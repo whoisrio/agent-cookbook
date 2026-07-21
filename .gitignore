@@ -1,0 +1,19 @@
+# 环境变量
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+uv.lock
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
