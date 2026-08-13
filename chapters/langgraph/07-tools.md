@@ -1,9 +1,76 @@
 
+2022年底，chapgpt3.5横空出世的时候，LLM只能提供聊天服务，这个时候，虽然有AGENT的概念，但是他只是一个没有手的家伙，AGENT = Model+Prompt；
+后来，openai在/v1/chat/completions/添加了function call的能力，让模型能够借助工具调用外部的服务，于是才有了构建agent的基础
+AGENT = Model + Context + Tools；
+再后来，模型能力越来越强，但是依然不能100%解决不了LLM幻觉、注意力漂移等问题，出现了Harness，AGENT = Model + Harness(Context + Tool)；
+再后来，持续改进， AGENT = Model + Harness(Context + Tool) + Eval；
+
+LLM本身是没有记忆的，
+Context 关注的是如何正确的时机，给模型提供正确的上下文，让模型实现正确的推理；
+Tools 解决的是如何让模型能够真正的为人类工作，没有Tools，模型就是关在笼子的大脑。
+
+模型理解Tools，也是通过agent在prompt中提供的描述来理解的
+
+生产级的Tool ? 
 - 什么场景适合用工具
 - 如何定义好的工具
 - 如何确保工具的安全性，同步审核，边车审核，规则引擎
 - 如果避免工具撑爆上下文，tool_search
 - 异步工具执行，工具的异步设计，占位符等等
+
+## Tools定义，让模型更好的理解工具
+- description，
+- 参数描述，
+- 使用样例，fewshot
+
+
+
+```python
+@tool
+def custom_tools(para1: str)->str
+  """
+  当xxx时使用该工具
+
+  para1:
+  """
+  #...
+  return ''
+```
+
+tools超多的时候，工具的分类分层定义
+
+
+
+## 工具调用，
+- 参数格式验证
+- 权限验证
+- 明确的错误提示
+
+## 错误围栏，
+- 外部错误，api级重试，降级；控制重试等待时间 ? 
+- 工具调用了llm，备份切换，比如rag本身是个tool
+- 工具执行整体重试 ? 幂等；难以实现幂等的工具，如发邮件，打电话，窗口限制
+- llm + tool调用死循环 ? 1.max turn； 2. 相同参数调用的次数限制；
+- 
+
+## mcp，防注入
+
+
+## 安全防护
+
+### 工具执行环境
+- 最小权限，cgrp，资源限制 ? 
+- docker
+- vm
+
+### prompt注入
+
+- tool_description的prompt注入
+- 执行结果
+- 
+
+
+
 
 今天主要看了一下 AI Agent Book 的 Tools 这一部分，和一部分 Agent Eval 的内容。
 Tools 的这一部分我觉得讲得还是挺清楚的：
@@ -79,7 +146,8 @@ dd
 # 架构决策
 
 agent 工具数量，比如超过100个工具，LLM很容易错误决策；
-
+工具分类，引导模型先推理用哪一类工具，再从分类里挑选；
+tool_search，
 
 ----
 我碰到过的一些agent调用llm的错误，model不支持多模态，返回报错了，agent仍然重试； -- hermes
