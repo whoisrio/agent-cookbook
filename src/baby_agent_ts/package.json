@@ -1,0 +1,27 @@
+{
+  "name": "baby_agent_ts",
+  "version": "1.0.0",
+  "description": "Baby Agent TS — createReactAgent + Ink TUI",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/cli.tsx",
+    "build": "tsc"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@langchain/core": "^1.2.4",
+    "@langchain/langgraph": "^1.4.9",
+    "@langchain/openai": "^1.5.5",
+    "ink": "^7.1.1",
+    "react": "^19.2.8",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@types/react": "^19.2.18",
+    "tsx": "^4.23.5",
+    "typescript": "^7.0.2"
+  }
+}

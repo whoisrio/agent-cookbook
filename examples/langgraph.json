@@ -1,0 +1,7 @@
+{
+  "dependencies": ["pyproject.toml"],
+  "graphs": {
+    "my_agent": "./app/simpleGraph.py:workflow"
+  },
+  "env": "./.env"
+}

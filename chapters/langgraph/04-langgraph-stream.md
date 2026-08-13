@@ -1,6 +1,10 @@
 
-LLM的交互是非常耗时的操作，特别是开启了推理（reasoning）之后，拿到LLM的完整反馈，需要等待的时间可能需要数秒到数十秒，因此stream模式几乎是标准的与LLM交互的模式。LangGraph的工作流也提供了工作流的stream模式，支持如下类型的stream；
+LLM的交互是非常耗时的操作，特别是开启了推理（reasoning）之后，拿到LLM的完整反馈，需要等待的时间可能需要数秒到数十秒，因此stream模式几乎是标准的与LLM交互的模式。
+LangGraph的工作流也提供了工作流的stream模式，分别是
+- stream，自行从stream中解析出需要的event，所有stream共享同一个通道；
+- event stream，是stream的升级版本，对event进行了结构化封装，各类事件独立通道，消费时互不影响；
 
+下面逐个看一下
 ### Stream
 
 LangGraph提供的Stream支持同步和异步模式，分别调用`graph.stream({}, stream_mode=[])`或者`graph.astream({},stream_mode=[])`来获得流式输出，支持的stream模式如下，
@@ -83,7 +87,7 @@ topic: ice cream and cats, joke:
 topic: ice cream and cats, joke: This is a joke about ice cream and cats
 ```
 
-- messages，返回的是与LLM交互的信息；使用messages来获得与LLM交互的信息，需要使用langchain提供的LLM交互机制，如果不希望使用langchain封装的LLM交互方法，则需要自行实现 custom stream；
+- messages，返回 LLM 调用的 (token, metadata) 二元组；注意 messages 模式依赖 LangChain 的 ChatModel 抽象来捕获 token 流，如果你的 LLM client 不是 LangChain 集成的，需要用 custom 模式自行实现；
 
 自定义 custom，需要通过langgraph提供的 `stream_writer` 自行将你使用的LLM client的stream chunk 写入，`writer({"custom_llm_chunk": chunk})`，
 ```python
@@ -122,14 +126,12 @@ for chunk in graph.stream(
 
 ### Event Stream
 
-Event Stream 是官方推荐的进程内流式模型，适用于大部分 LangGraph 应用代码。它返回一个 run stream 对象，可以同时从多个角度消费流式数据。
+Event Stream 是官方推荐的进程内流式模型，适用于大部分 LangGraph 应用代码。它返回一个 run stream 对象，可以同时从多个角度消费流式数据。底层和 Stream 一样从 Pregel 引擎拿原始事件（updates、values、messages 等），区别在于怎么给你：
 
-新版本的 LangGraph，更推荐使用 EventStream 来获得工作流执行的流式输出。其实 Stream 和 EventStream 底层都从 Pregel 引擎拿原始事件（updates、values、messages 等），区别在于怎么给你：
+- **Stream** 按你指定的 `stream_mode` 过滤后，吐出统一的 `StreamPart` dict（v2 格式下），每个 chunk 有 `type`、`ns`、`data` 三个字段。你需要自己按 `chunk["type"]` 写 if-else 分支来处理不同类型的数据。
+- **EventStream** 多了一层 stream transformer，把原始事件路由到不同的 transformer，产出类型化的投影对象。你用 `stream.messages` 拿到的就是 MessageStream 对象，`stream.values` 拿到状态快照，不用自己写 if-else 分支。
 
-- **Stream** 是按你指定的 `stream_mode` 过滤后直接吐数据结构——比如 `stream_mode="values"` 你就拿到 `(node_name, state_dict)` 的 tuple，需要你自己按 `chunk["type"]` 分支处理。
-- **EventStream** 多了一组 stream transformer（看上图），把原始事件路由到不同的 transformer，产出类型化的投影对象。你用 `stream.messages` 就直接拿到 MessageStream 对象，用 `stream.values` 拿到状态快照，不用自己写 if-else 分支。
-
-要注意的是，EventStream 的投影和 Stream 的 mode 不是一一对应的——比如 Stream 的 `updates`、`checkpoints`、`tasks`、`debug` 这几个 mode，EventStream 没有等价的投影。两套 API 各有所长，不是谁是谁的超集。
+要注意的是，EventStream 的投影和 Stream 的 mode 不是一一对应的——Stream 的 `updates`、`checkpoints`、`tasks`、`debug` 这几个 mode，在 EventStream 中需要自定义 transformer 才能消费，没有开箱即用的投影。反过来，EventStream 的 `stream.subgraphs`、`stream.interrupts`、`stream.extensions` 这些能力，Stream 也没有直接等价物。两套 API 各有所长，不是谁是谁的超集。
 
 |投影|用途|
 |---|---|
@@ -140,6 +142,7 @@ Event Stream 是官方推荐的进程内流式模型，适用于大部分 LangGr
 |`stream.subgraphs`|发现并观察嵌套的子图执行|
 |`stream.interrupts`|查看人机交互（HITL）的中断信息|
 |`stream.interrupted`|检测 run 是否因等待人工输入而暂停|
+|`stream.extensions`|消费自定义 stream transformer 投影|
 
 如下是event stream的处理架构，Pregel engine发出原生的事件，原始的event会发送到 event router，event router将不同类型的事件提交到对应的 transformer，再生产出结构化的 event stream；
 
@@ -165,61 +168,45 @@ flowchart TD
 ```
 
 
-通过event stream获得workflow的流式输出，需要指定v3版本，
-```python
-stream = workflow.event_stream({},version="v3")
+通过 Event Stream 获得 workflow 的流式输出，需要使用 `stream_events()` 并指定 `version="v3"`：
 
-#结构化的访问stream的信息
+```python
+stream = graph.stream_events(
+    {"messages": [{"role": "user", "content": "hello"}]},
+    version="v3",
+)
+
+# 结构化的访问 stream 的信息
 for message in stream.messages:
     text = str(message.text)
     usage = message.output.usage_metadata
 
     print(text)
     print(usage)
-
 ```
 
-对比使用stream，需要自行指定`stream_mode`,以及自行处理访问的数据
+对比使用 Stream，需要自行指定 `stream_mode` 并手动按 type 分支处理数据：
+
 ```python
-async for chunk in graph.astream(
+for chunk in graph.stream(
     {"topic": "cats"},
     stream_mode="messages",
     version="v2",
 ):
     if chunk["type"] == "messages":
-        msg, metadata = chunk["data"]        
+        msg, metadata = chunk["data"]
 ```
 
-langchain给出的使用 event_stream的优势 : 
+langchain给出的使用 Event Stream 的优势 : 
 
 除了单个事件的对象化结构，Event Stream 相比传统 Stream 模式还有几个架构层面的优势：
 
 - **类型安全的投影**：它提供了一套类型化的投影 API，不同事件类型对应不同的迭代器。你不用根据 `stream_mode` 手动写 if-else 来分支处理不同数据形状。
-- **逻辑更简洁**：不用操心复杂 tuple 或条件判断，Event Stream 给的是统一的 StreamPart 字典结构，消费端的代码更干净、更好维护。
+- **逻辑更简洁**：不用自己写 `chunk["type"]` 条件分支，Event Stream 每种投影独立迭代，消费端的代码更干净、更好维护。
 - **关注点分离更精细**：每种投影有独立的迭代器，你可以把 LLM token 推前端、状态更新记日志、自定义事件追踪进度，这几件事各走各的通道，不用揉在一个循环里。
 - **更好的类型推导**：使用 `version="v3"` 后，IDE 能正确推导 `chunk["type"]` 对应的 `chunk["data"]` 结构，大幅减少因数据结构不匹配导致的运行时错误。
 
 
-看起来使用event_stream 获得workflow的流式输出，要方便一些，但是这个是不是另外一个过渡封装，现在还不好说；
+看起来使用 Event Stream 获得 workflow 的流式输出，要方便一些，但是这个是不是另外一个过渡封装，现在还不好说；
 使用哪一种，主要看你的使用场景；
->BTW，event_stream的API现在还是beta阶段
-
-
-----
-
-
-Workflow有一个特别的属性，`channels`，包含的信息如下，你知道用途是啥不，下次咱们聊聊`channels`
-
-```shell
-{'__pregel_tasks': <langgraph.channels.topic.Topic object at 0x10714bd40>,
- '__start__': <langgraph.channels.ephemeral_value.EphemeralValue object at 0x107142e80>,
- 'branch:to:genJoke': <langgraph.channels.ephemeral_value.EphemeralValue object at 0x10714b780>,
- 'branch:to:humanReview': <langgraph.channels.ephemeral_value.EphemeralValue object at 0x107149ec0>,
- 'branch:to:review': <langgraph.channels.ephemeral_value.EphemeralValue object at 0x106bf0480>,
- 'branch:to:translate': <langgraph.channels.ephemeral_value.EphemeralValue object at 0x107149bc0>,
- 'content': <langgraph.channels.last_value.LastValue object at 0x107142c00>,
- 'humanReviewResult': <langgraph.channels.last_value.LastValue object at 0x107141700>,
- 'retryCount': <langgraph.channels.last_value.LastValue object at 0x107142bc0>,
- 'reviewResult': <langgraph.channels.last_value.LastValue object at 0x107142380>,
- 'topic': <langgraph.channels.last_value.LastValue object at 0x107141400>}
-```
+>BTW，`stream_events` 的 API 目前还是 beta 阶段

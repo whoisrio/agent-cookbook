@@ -16,4 +16,24 @@ dependencies = [
     "python-dotenv>=1.0",
     "jupyter",
     "ipykernel",
+    "deepagents>=0.7.1",
+    "langchain-community>=0.3.0",
+    "langchain-experimental>=0.4.0",
+    "textual>=0.80.0",
 ]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["src/baby_agent/tests"]
+pythonpath = ["src"]

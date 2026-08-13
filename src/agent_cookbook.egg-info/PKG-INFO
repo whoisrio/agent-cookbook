@@ -1,3 +1,25 @@
+Metadata-Version: 2.4
+Name: agent-cookbook
+Version: 0.1.0
+Summary: LLM Agent 实战指南：从工作流到自主 Agent 的完整教程
+Requires-Python: >=3.13
+Description-Content-Type: text/markdown
+Requires-Dist: grandalf>=0.8
+Requires-Dist: instructor>=1.15.4
+Requires-Dist: langchain>=1.3.13
+Requires-Dist: langchain-openai>=1.3.5
+Requires-Dist: langgraph>=1.2.0
+Requires-Dist: langgraph-checkpoint-sqlite>=1.0.0
+Requires-Dist: langsmith>=0.10.2
+Requires-Dist: pygraphviz>=2.0
+Requires-Dist: python-dotenv>=1.0
+Requires-Dist: jupyter
+Requires-Dist: ipykernel
+Requires-Dist: deepagents>=0.7.1
+Requires-Dist: langchain-community>=0.3.0
+Requires-Dist: langchain-experimental>=0.4.0
+Requires-Dist: textual>=0.80.0
+
 # Agent Cookbook
 
 LLM Agent 实战指南——从工作流到自主 Agent 的完整教程。
