@@ -187,6 +187,17 @@ flowchart TD
 ```
 
 如果在`create_agent`时传入了多个middleware，那么各个middleware而是按 hook 分区域串联，而且有顺序讲究：
+假设你有三个middelware，分别是A,B,C，每个middleware都实现了前面说的hook点逻辑，在创建agent时按照A,B,C的顺序提供给agent，
+
+```python
+agent = create_agent(
+    model=...,
+    tools=[send_email, ...],
+    middleware=[A,B,C],
+)
+```
+
+那么，before 类是正序（A 先 B 后），after 类是**反序**（C 先 A 后），像栈一样先挂的后执行。`wrap_*` 则是包成一条链：A 包 B 包实际调用，从外到内进、从内到外出。
 
 ```
 before_agent:  A → B → C        （正序）
@@ -194,9 +205,8 @@ before_model:  A → B → C        （正序）
 after_model:   C → B → A        （反序）
 after_agent:   C → B → A        （反序）
 ```
-before 类是正序（A 先 B 后），after 类是**反序**（C 先 A 后），像栈一样先挂的后执行。`wrap_*` 则是包成一条链：A 包 B 包实际调用，从外到内进、从内到外出。
 
-具体到节点：`before_*` / `after_*` 这四类 hook 会各自编译成 graph 里的真实 node——一个 middleware 实现了哪个，就多挂哪个；而 `wrap_model_call` / `wrap_tool_call` 不会单独成 node，它们是包在 `model` / `tools` 节点内部的拦截链。
+具体到graph的节点：`before_*` / `after_*` 这四类 hook 会各自编译成 graph 里的真实 node——一个 middleware 实现了哪个，就多挂哪个；而 `wrap_model_call` / `wrap_tool_call` 不会单独成 node，它们是包在 `model` / `tools` 节点内部的拦截链。
 
 ---
 
