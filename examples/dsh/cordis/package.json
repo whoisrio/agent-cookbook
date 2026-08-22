@@ -1,0 +1,24 @@
+{
+  "name": "cordis-examples",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "cordis 概念演示：服务/插件关系、inject、waterfall 等",
+  "scripts": {
+    "01": "tsx 01-service-inject.ts",
+    "02": "tsx 02-multiple-services.ts",
+    "03": "tsx 03-waterfall.ts",
+    "04": "tsx 04-waterfall-input.ts",
+    "05": "tsx 05-serial-bail.ts",
+    "06": "tsx 06-cross-plugin.ts",
+    "07": "tsx 07-coffeeshop.ts",
+    "all": "tsx 01-service-inject.ts && tsx 02-multiple-services.ts && tsx 03-waterfall.ts && tsx 04-waterfall-input.ts && tsx 05-serial-bail.ts && tsx 06-cross-plugin.ts && tsx 07-coffeeshop.ts"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}
