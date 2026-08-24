@@ -367,13 +367,12 @@ export const coffeePlugin = {
 ```
 为了模拟嵌套关系，我们把 `coffeePlugin` 的注册放在楼层管理插件的 `apply` 里（`floor.ts:48`），也就是咖啡店「一楼A01」挂进来，而楼层管理插件本身没有 `inject`，注册即激活；
 ```ts
-// floor.ts:48-49
-const coffeeFiber = ctx.plugin(coffeePlugin)  // ← 招商办受理：建档 + new Fiber，返回 fiber
+ctx.plugin(coffeePlugin)  // ← 招商办受理：建档 + new Fiber，返回 fiber
 ```
 对于coffee这类业务插件，通过如上注册，等待Cordis的调度，满足依赖条件之后，开始运行自身的逻辑就可以了；
 如果希望你的插件服务也可以被其他插件使用，比如咱们的例子里，面包店希望和咖啡店合作，卖咖啡，coffee就需要把自己的能力在apply的时候`provide`出来；
 ```ts
-ctx.provide('coffee', coffeeFiber)            // ← 把「咖啡店 fiber」也挂出去，方便楼外 await
+ctx.provide('sell', sell)            // ← 把「咖啡店 fiber」也挂出去，方便楼外 await
 ```
 如果你的插件不对外提供服务，使用对象插件或者更简单的函数插件的方式就可以了。
 
@@ -387,7 +386,6 @@ export class WaterService extends Service {
   }
 }
 ```
-
 供水、供电plugin注册在楼层管理之后()`main.ts:29`）。通过继承Service类的插件注册，通过调用父类构造函数完成。
 对于提供基础能力的插件，通过Service的方式注册，激活的同时，也将自己的能力provide到上下文中方便其他插件调用。
 ```ts
@@ -399,7 +397,7 @@ export class WaterService extends Service {
     return self
   }
 ```
-在咱们的例子里，coffee插件工作时，就调用了water和power提供的能力，
+在咱们的例子里，coffee插件执行apply时，就调用了water和power提供的能力，
 ```ts
 ctx.logger.info('咖啡店开业！供水=' + ctx.water.supply() + ' 供电=' + ctx.power.available() + 'kW')
 ```
@@ -415,49 +413,70 @@ export class PowerService extends Service {
 }
 ```
 
-`main.ts` 是「楼外 client」——它跑在根 fiber 里，没有 `inject` 门禁，所以要用 `ready()` 等服务上线、用 strict `ctx.get()` 查服务是否还在。
+`main.ts` 是「楼外 client」——它跑在根 fiber 里，没有 `inject` 门禁，所以我们准备了一个 `ready()` 方法，在`main.ts`里调用注册到ctx的服务(sell)时，确保他已经被cordis加载了，用 strict `ctx.get()` 查服务是否还在。
 当前的调用顺序如下，
 ```ts
 async function main() {
   const ctx = new Context()
-  ctx.logger.exporter({ /* 把秘书处台账接到控制台 */ })
 
-  // [08:30] 挂楼层管理：coffee / bakery 随之登记，但都因依赖未齐而 PENDING
+  // 秘书处：外接一根控制台出口（默认只写楼内 ring buffer，容量 1000，不外接看不到）
+  ctx.logger.exporter({
+    export(message) {
+      const tag = message.type.toUpperCase().padEnd(4)
+      console.log('  [秘书处] ' + tag + ' [' + message.name + '] ' + message.args.join(' '))
+    },
+  })
+
+  // —— 大厦开张：先挂三楼楼层管理（咖啡店随之注册，但此时供水/供电还没挂牌）——
+  console.log('[08:00] 大厦开张，供水/供电/财务部还没挂牌')
+  console.log('[08:30] 先挂楼层管理 → 咖啡店入驻，但 inject 缺 water/power → PENDING，不开业')
   await ctx.plugin(floorManagerPlugin)
 
-  // [09:00] 挂公用部门：finance 一挂牌，water→power→coffee→bakery 的级联被触发
+  // —— 挂全楼公用部门：最后一个部门（finance）挂牌后，
+  //    water→power→coffee→bakery 的依赖级联被触发，但级联是异步跨微任务的，
+  //    await ctx.plugin(FinanceService) 只等 finance 自己激活，不保证咖啡店已经开业。——
+  console.log('[09:00] 依次挂牌供电/供水/财务部')
   await ctx.plugin(PowerService)
   await ctx.plugin(WaterService)
   await ctx.plugin(FinanceService)
 
-  // 楼外 client：按服务名等咖啡店 ACTIVE，不持有 coffee 的 fiber
+  // main 跑在 root fiber 里，没有 inject 门禁，是「楼外 client」。
+  // 用 ready() 按服务名等咖啡店的能力就绪——只认 'sell' 这个能力，
+  // 不关心它在三楼名下、也不需要持有咖啡店的 fiber。
   const sell = await ready(ctx, 'sell')
-  sell(5, 'main ')
+  sell(5,'main ')
 
+  // —— 广播系统：emit（单向，发完不管）——
+  // 供水部门作为发起方，向 water/maintenance 频道全网广播
   ctx.emit('water/maintenance', '今晚18:00 停水')
 
-  // [14:00] 停水：coffee 同步离开 ACTIVE，strict get 当场返回 undefined
+  // —— 停业 / 复业：供水依赖驱动 ——
+  console.log('[14:00] 供水退租')
   ctx.registry.delete(WaterService)
+
   try {
-    const s = ctx.get('sell', true)          // 同步快照：删水后必为 undefined
-    if (!s) throw new Error('coffee shop gone, cannot sell')
-    s(2, 'main ')
+    const sellAfterShutdown = ctx.get('sell', true)
+    if (!sellAfterShutdown) throw new Error('coffee shop gone, cannot sell')
+    sellAfterShutdown(2, 'main ')
   } catch (error) {
     console.error('[error] ' + (error as Error).message)
   }
-
-  // [15:00] 复水：等咖啡店重新开业、sell 重新 provide
+  console.log('[15:00] 新供水挂牌 → 咖啡店重新走一遍开业流程')
   await ctx.plugin(WaterService)
+  // 复业后 sell 是新实例，同样用 ready() 等它重新 provide。
   const reopenedSell = await ready(ctx, 'sell')
-  reopenedSell(3, 'main ')
+  reopenedSell(3,'main ')
+  console.log('财务账本累计（跨停业保留）= ' + ctx.finance.balance())
 
-  // [18:00] 楼层退租：三楼整层（coffee / bakery / cleaning）级联清退
+  // —— 楼层退租：三楼整层级联清退（咖啡店 / 面包店 / 保洁 一并撤场）——
+  console.log('[18:00] 楼层管理退租 → 三楼整层清退')
   ctx.registry.delete(floorManagerPlugin)
 }
 ```
 
 下面这段是上面代码真实跑出的日志（`cd examples/dsh/cordis && npx tsx coffeeshop/main.ts`）。
 我们按时间分五拍，逐行说清楚「这一行是谁、因为什么打出来的」。
+
 
 ```shell
 [08:00] 大厦开张，供水/供电/财务部还没挂牌
@@ -496,77 +515,23 @@ async function main() {
   [秘书处] INFO [cleaning] 保洁撤场（随咖啡店一并退）
 ```
 
-**第一拍（08:00–08:30）——只有楼层管理开业。**
+**五拍运行解读**（对照上方 `main` 代码与运行日志）
 
-- `[08:00]` / `[08:30]` 两行是 `main.ts` 自己的 `console.log`，纯剧本旁白。
-- `[floor-manager] 楼层管理挂牌` 来自楼层管理 `apply` 里的 `ctx.logger.info`（`floor.ts:34`）。
-  楼层管理没有 `inject`，注册即激活，所以它的 `apply` 在 `await ctx.plugin(floorManagerPlugin)` 期间同步跑完。
-- 注意这一拍**没有** coffee、bakery、cleaning 的日志。
-  floor 的 `apply` 里确实 `ctx.plugin(coffeePlugin)` 和 `ctx.plugin(bakeryPlugin)` 了（`floor.ts:45-46`），但 coffee 缺 `water/power/finance`、bakery 缺 `sell`，两个 fiber 都停在 PENDING，`apply` 根本不执行。
+- **第一拍（08:00）** 只挂楼层管理。它无 `inject`，注册即激活（`floor.ts:34`）；其 `apply` 内 `ctx.plugin(coffee/bakery)` 时 coffee 缺 `water/power/finance`、bakery 缺 `sell`，两个 fiber 停在 PENDING，故本拍无咖啡/面包/保洁日志。
+- **第二拍（09:00）** 挂 water/power/finance，级联唤醒整栋。water 构造里 `super(ctx,'water')` 挂牌（`services.ts:25`）；power 因 `inject:['water']` 排在 water 之后激活（`services.ts:37,41`）；coffee 等齐三者才开业（`coffee.ts:22`），`apply` 中 `await ctx.plugin(CleaningService)` 注册自营保洁、随后 `provide('sell', sell)`（`coffee.ts:27,40`）；bakery 因 `inject:['sell']` 排在 coffee 之后开业（`floor.ts:23,25`）。关键时序：`await plugin(cleaning)` 让出微任务，使 `sell` 晚于 finance 才就绪——所以楼外 main 必须 `await ready(ctx,'sell')`（`main.ts:36`）。
+- **第三拍（14:00）** `ctx.registry.delete(WaterService)`（`main.ts:45`）。删依赖令 coffee fiber 在同一调用栈内当场 INACTIVE，strict `ctx.get('sell', true)` 立即返回 `undefined`，main 主动抛错接住（`main.ts:56-60`）。这里不能用 `await ready`——它会挂起或返回旧闭包。本拍看不到「停业/撤场」日志：disposer 跑在 `delete` 后的微任务里，而 main 到 15:00 前无 `await`，微任务未 flush。
+- **第四拍（15:00）** `await ctx.plugin(WaterService)`（`main.ts:63`）让出微任务，上一拍积攒的撤场 disposer 此刻 flush：旧 coffee「本班 7 作废」、bakery/cleaning 撤场，财务部总账不动。随后新供水→power 重激活→coffee 重开业→bakery 再开，同构重演；`本班` 从 0 重计、`全店` 在旧账 7 上续到 12（`main.ts:67`）。
+- **第五拍（18:00）** `ctx.registry.delete(floorManagerPlugin)`（`main.ts:71`）。父级退租触发子树级联清退：coffee、其下 cleaning、同挂 floor 的 bakery 全部连带销毁（顺序 LIFO + 子先于父）。
 
-**第二拍（09:00）——公用部门挂牌，级联把整栋楼叫醒。**
-
-- `[09:00] 依次挂牌…` 是 main 的旁白。
-- `[water] 供水部门挂牌` 是 `WaterService` 构造函数里的日志（`services.ts:25`）。
-  `super(ctx, 'water')` 这一句把供水以 `'water'` 之名 provide 到根上下文。
-- `[power] 通水了，供电部门正式挂牌` 是 `PowerService` 构造函数（`services.ts:41`）。
-  供电声明了 `static inject = ['water']`（`services.ts:37`），所以它在供水挂牌前一直 PENDING；水一到，它才被调度执行构造函数、`super(ctx, 'power')` 挂牌。
-  这一行出现在 water 之后，正是「依赖就绪才激活」的可见证据。
-- `[finance] 财务部挂牌` 是 `FinanceService` 构造函数（`services.ts:55`）。
-  财务部没有 `inject`，注册即挂牌。
-- `[coffee] 咖啡店开业！` 是 coffee `apply` 的第一行（`coffee.ts:22`）。
-  它要等的三个依赖 `water/power/finance` 到这一刻才全部 ACTIVE，楼管 `notify` 把它从 PENDING 翻成 ACTIVE，`apply` 才开始跑。
-  它能直接读到 `ctx.water.supply()` 和 `ctx.power.available()`，是因为 `inject` 门禁向它保证了这两个服务在。
-- `[cleaning] 保洁挂牌` 来自 `CleaningService` 构造函数（`cleaning.ts:17`）。
-  它不是 main 注册的，而是 coffee 在 `apply` 里 `await ctx.plugin(CleaningService)`（`coffee.ts:27`）注册的，所以挂在 coffee 名下。
-- `[coffee] 咖啡店叫自家保洁：地板已拖净` 和 `[coffee] 借楼层会议室：…` 是 coffee `apply` 从 cleaning 的 `await` 恢复后继续打的日志（`coffee.ts:35-36`）。
-  前者用 `ctx.get('cleaning')` 取自营保洁，后者沿父链读到楼层管理 provide 的 `meetingRoom`。
-- 这里有个关键时序：`await ctx.plugin(CleaningService)` 让 coffee 的 `apply` 让出了一次微任务，所以真正的 `ctx.provide('sell', sell)`（`coffee.ts:40`）要更晚才执行。
-  这也是为什么楼外的 main **不能**在挂完 finance 后立刻同步读 `sell`——它必须 `await ready(ctx, 'sell')`。
-- `[bakery] 面包店开业` 是 bakery `apply`（`floor.ts:25`）。
-  bakery 声明了 `inject: ['sell']`（`floor.ts:23`），所以它的激活被排在 coffee 之后：coffee provide 出 `sell`、fiber 翻成 ACTIVE，楼管通知 bakery，它才开业。
-- `[coffee] bakery卖出 2 杯` 是 bakery 在 `apply` 里调 `ctx.sell(2, 'bakery')`（`floor.ts:26`）打进 coffee 的日志。
-  卖咖啡的函数是 coffee 定义的，所以日志名是 `[coffee]`；`本班 2 / 全店 2` 里「本班」是 coffee 这次开业的局部计数、「全店」是根上财务部的累计。
-- `[coffee] main 卖出 5 杯` 是 main 的 `ready(ctx,'sell')` resolve 后调 `sell(5, 'main ')`（`main.ts:36-37`）打进的。
-  `本班 7 / 全店 7` 说明 bakery 的 2 杯和 main 的 5 杯记在同一本账上。
-
-**第三拍（14:00）——停水，咖啡店同步离场。**
-
-- `[14:00] 供水退租` 是 main 的旁白，紧接 `ctx.registry.delete(WaterService)`（`main.ts:45`）。
-- `[error] coffee shop gone, cannot sell` 是 main 的 catch 打出来的（`main.ts:60`）。
-  删水后 coffee 的 fiber 在**同一个调用栈内**就被切出 ACTIVE（epoch 变 INACTIVE），所以 strict `ctx.get('sell', true)` 当场返回 `undefined`，main 主动抛错并接住。
-  这里不能用 `await ready()`——`ready` 是「等服务上线」，水刚删还没挂回来时它要么挂起、要么（不做 strict 复查时）把正在卸载的旧闭包当有效值返回。
-- 注意这一拍**看不到**「咖啡店停业」「保洁撤场」。
-  那些是卸载 disposer，跑在 `delete` 之后的微任务里；而 main 从 `delete` 到 15:00 之间没有任何 `await`，微任务一直没机会 flush，所以这些清理日志被推迟到了下一拍。
-
-**第四拍（15:00）——复水，旧店收尾与新店开业交织。**
-
-- `[15:00] 新供水挂牌…` 是 main 的旁白；紧接着 `await ctx.plugin(WaterService)`（`main.ts:63`）让出微任务队列，上一拍积攒的卸载 disposer 终于执行。
-- `[coffee] 咖啡店停业（本班营业账 7 杯作废…）` 是上一轮 coffee `apply` 返回的清理函数（`coffee.ts:43`）。
-  它在这一刻才跑，正好解释了「本班 7」——上一轮开业累计的 7 杯（bakery 2 + main 5）随旧店作废；财务部总账不受影响。
-- `[water] 供水部门挂牌` 是新供水的构造日志。
-- `[bakery] 面包店撤场` / `[cleaning] 保洁撤场` 是上一轮 bakery、cleaning 的撤场 effect（`floor.ts:27`、`cleaning.ts`），同样是被推迟到这一拍才 flush。
-- `[power] 通水了…` 是新供水到达后，供电重新激活的构造日志。
-- 之后 `[coffee] 咖啡店开业` → `[cleaning] 保洁挂牌` → `[coffee] 叫保洁/借会议室` → `[bakery] 面包店开业` → `bakery卖出 2 杯` → `main 卖出 3 杯`，和第二拍完全同构，是新一轮开业的完整重演。
-  `本班 2 / 全店 9`、`本班 5 / 全店 12` 说明局部账重新从 0 开始（2、5），而财务总账在旧账 7 的基础上继续累计到 9、12。
-- `财务账本累计（跨停业保留）= 12` 是 main 最后读 `ctx.finance.balance()`（`main.ts:67`）。
-  12 = 第一轮 7 + 第二轮 5（bakery 2 + main 3），证明长期状态挂在根上的财务部、不随门店停业清零。
-
-**第五拍（18:00）——楼层退租，整层级联清退。**
-
-- `[18:00] 楼层退租…` 是 main 最后的旁白，对应 `ctx.registry.delete(floorManagerPlugin)`（`main.ts:71`）。
-- `[bakery] 撤场` → `[coffee] 停业（本班 5 杯作废）` → `[cleaning] 撤场` 三行是三楼子树自下而上的 disposer。
-  floor 一退，挂在它名下的 coffee、以及 coffee 名下的 cleaning、和 floor 名下的 bakery 全部连带清退——这就是「父级卸载，子树级联销毁」。
-  它们的顺序（LIFO + 子先于父）由 fiber 的 disposable 列表保证。
-
-整段日志串起来想说明三件事。
-一是**激活顺序由依赖决定，不由注册顺序决定**：power 在 water 之后开业、bakery 在 coffee 之后开业，都是 `inject` 门禁驱动的。
-二是**上线异步、下线同步**：开业要跨 `PENDING → LOADING → ACTIVE` 的微任务链，所以楼外要 `await ready`；删依赖时 fiber 当场离场，strict `get` 立刻能查到。
-三是**闭包引用脱离生命周期**：main 手里那个旧 `sell` 闭包在停水后理论上仍能调用（它只引用根上的 finance），所以停业后必须重新 `ctx.get` 而不能复用旧引用——这也是第三拍用 strict get 拦截的原因。
 
 ### 3. 通知
 
-上一拍日志里反复出现「水一到，供电/咖啡店/面包店依次醒来开业」「水一退，整串依次停业」。
+cordis 里叫「通知」的机制其实有两套，别混为一谈：
+
+- **依赖变化通知（`reflect.notify`）**——服务挂牌/摘牌时按名字反查依赖方、驱动「自动开业/停业」的级联。下面「一」，用 coffeeshop 演示。
+- **消息广播通知（`events`）**——插件之间主动发消息的发布/订阅总线（如「今晚停水」）。下面「二」，用独立的广播样例演示，不和依赖机制搅在一起。
+
+先说「一」。上一拍日志里反复出现「水一到，供电/咖啡店/面包店依次醒来开业」「水一退，整串依次停业」。
 驱动这一切的是楼管 `reflect` 的**通知机制**：任何服务挂牌或摘牌，`reflect` 都遍历整棵树，找到 `inject` 了这个名字的 fiber，让它重新核对依赖、决定自己开业还是停业。
 
 **通知发起点是 `provide` / 卸载。**
@@ -607,6 +572,60 @@ coffee 卸载又使 `sell` 消失 → `notify(['sell'])` → bakery 跟着 `_unl
 状态翻转在 `delete` 的同步调用栈内就完成了（所以 strict `get` 当场返回 `undefined`），但 disposer 函数体是 `async` 的，真正打日志要等后续微任务——这正是第三拍看不到撤场日志、第四拍才看到的原因。
 
 > 同一个插件模块可以在不同 `Context` 下挂载多次，每次都有**独立的 Fiber**——「Fiber 是运行实例而非插件定义本身」。`notify` 遍历的是这些运行中的 fiber，不是插件定义。
+
+**二、消息广播通知（events）——真正「发消息」的那套。**
+
+`events` 是挂到每个 `Context` 上的发布/订阅总线（`ctx.events`，方法也 mixin 到了 `ctx`）。它和「一」的 `reflect.notify` **完全两路**：`events` 是插件**主动**给感兴趣的人发消息，`reflect.notify` 是框架**被动**因依赖变化触发级联；`events` 不驱动开业/停业，只负责传话。
+
+**五种派发模式**（`ctx.emit` / `parallel` / `serial` / `bail` / `waterfall`）：
+
+- `emit(name, ...args)`：单向广播，**发完不管**——同步触发所有监听器、不 `await` 它们、也不收返回值（故事里供水部门 `emit('water/maintenance', '今晚18:00 停水')`）。
+- `parallel(name, ...args)`：并发派发并 `await` 所有监听器（大楼「必须确认每家都回执了」才继续）。
+- `serial(name, ...args)`：顺序逐个 `await`，遇到第一个命中值（非 `null/false/undefined`）就停。
+- `bail(name, ...args)`：同步版 `serial`，首命中即停。
+- `waterfall(name, ...args, next)`：以最后一个 `next` 收尾，监听器外层包内层；不调 `next` 即否决（完整演示见示例 `03`/`04`）。
+
+**接收方用 `ctx.on(name, listener)` 订阅「频道」**，返回值是 disposer。关键一点：`ctx.on` 注册的监听器归「当前 fiber」所有，fiber 卸载时自动移除——所以插件在 `apply` 里订阅，就能随插件一起清理，不用手动 `off`。
+
+下面这段只演示广播、不涉及任何依赖级联（完整可跑文件 `examples/dsh/cordis/08-events.ts`，`cd examples/dsh/cordis && npx tsx 08-events.ts`）：
+
+```typescript
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    'water/maintenance'(message: string): void
+  }
+}
+
+const ctx = new Context()
+
+// 接收方：订阅「供水检修」频道
+ctx.on('water/maintenance', (msg) => {
+  console.log('[咖啡店] 收到供水通知：' + msg + ' → 提前蓄水')
+})
+ctx.on('water/maintenance', (msg) => {
+  console.log('[面包店] 收到供水通知：' + msg + ' → 暂停和面')
+})
+// 异步监听器：emit 不会等它，它的日志要等一个微任务才打出
+ctx.on('water/maintenance', async (msg) => {
+  await Promise.resolve()
+  console.log('[异步租户] 慢半拍才看到：' + msg)
+})
+
+// 发送方：单向广播，发完不管
+ctx.emit('water/maintenance', '今晚 18:00 停水')
+console.log('emit 调用已返回，不等待上面的异步监听器')
+```
+
+真实输出（注意 `[异步租户]` 排在 `emit 调用已返回` 之后，正说明 `emit` 不等待监听器）：
+
+```
+[咖啡店] 收到供水通知：今晚 18:00 停水 → 提前蓄水
+[面包店] 收到供水通知：今晚 18:00 停水 → 暂停和面
+emit 调用已返回，不等待上面的异步监听器
+[异步租户] 慢半拍才看到：今晚 18:00 停水
+```
+
+`parallel` / `serial` / `bail` 的并发、顺序、首命中即停等行为，在 `08-events.ts` 里有完整可跑的对照，跑一遍比读文字更直观。
 
 
 

@@ -32,6 +32,8 @@ export const coffeePlugin = {
       ctx.logger.info(seller + '卖出 ' + cups + ' 杯（本班 ' + shiftNote + ' / 全店 ' + ctx.get('finance')!.balance() + '）')
     }
 
+    ctx.on('water/maintenance',(message)=>ctx.logger.info('收到通知' + message))
+
     ctx.logger.info('咖啡店叫自家保洁：' + ctx.get('cleaning')!.clean())
     ctx.logger.info('咖啡店借楼层会议室：' + ctx.meetingRoom.book())
 
