@@ -69,7 +69,6 @@ export interface Context {
 
 ```ts
 //context 初始化：根 fiber 的 inject 为空集合，_refresh() 算出的 epoch 是空串 '' 而非 INACTIVE，
-//所以一开局就处于就绪（ACTIVE）状态——并非"第四个参数填 null"这种因果。
   constructor() {
     this[symbols.isolate] = Object.create(null)
     this[symbols.intercept] = Object.create(null)
@@ -292,12 +291,55 @@ reflect 只传声不拍板，开不开由 fiber 自己的 `epoch` 跃迁定；
 
 （同一个插件模块可以在不同 `Context` 下挂载多次，每次挂载都有**独立的 Fiber**——这正是"Fiber 是运行实例而非插件定义本身"的体现。）
 
+### declare module：类型层注册 vs 运行时注册
+有一点需要说明一下，插件是随时可被激活或者卸载的，运行时cordis的机制保证了你的插件依赖肯定存在；
+但是你的插件代码如果需要使用别的插件提供的能力，是没办法通过import的方式引入依赖的，为了让你的ts代码不飘红，要通过declare的方式来扩展定义；
 
+比如声明你的插件提供的service或者函数，
+```ts
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    sell: (cups: number) => void
+  }
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    water: WaterService
+    power: PowerService
+    finance: FinanceService
+  }
+}
+```
+
+比如声明你的插件会发一个`water/maintenance`的事件
+```ts
+// services.ts:14-17
+declare module 'cordis' {
+  interface Events {
+    'water/maintenance'(message: string): void   // ← 补一个频道：名 + 回调参数类型
+  }
+}
+```
 
 ## 结合代码重放一遍插件是如何在cordis里注册的
 
 咱们现在把同一件事**从代码维度**走一遍。
 >示例用 `examples/dsh/cordis/coffeeshop/`（多层级版：根 → 楼层管理 → 咖啡店 → 自营保洁），所有行号都指这个目录下的文件。先给一张「故事角色 ↔ 代码实体」对照表，后面每一拍都落在这张表上：
+
+### 0. 先看全景：样例里的 7 个插件与依赖关系
+
+coffeeshop 一共 7 个插件，依赖关系如下，咱们主要看coffee、water和power：
+
+| 插件 | 文件 | 依赖（inject） | 注册位置 | 对外提供 |
+|---|---|---|---|---|
+| `coffeePlugin` 咖啡店 | coffee.ts | `water`, `power` | floor 名下 | `sell` |
+| `WaterService` 供水 | services.ts | 无 | 根 | `water` |
+| `PowerService` 供电 | services.ts | `water` | 根 | `power` |
+| `floorManagerPlugin` 楼层管理 | floor.ts | 无（注册即激活） | 根 | `meetingRoom` |
+| `bakeryPlugin` 面包店 | floor.ts | 无 | floor 名下 | — |
+| `CleaningService` 保洁 | cleaning.ts | 无 | coffee 名下 | `cleaning` |
+| `FinanceService` 财务 | services.ts | 无 | 根 | `finance` |
 
 ### 1. 第一步：`new Context()` —— 盖楼 + 开盘
 
@@ -314,7 +356,7 @@ const ctx = new Context()
 
 注册动作就是调 `ctx.plugin(...)`（它是 `registry` 的门面）。coffeeshop 里出现**两种注册形态**：
 
-**形态 A —— 对象插件（普通团队）**，靠 `inject` 声明开业条件（咖啡店就是这种）：
+**形态 A —— 对象插件**，靠 `inject` 声明开业条件（咖啡店就是这种）：
 ```ts
 // coffee.ts:17-19
 export const coffeePlugin = {
@@ -327,11 +369,15 @@ export const coffeePlugin = {
 ```ts
 // floor.ts:48-49
 const coffeeFiber = ctx.plugin(coffeePlugin)  // ← 招商办受理：建档 + new Fiber，返回 fiber
+```
+对于coffee这类业务插件，通过如上注册，等待Cordis的调度，满足依赖条件之后，开始运行自身的逻辑就可以了；
+如果希望你的插件服务也可以被其他插件使用，比如咱们的例子里，面包店希望和咖啡店合作，卖咖啡，coffee就需要把自己的能力在apply的时候`provide`出来；
+```ts
 ctx.provide('coffee', coffeeFiber)            // ← 把「咖啡店 fiber」也挂出去，方便楼外 await
 ```
+如果你的插件不对外提供服务，使用对象插件或者更简单的函数插件的方式就可以了。
 
 **形态 B —— Service 子类**：
-
 ```ts
 // services.ts:20-24
 export class WaterService extends Service {
@@ -342,279 +388,225 @@ export class WaterService extends Service {
 }
 ```
 
-它的注册在入口处（先挂楼层管理之后，`main.ts:29`）：`await ctx.plugin(WaterService)`。
-`Registry.resolve` 会 `new WaterService`，其 `super(ctx,'water')` 触发 `ctx.provide('water', this)`
-**这个实例既是插件实例，也是 'water' 服务的实现**（牌子挂的就是 `this`）。`main.ts:30,31` 同理挂上 `power`、`finance`。
-
-> `ctx.plugin` 背后 registry 做的「resolve → 建档 → `new Fiber`」、以及「fiber 是 `ctx.plugin` 现场 `extend`+`new` 出来的、`inject` 是写进 Fiber 的开业条件条款」这些机制，已在 §cordis核心对象简介 的 `registry` / `Fiber` 两段讲透，这里对照代码即可：`floor.ts:48` 那次 `ctx.plugin` 返回的就是新 `Fiber`，`services.ts:22` 那个 `super(ctx,'water')` 同时完成了「插件实例 + 服务挂牌」。
-
-**两种形态的本质区别。** 二者都经 `ctx.plugin()` 受理、都 `new` 出 fiber、走同一套管线——区别不在"怎么注册"，而在**注册出来的对象"是什么角色"**：
-
-| | 形态 A（对象插件） | 形态 B（Service 子类） |
-|---|---|---|
-| 角色 | 纯消费方 / 只有行为（故事里的「租户 / 团队」） | 既是插件又是服务（故事里的「部门」） |
-| 挂牌 | 自己**不对外挂牌**，只靠 `inject` 声明"开业前得先借到谁" | 构造时 `super(ctx,'water')` 把 `this` 挂成 `ctx.water`，**注册即挂牌** |
-| 被人使用 | `await` 它返回的 fiber，或它 `apply` 里主动 `provide` 的东西（如咖啡店 `ctx.provide('sell',…)` → 楼外 `ctx.sell(3)`） | 别人只要 `inject:['water']` 或 `ctx.water` 就能借到，无需知道它叫什么插件 |
-
-一句话：**形态 A 要"一段可被依赖驱动启停的逻辑"，形态 B 要"一个可被借用的服务"。** 二者不互斥——对象插件在 `apply` 里多次 `ctx.provide()` 可挂多块牌子（团队+多部门）；Service 子类若 `inject` 了别人，就是"既当部门又当租户"。
-
-#### 2.1 declare module：类型层注册 vs 运行时注册
-
-前面 §2 讲的 `ctx.plugin` / `ctx.provide` / `ctx.on` 全是**运行时**动作——代码真正跑起来才建档、挂牌、订阅。但还有一个绕不开的问题：coffeeshop 里你写 `ctx.water.supply()`、`ctx.emit('water/maintenance', ...)` 时，TS 凭什么不报红？`water` 这个属性、`water/maintenance` 这个频道名，编译器是怎么知道的？
-
-答案是 **`declare module 'cordis'`**——这是 TypeScript 的「接口合并（declaration merging）」，用来给 cordis 的 `Context` / `Events` 接口**补类型**。它**只活在编译期，不在运行时创建任何东西**，所以严格说它不是"注册"，而是"类型层承诺"。
-
-**两条扩展路径，对应两类名字：**
-
-**(a) 事件频道名 —— 扩 `Events` 接口。** coffeeshop 里频道类型的约束写在 `services.ts:14-17`：
-
+供水、供电plugin注册在楼层管理之后()`main.ts:29`）。通过继承Service类的插件注册，通过调用父类构造函数完成。
+对于提供基础能力的插件，通过Service的方式注册，激活的同时，也将自己的能力provide到上下文中方便其他插件调用。
 ```ts
-// services.ts:14-17
-declare module 'cordis' {
-  interface Events {
-    'water/maintenance'(message: string): void   // ← 补一个频道：名 + 回调参数类型
+  //Service类构造函数构造函数
+  constructor(protected ctx: Context, name: string) {
+    name ??= this.constructor['provide'] as string
+    ...
+    self.ctx.reflect.provide(name, self, this[symbols.check])
+    return self
   }
-}
 ```
-
-补完之后，`ctx.emit('water/maintenance', msg)` 和 `ctx.on('water/maintenance', cb)` 的**频道字符串和回调参数**才受类型保护——拼错频道名（如 `'water/mantenance'`）、传错 `msg` 类型，编译期直接报错。运行时真正把监听挂上、把消息发出去的，依旧是 `EventsService`（`on`/`emit`），`declare` 一句都没参与。
-
-**(b) 依赖注入的服务名 —— 扩 `Context` 上的属性。** 那些能直接 `ctx.water` / `ctx.power` / `ctx.meetingRoom` 点出来的属性，运行时是 `Service` 构造时 `super(ctx,'water')` → `ctx.provide('water', this)` 挂上去的；但要让 `ctx.water` 在 TS 里点得出来、拿到的类型正确，同样靠 `declare module 'cordis'` 给 `Context` 补索引签名 / 具名属性。否则 `ctx.water` 就是 `any` 甚至编译报错。
-
-**一句话区分三层：**
-
-| 层面 | 谁负责 | 动作 | coffeeshop 落点 |
-|---|---|---|---|
-| 类型层 | `declare module 'cordis'` | 接口合并，给 `Context`/`Events` 补名字与类型 | `services.ts:14-17`（Events） |
-| 运行时-服务 | `ctx.provide` / `super(ctx,'key')` | 真正把实例挂到 fiber 上 | `services.ts:22`（`super(ctx,'water')`） |
-| 运行时-插件 | `ctx.plugin` | resolve → 建档 → `new Fiber` | `main.ts:22` / `floor.ts:48` |
-| 运行时-订阅 | `ctx.on` / `ctx.emit` | 调 `EventsService` 动态挂监听 / 发消息 | `coffee.ts:35` / `main.ts:34` |
-
-**插件提供的 service 名、事件频道名，要在 TS 工程里做到类型安全，都得靠 `declare module 'cordis'` 扩接口**；但 `declare` 只解决"写代码不报红、拼错能查出来"，真正的注册（`plugin` / `provide` / `on`）是运行时那一摊。故事侧重运行时，所以没单列 `declare`；落到真实 TS 项目，这两类名字缺了类型扩展，IDE 和编译器都不会认。
-
-#### 2.2 Service 子类也有依赖，且有两种 provide 时机
-
-前面把 Service 子类当成"构造即挂牌的部门"，容易让人以为它和依赖无关。其实**Service 子类照样能声明依赖**，而且它的"挂牌时机"有两种写法，语义完全不同——这正是 coffeeshop 里 `WaterService` 和 `PowerService` 的对照。
-
-**(a) 构造时直接 provide（无依赖、硬挂牌）—— `WaterService`**
-
+在咱们的例子里，coffee插件工作时，就调用了water和power提供的能力，
 ```ts
-// services.ts:20-28
-export class WaterService extends Service {
-  constructor(ctx: Context) {
-    super(ctx, 'water')                 // ← 构造即挂牌：Service 基类在这里调 ctx.provide('water', this)
-    ctx.logger('water').info('供水部门挂牌（大厦公用）')
-  }
-  supply(): string { return '自来水' }
-}
-```
-
-`super(ctx,'water')` 在构造器里**同步**把 `this` 挂成 `ctx.water`。只要这个 Service 自己没有 `inject`，它一注册（`main.ts:29`）就立刻挂牌生效——供水部门不依赖任何人，所以"开盘即营业"。这是最常见的写法：**部门无前置条件，挂上去就能用**。
-
-**(b) 依赖就绪后、apply/init 里 provide—— `PowerService`**
-
-```ts
-// services.ts:30-53
-export class PowerService extends Service {
-  static inject = ['water']             // ← Service 子类照样能声明依赖（fiber 级 inject，和对象插件同机制）
-  constructor(ctx: Context) {
-    super(ctx, 'power-placeholder')     // ← 占位名，先不挂真名 'power'
-    ctx.logger('power').info('供电所建成，但得等通水才挂牌营业')
-  }
-  [Service.init]() {                    // ← Service 版的 apply：依赖齐了才跑
-    this.ctx.provide('power', this)     // ← 这时才把 'power' 真正挂出去
-    this.ctx.logger('power').info('通水了，供电部门正式挂牌（大厦公用）')
-  }
-  available(): number { return 100 }
-}
-```
-
-`PowerService` 声明了 `static inject = ['water']`：供电所自己得先通水才能运转。fiber 等 `water` 就绪后才 `_reload`、跑 `[Service.init]`，里面的 `ctx.provide('power', this)` 才执行——**'power' 这块牌子是"依赖齐了才挂"的**。运行日志印证了这点：
-
-```
-[09:00] 供水部门挂牌（大厦公用）          ← water 先上
-[09:00] 供电所建成，但得等通水才挂牌营业  ← power 构造完成、仍 PENDING
-[09:00] 通水了，供电部门正式挂牌（大厦公用）← water 就绪 → init 跑 → power 挂牌
-[09:00] 咖啡店开业！... 供电=100kW        ← 此刻 coffee 的 inject[water,power] 才全齐
-```
-
-**两种时机的本质差别（一句话）：**
-
-| 写法 | 挂牌时机 | 适用 | coffeeshop 落点 |
-|---|---|---|---|
-| 构造时 `super(ctx,'key')` | 注册即挂，不看过路依赖 | 部门无前置条件 | `WaterService` / `FinanceService` |
-| `apply`/`[Service.init]` 里 `provide` | 依赖齐了才挂 | 部门自己也依赖别人 | `PowerService` |
-
-补充一点：`Service.init` 就是 Service 子类的 `apply`——fiber 判定 `runtime.callback` 是构造函数时，会 `new` 出实例、再调 `instance[Service.init]()`（见 §cordis核心对象简介 的 `Fiber` 执行段）。所以"对象插件的 `apply`"和"Service 子类的 `init`"是**同一个机制的两张脸**：都是"依赖齐了才执行的一段逻辑"，区别只是对象插件这段逻辑不自动挂牌、Service 子类常在这段逻辑里 `provide` 自己。
-
-> **一个实战坑（复业等待的写法）：** 既然激活是异步的，复业时**不能**写 `await ctx.get('coffee'); ctx.sell(2)`——`get` 拿到 fiber 后 `await` 是非 thenable 的、立即返回，而咖啡店是异步 reload 的，`sell` 还没挂上就会 `TypeError`。coffeeshop 复业段（`main.ts:46-49`）改成了**等 `internal/service` 事件**：cordis 每完成一次 provide 都会 `emit('internal/service', name, value)`，监听 `name === 'sell'` 才真正动手。这个事件类型也在 `services.ts` 的 `declare module` 里补了签名（呼应 §2.1：运行时注册和类型声明要配套）。
-
-### 3. 店长核对资源 / 等待激活（PENDING）
-
-Fiber 一创建，就拿着自己的 `inject` 清单去核对每一项依赖有没有人 `provide`——查全了才 `_reload()` 跑 `apply` 开业（ACTIVE），没查全就停在 **PENDING**（`apply` 不执行）。这套「协议主动出击、楼管只传声」的机制（含 `_checkImpl` / `epoch` 状态机）已在 §cordis核心对象简介 的 `Fiber` 与 `reflect.notify` 两段讲透，这里只对照 coffeeshop 的时间线：
-
-**一个重要的时间线事实：** 在这个多层示例里，`main.ts:22` 先 `await ctx.plugin(floorManagerPlugin)`、进而在 `floor.ts:48` 注册咖啡店；而 `WaterService` / `PowerService` / `FinanceService` 要等到 `main.ts:29-31` 才挂到根上。所以**咖啡店被注册的那一刻，water/power 还没挂牌**，它一出生就停在 **PENDING**，直到 `[09:00]` 供水/供电挂牌、依赖齐了才自动翻成 ACTIVE 开业——和故事里「开局 PENDING → 挂牌后自动开业」的节奏完全对齐。
-
-那「等待激活」在 coffeeshop 里体现在哪？两个真实落点：
-
-1. **开局 PENDING**：`main.ts:22` 注册咖啡店时 water/power 未挂牌 → 停在 PENDING，日志里此时没有任何「咖啡店开业」输出；`main.ts:29-31` 挂牌后自动开业。这是最直观的「等依赖就绪」演示。
-2. **复业等待**（见 §6）：先删供水让咖啡店停业，再重新挂牌供水，此时咖啡店从停业→复业，`main.ts:46` 用 `await ctx.get('coffee')` 卡住等它重新激活完成（注意 `floor.ts` 里 `await coffeeFiber` 是另一个显式等待点，在楼层管理 `apply` 内等咖啡店 fiber 就绪）。
-
-（单文件 `07-coffeeshop.ts` 也演示了开局 PENDING，但 coffeeshop 多层级版现在同样演示了——而且还能顺带展示「显式 await 等待点」和「复业等待」两种形态。依赖驱动启停 / 复业的状态机图见 §cordis核心对象简介 的 `Fiber` 状态机部分。）
-
-### 4. 激活后开始工作（apply 执行）
-
-依赖齐了，`apply(ctx)` 才跑——这就是「开业」。`coffee.ts:20-55` 里每一行都是开业后要干的活，逐一看：
-
-```ts
-// coffee.ts:22-23  ① 本班营业账清零（每次重新开业都重走一遍，账归零）
-let shiftNote = 0
 ctx.logger.info('咖啡店开业！供水=' + ctx.water.supply() + ' 供电=' + ctx.power.available() + 'kW')
 ```
 
+顺便提一下，service类型的plugin，也可以声明依赖，比如我们的power插件，依赖water；
 ```ts
-// coffee.ts:28-29  ② 注册自营保洁（子插件，挂在咖啡店名下 → 随店清退）
-await ctx.plugin(CleaningService)
-ctx.logger.info('咖啡店叫自家保洁：' + ctx.get('cleaning')!.clean())
-```
-注意：查找链只**向上**（咖啡店→楼层→根），够不到自己挂的「孩子」，所以要用 `ctx.get('cleaning')` 直查，而不是 `ctx.cleaning`。查找链的向上穿透与 `ctx.get` 直查机制见 §cordis核心对象简介 的 fiber 链一节。
-
-```ts
-// coffee.ts:32  ③ 借楼层的共享会议室：楼层管理 provide 的，沿链向上命中，不用 inject
-ctx.logger.info('咖啡店借楼层会议室：' + ctx.meetingRoom.book())
-```
-
-```ts
-// coffee.ts:35-37  ④ 订阅广播（接收通知，见 §5）
-ctx.on('water/maintenance', (msg) => {
-  ctx.logger.info('收到大楼广播：' + msg + ' → 准备提前歇业')
-})
-```
-
-```ts
-// coffee.ts:40-41  ⑤ 协议附件登记撤场处理（LIFO：后登记的先执行）
-ctx.effect(() => () => ctx.logger.info('撤场：摘下门口的画'))
-ctx.effect(() => () => ctx.logger.info('撤场：停掉订阅的报纸'))
-```
-
-```ts
-// coffee.ts:44-49  ⑥ 卖咖啡 + 把自己能提供的服务挂出去（provide）
-const sell = (cups: number) => {
-  shiftNote += cups
-  ctx.get('finance')!.record(cups)        // 长期账交财务部（ctx.get 借根上常驻部门）
-  ctx.logger.info('卖出 ' + cups + ' 杯（本班 ' + shiftNote + ' / 全店 ' + ctx.get('finance')!.balance() + '）')
-}
-ctx.provide('sell', sell)                 // ← 咖啡店对外挂牌 'sell'
-```
-
-```ts
-// coffee.ts:52-54  ⑦ 退租清理（依赖消失时被调用，从最后一项往回执行）
-return () => {
-  ctx.logger.info('咖啡店停业（本班营业账 ' + shiftNote + ' 杯作废；财务部总账仍在）')
+export class PowerService extends Service {
+  static inject = ['water']             // ← Service 子类照样能声明依赖（fiber 级 inject，和对象插件同机制）
+  constructor(ctx: Context) {
+    super(ctx, 'power')     // ← 占位名，先不挂真名 'power'
+    ctx.logger('power').info('供电所建成，但得等通水才挂牌营业')
+  }
 }
 ```
 
-`ctx.provide('sell', sell)` 就是故事里「咖啡店对外挂牌」——之后楼外 `main.ts:37` 的 `ctx.sell(3)` 才能调到。**provide 出去的名字 = 别的插件/代码能 `ctx.xxx` 借到的分机。**
-
-### 5. 如何发通知 / 如何接收通知
-
-coffeeshop 里这条链路是**最简的 emit（单向，发完不管）+ on（订阅）**：
-
-**发通知**（供水部门，作为发起方全网广播）：
-
+`main.ts` 是「楼外 client」——它跑在根 fiber 里，没有 `inject` 门禁，所以要用 `ready()` 等服务上线、用 strict `ctx.get()` 查服务是否还在。
+当前的调用顺序如下，
 ```ts
-// main.ts:34
-ctx.emit('water/maintenance', '今晚18:00 停水')
-```
+async function main() {
+  const ctx = new Context()
+  ctx.logger.exporter({ /* 把秘书处台账接到控制台 */ })
 
-`emit` 走的是 `events` 总线，把消息推到 `water/maintenance` 频道，**发完不管**——供水部门不关心谁收到、怎么应对。频道名在 `services.ts:14-17` 用 `declare module` 做了类型约束：
+  // [08:30] 挂楼层管理：coffee / bakery 随之登记，但都因依赖未齐而 PENDING
+  await ctx.plugin(floorManagerPlugin)
 
-```ts
-// services.ts:14-17
-interface Events {
-  'water/maintenance'(message: string): void
+  // [09:00] 挂公用部门：finance 一挂牌，water→power→coffee→bakery 的级联被触发
+  await ctx.plugin(PowerService)
+  await ctx.plugin(WaterService)
+  await ctx.plugin(FinanceService)
+
+  // 楼外 client：按服务名等咖啡店 ACTIVE，不持有 coffee 的 fiber
+  const sell = await ready(ctx, 'sell')
+  sell(5, 'main ')
+
+  ctx.emit('water/maintenance', '今晚18:00 停水')
+
+  // [14:00] 停水：coffee 同步离开 ACTIVE，strict get 当场返回 undefined
+  ctx.registry.delete(WaterService)
+  try {
+    const s = ctx.get('sell', true)          // 同步快照：删水后必为 undefined
+    if (!s) throw new Error('coffee shop gone, cannot sell')
+    s(2, 'main ')
+  } catch (error) {
+    console.error('[error] ' + (error as Error).message)
+  }
+
+  // [15:00] 复水：等咖啡店重新开业、sell 重新 provide
+  await ctx.plugin(WaterService)
+  const reopenedSell = await ready(ctx, 'sell')
+  reopenedSell(3, 'main ')
+
+  // [18:00] 楼层退租：三楼整层（coffee / bakery / cleaning）级联清退
+  ctx.registry.delete(floorManagerPlugin)
 }
 ```
 
-**接收通知**（咖啡店订阅自己关心的频道）：
+下面这段是上面代码真实跑出的日志（`cd examples/dsh/cordis && npx tsx coffeeshop/main.ts`）。
+我们按时间分五拍，逐行说清楚「这一行是谁、因为什么打出来的」。
 
-```ts
-// coffee.ts:35-37
-ctx.on('water/maintenance', (msg) => {
-  ctx.logger.info('收到大楼广播：' + msg + ' → 准备提前歇业')
-})
+```shell
+[08:00] 大厦开张，供水/供电/财务部还没挂牌
+[08:30] 先挂楼层管理 → 咖啡店入驻，但 inject 缺 water/power → PENDING，不开业
+  [秘书处] INFO [floor-manager] 楼层管理挂牌（三楼）
+[09:00] 依次挂牌供电/供水/财务部
+  [秘书处] INFO [water] 供水部门挂牌（大厦公用）
+  [秘书处] INFO [power] 通水了，供电部门正式挂牌（大厦公用）
+  [秘书处] INFO [finance] 财务部挂牌（长期账本归这里）
+  [秘书处] INFO [coffee] 咖啡店开业！供水=自来水 供电=100kW
+  [秘书处] INFO [cleaning] 保洁挂牌（瑞迪星自营，随咖啡店退租一并清退）
+  [秘书处] INFO [coffee] 咖啡店叫自家保洁：地板已拖净
+  [秘书处] INFO [coffee] 咖啡店借楼层会议室：三楼会议室已预订
+  [秘书处] INFO [bakery] 面包店开业（三楼兄弟租户）
+  [秘书处] INFO [coffee] bakery卖出 2 杯（本班 2 / 全店 2）
+  [秘书处] INFO [coffee] main 卖出 5 杯（本班 7 / 全店 7）
+[14:00] 供水退租
+[error] coffee shop gone, cannot sell
+[15:00] 新供水挂牌 → 咖啡店重新走一遍开业流程
+  [秘书处] INFO [coffee] 咖啡店停业（本班营业账 7 杯作废；财务部总账仍在）
+  [秘书处] INFO [water] 供水部门挂牌（大厦公用）
+  [秘书处] INFO [bakery] 面包店撤场（随三楼一并退）
+  [秘书处] INFO [cleaning] 保洁撤场（随咖啡店一并退）
+  [秘书处] INFO [power] 通水了，供电部门正式挂牌（大厦公用）
+  [秘书处] INFO [coffee] 咖啡店开业！供水=自来水 供电=100kW
+  [秘书处] INFO [cleaning] 保洁挂牌（瑞迪星自营，随咖啡店退租一并清退）
+  [秘书处] INFO [coffee] 咖啡店叫自家保洁：地板已拖净
+  [秘书处] INFO [coffee] 咖啡店借楼层会议室：三楼会议室已预订
+  [秘书处] INFO [bakery] 面包店开业（三楼兄弟租户）
+  [秘书处] INFO [coffee] bakery卖出 2 杯（本班 2 / 全店 9）
+  [秘书处] INFO [coffee] main 卖出 3 杯（本班 5 / 全店 12）
+财务账本累计（跨停业保留）= 12
+[18:00] 楼层管理退租 → 三楼整层清退
+  [秘书处] INFO [bakery] 面包店撤场（随三楼一并退）
+  [秘书处] INFO [coffee] 咖啡店停业（本班营业账 5 杯作废；财务部总账仍在）
+  [秘书处] INFO [cleaning] 保洁撤场（随咖啡店一并退）
 ```
 
-`ctx.on(频道, 回调)` 是订阅，只收自己关心的频道。区别**只在「发的时候用哪个函数」**，广播系统共有四种模式（coffeeshop 只演示了 emit，其余三种在单文件 `07-coffeeshop.ts` 里演示）：
+**第一拍（08:00–08:30）——只有楼层管理开业。**
 
-- `emit`：单向，发完不管（本示例即用）。
-- `parallel`：广播 + **等全员回执**（await 所有监听器，都处理完才返回）。
-- `serial` / `bail`：首位应答者拍板（任意一家有影响反馈就短路，其余不被调到）。
-- `waterfall`：层层流转单（经手人不调 `next()` 即打回/短路）。
+- `[08:00]` / `[08:30]` 两行是 `main.ts` 自己的 `console.log`，纯剧本旁白。
+- `[floor-manager] 楼层管理挂牌` 来自楼层管理 `apply` 里的 `ctx.logger.info`（`floor.ts:34`）。
+  楼层管理没有 `inject`，注册即激活，所以它的 `apply` 在 `await ctx.plugin(floorManagerPlugin)` 期间同步跑完。
+- 注意这一拍**没有** coffee、bakery、cleaning 的日志。
+  floor 的 `apply` 里确实 `ctx.plugin(coffeePlugin)` 和 `ctx.plugin(bakeryPlugin)` 了（`floor.ts:45-46`），但 coffee 缺 `water/power/finance`、bakery 缺 `sell`，两个 fiber 都停在 PENDING，`apply` 根本不执行。
 
-一句话：**发 = `ctx.emit/on/parallel/serial/waterfall`，收 = `ctx.on`**，频道字符串是双方的约定。频道名的类型层约束（`services.ts:14-17` 的 `declare module` 扩展 `Events`）与运行时 `on`/`emit` 的关系，已在 §2.1 讲透，这里不重复。
+**第二拍（09:00）——公用部门挂牌，级联把整栋楼叫醒。**
 
-### 6. 依赖驱动启停 + 复业
+- `[09:00] 依次挂牌…` 是 main 的旁白。
+- `[water] 供水部门挂牌` 是 `WaterService` 构造函数里的日志（`services.ts:25`）。
+  `super(ctx, 'water')` 这一句把供水以 `'water'` 之名 provide 到根上下文。
+- `[power] 通水了，供电部门正式挂牌` 是 `PowerService` 构造函数（`services.ts:41`）。
+  供电声明了 `static inject = ['water']`（`services.ts:37`），所以它在供水挂牌前一直 PENDING；水一到，它才被调度执行构造函数、`super(ctx, 'power')` 挂牌。
+  这一行出现在 water 之后，正是「依赖就绪才激活」的可见证据。
+- `[finance] 财务部挂牌` 是 `FinanceService` 构造函数（`services.ts:55`）。
+  财务部没有 `inject`，注册即挂牌。
+- `[coffee] 咖啡店开业！` 是 coffee `apply` 的第一行（`coffee.ts:22`）。
+  它要等的三个依赖 `water/power/finance` 到这一刻才全部 ACTIVE，楼管 `notify` 把它从 PENDING 翻成 ACTIVE，`apply` 才开始跑。
+  它能直接读到 `ctx.water.supply()` 和 `ctx.power.available()`，是因为 `inject` 门禁向它保证了这两个服务在。
+- `[cleaning] 保洁挂牌` 来自 `CleaningService` 构造函数（`cleaning.ts:17`）。
+  它不是 main 注册的，而是 coffee 在 `apply` 里 `await ctx.plugin(CleaningService)`（`coffee.ts:27`）注册的，所以挂在 coffee 名下。
+- `[coffee] 咖啡店叫自家保洁：地板已拖净` 和 `[coffee] 借楼层会议室：…` 是 coffee `apply` 从 cleaning 的 `await` 恢复后继续打的日志（`coffee.ts:35-36`）。
+  前者用 `ctx.get('cleaning')` 取自营保洁，后者沿父链读到楼层管理 provide 的 `meetingRoom`。
+- 这里有个关键时序：`await ctx.plugin(CleaningService)` 让 coffee 的 `apply` 让出了一次微任务，所以真正的 `ctx.provide('sell', sell)`（`coffee.ts:40`）要更晚才执行。
+  这也是为什么楼外的 main **不能**在挂完 finance 后立刻同步读 `sell`——它必须 `await ready(ctx, 'sell')`。
+- `[bakery] 面包店开业` 是 bakery `apply`（`floor.ts:25`）。
+  bakery 声明了 `inject: ['sell']`（`floor.ts:23`），所以它的激活被排在 coffee 之后：coffee provide 出 `sell`、fiber 翻成 ACTIVE，楼管通知 bakery，它才开业。
+- `[coffee] bakery卖出 2 杯` 是 bakery 在 `apply` 里调 `ctx.sell(2, 'bakery')`（`floor.ts:26`）打进 coffee 的日志。
+  卖咖啡的函数是 coffee 定义的，所以日志名是 `[coffee]`；`本班 2 / 全店 2` 里「本班」是 coffee 这次开业的局部计数、「全店」是根上财务部的累计。
+- `[coffee] main 卖出 5 杯` 是 main 的 `ready(ctx,'sell')` resolve 后调 `sell(5, 'main ')`（`main.ts:36-37`）打进的。
+  `本班 7 / 全店 7` 说明 bakery 的 2 杯和 main 的 5 杯记在同一本账上。
 
-这是 coffeeshop 最精彩的一段，把「等待激活 / 自动停业 / 自动复业」全演示了：
+**第三拍（14:00）——停水，咖啡店同步离场。**
 
-```ts
-// main.ts:42  供水退租 → reflect 挨个通知依赖 'water' 的店长 → 咖啡店自动停业、自营保洁随店一并清退
-ctx.registry.delete(WaterService)
+- `[14:00] 供水退租` 是 main 的旁白，紧接 `ctx.registry.delete(WaterService)`（`main.ts:45`）。
+- `[error] coffee shop gone, cannot sell` 是 main 的 catch 打出来的（`main.ts:60`）。
+  删水后 coffee 的 fiber 在**同一个调用栈内**就被切出 ACTIVE（epoch 变 INACTIVE），所以 strict `ctx.get('sell', true)` 当场返回 `undefined`，main 主动抛错并接住。
+  这里不能用 `await ready()`——`ready` 是「等服务上线」，水刚删还没挂回来时它要么挂起、要么（不做 strict 复查时）把正在卸载的旧闭包当有效值返回。
+- 注意这一拍**看不到**「咖啡店停业」「保洁撤场」。
+  那些是卸载 disposer，跑在 `delete` 之后的微任务里；而 main 从 `delete` 到 15:00 之间没有任何 `await`，微任务一直没机会 flush，所以这些清理日志被推迟到了下一拍。
 
-// main.ts:45-47  新供水挂牌 → 楼管再核对 → 咖啡店重新走一遍开业流程（apply 重跑）
-await ctx.plugin(WaterService)
-await ctx.get('coffee')   // ← 等咖啡店重新激活完成（sell 重新挂上）再卖
-ctx.sell(2)
-```
+**第四拍（15:00）——复水，旧店收尾与新店开业交织。**
 
-谁挂牌/摘牌，楼管 `reflect.notify()` 就**按服务名反查**所有 `inject` 含该名字的 fiber，凡命中的就重算依赖——齐了自动开业，缺了自动撤场（**楼管只传声、不拍板，开不开由店长自己定**）。这套「`notify` 反查 + epoch 重算 + 级联」机制已在 §cordis核心对象简介 的 `reflect.notify` 一段讲透，这里对照代码看效果即可。
+- `[15:00] 新供水挂牌…` 是 main 的旁白；紧接着 `await ctx.plugin(WaterService)`（`main.ts:63`）让出微任务队列，上一拍积攒的卸载 disposer 终于执行。
+- `[coffee] 咖啡店停业（本班营业账 7 杯作废…）` 是上一轮 coffee `apply` 返回的清理函数（`coffee.ts:43`）。
+  它在这一刻才跑，正好解释了「本班 7」——上一轮开业累计的 7 杯（bakery 2 + main 5）随旧店作废；财务部总账不受影响。
+- `[water] 供水部门挂牌` 是新供水的构造日志。
+- `[bakery] 面包店撤场` / `[cleaning] 保洁撤场` 是上一轮 bakery、cleaning 的撤场 effect（`floor.ts:27`、`cleaning.ts`），同样是被推迟到这一拍才 flush。
+- `[power] 通水了…` 是新供水到达后，供电重新激活的构造日志。
+- 之后 `[coffee] 咖啡店开业` → `[cleaning] 保洁挂牌` → `[coffee] 叫保洁/借会议室` → `[bakery] 面包店开业` → `bakery卖出 2 杯` → `main 卖出 3 杯`，和第二拍完全同构，是新一轮开业的完整重演。
+  `本班 2 / 全店 9`、`本班 5 / 全店 12` 说明局部账重新从 0 开始（2、5），而财务总账在旧账 7 的基础上继续累计到 9、12。
+- `财务账本累计（跨停业保留）= 12` 是 main 最后读 `ctx.finance.balance()`（`main.ts:67`）。
+  12 = 第一轮 7 + 第二轮 5（bakery 2 + main 3），证明长期状态挂在根上的财务部、不随门店停业清零。
 
-注意「本班营业账作废、营业总账交财务部」：闭包里的 `shiftNote` 随 `apply` 重跑丢失，所以**长期状态必须放进 Service 实例**（`FinanceService` 挂在根上，`balance()` 跨停业保留，`main.ts:49` 打印累计账本）。
+**第五拍（18:00）——楼层退租，整层级联清退。**
 
-最后 `main.ts:53` `ctx.registry.delete(floorManagerPlugin)` 触发**层级联清退**：三楼整层（咖啡店 / 面包店 / 保洁）一并撤场，每个 `ctx.effect` 登记的撤场项按 LIFO 倒序执行。
+- `[18:00] 楼层退租…` 是 main 最后的旁白，对应 `ctx.registry.delete(floorManagerPlugin)`（`main.ts:71`）。
+- `[bakery] 撤场` → `[coffee] 停业（本班 5 杯作废）` → `[cleaning] 撤场` 三行是三楼子树自下而上的 disposer。
+  floor 一退，挂在它名下的 coffee、以及 coffee 名下的 cleaning、和 floor 名下的 bakery 全部连带清退——这就是「父级卸载，子树级联销毁」。
+  它们的顺序（LIFO + 子先于父）由 fiber 的 disposable 列表保证。
 
-### 7. 退租清理（effect / dispose，LIFO）+ 层级联清退
+整段日志串起来想说明三件事。
+一是**激活顺序由依赖决定，不由注册顺序决定**：power 在 water 之后开业、bakery 在 coffee 之后开业，都是 `inject` 门禁驱动的。
+二是**上线异步、下线同步**：开业要跨 `PENDING → LOADING → ACTIVE` 的微任务链，所以楼外要 `await ready`；删依赖时 fiber 当场离场，strict `get` 立刻能查到。
+三是**闭包引用脱离生命周期**：main 手里那个旧 `sell` 闭包在停水后理论上仍能调用（它只引用根上的 finance），所以停业后必须重新 `ctx.get` 而不能复用旧引用——这也是第三拍用 strict get 拦截的原因。
 
-经营期间每添置一样东西，都要在协议附件（`ctx.effect()` 的 dispose 清单）上登记「撤场时怎么处理」。咖啡店在 `coffee.ts:40-41` 登记了两样——摘画、停报纸；退租时从最后一项往回执行（LIFO）：日志里「停掉报纸」排在「摘下画」之前，因为报纸后登记、先撤。
+### 3. 通知
 
-```ts
-// coffee.ts:52-54  apply 末尾 return 的清理函数，依赖消失时被调用
-return () => {
-  ctx.logger.info('咖啡店停业（本班营业账 ' + shiftNote + ' 杯作废；财务部总账仍在）')
-}
-```
+上一拍日志里反复出现「水一到，供电/咖啡店/面包店依次醒来开业」「水一退，整串依次停业」。
+驱动这一切的是楼管 `reflect` 的**通知机制**：任何服务挂牌或摘牌，`reflect` 都遍历整棵树，找到 `inject` 了这个名字的 fiber，让它重新核对依赖、决定自己开业还是停业。
 
-`cleaning.ts:20` 也登记了撤场项，所以保洁随咖啡店一并清退。**「忘了登记的物业不管」**：没包进 `ctx.effect` 的副作用（比如裸 `setInterval`）在附件上没有条目，退租时自然漏收。
+**通知发起点是 `provide` / 卸载。**
+`provide(name, value)` 把 `impl = { name, value, fiber }` 写进 `ReflectService.store` 后，会调 `notify([name])`（`reflect.ts`）。
+服务卸载（提供方 fiber 退场、impl 从 store 删除）同样触发 `notify([name])`。
+在咱们的例子里，供水 `super(ctx, 'water')`、coffee `ctx.provide('sell', sell)`、`registry.delete(WaterService)` 都是通知发起点。
 
-层级联清退：`floor.ts` 的楼层管理退租（`main.ts:53`）会让**父级 Context 对应的 fiber** 名下所有子 fiber（咖啡店、面包店）先撤场，咖啡店撤场又带动它名下的保洁撤场——一层套一层，整层清空。
+**`notify` 只叫醒「inject 了这个名字」的 fiber。**
+它遍历 `registry` 里所有 runtime 的 fibers，对每个 fiber 检查 `name in fiber.inject`，命中才处理，不命中直接跳过（`reflect.ts` 的 `notify`）。
+所以挂供水只会唤醒 inject 了 `water` 的供电和 coffee，不会惊动面包店；挂 `sell` 只会唤醒 inject 了 `sell` 的 bakery。
 
-### 8. 楼层与隔离（extend / isolate / fiber 链查找）
+**被叫醒的 fiber 做两件事：`_checkImpl` 抄账，`_refresh` 重算状态。**
 
-「楼层」不是 cordis 的内置概念，而是注册结构长出来的：楼层管理本身是一个插件（容器），挂在大厦根上，它的 `apply` 里再 `ctx.plugin` 挂本层租户（`floor.ts:48`）。于是咖啡店的查找链变成：咖啡店 → 楼层管理 → 大厦根——中间多出「三楼」这一层。
+- `_checkImpl(name)`：消费者去总账 `reflect.store` 查这条依赖，查得到（且提供方 ACTIVE）就把这条 `impl` 抄进自己私有的 `fiber._store`，查不到就从 `_store` 删掉（`fiber.ts`）。
+  它只是「查总账 → 写/清自己这本账」的刷新动作，**绝不调用 `provide`**——`provide` 永远只在插件 `apply` 里由开发者写。
+- `_refresh()`：只读自己的 `_store`，遍历 `inject` 逐项核对，全部齐了算出一个非空 `epoch`，缺任何一项就是 `INACTIVE`（`fiber.ts`）。
+- `_setEpoch()` 做真正的状态跃迁：`INACTIVE → 就绪` 就 `_reload()`（跑 `apply` 开业），`就绪 → INACTIVE` 就 `_unload()`（跑 disposer 撤场）。
+  这对应故事里「开不开店由店长自己定」——`reflect` 只负责通知，决策和执行都在 fiber 自己手里。
 
-- **父级服务对子树可见**：咖啡店不 inject、直接 `ctx.meetingRoom` 借到楼层的共享会议室（`coffee.ts:32`，沿链向上命中楼层管理 `floor.ts:40` 的 provide）。
-- **兄弟层不互通**：面包店 `ctx.cleaning` 会报错（`floor.ts:25`），因为自下而上查找只经过自己的父链，够不到旁支（咖啡店名下的 cleaning）。
-- **ctx.get 直查**：咖啡店要用自己挂的保洁、或借根上的财务部，都用 `ctx.get('cleaning')` / `ctx.get('finance')`——查找链向上够不到「孩子」，得主动直查。
-- **isolate / intercept**：跨独立水表（`isolate(name)`）的楼层会被拦下；`intercept(name, config)` 给楼层设统一餐标。隔离与拦截的查找链行为见 §cordis核心对象简介 的相关说明。
+**用第二拍的级联把这条链走一遍。**
 
-### 角色对照（故事 ↔ 代码）
+1. `WaterService` 构造 → `super(ctx,'water')` → store 有了 `water` → `notify(['water'])`。
+2. `notify` 发现供电和 coffee 都 inject 了 `water`，对它们调 `_checkImpl('water')` + `_refresh()`。
+   供电只缺 water，这一项抄进 `_store` 后 epoch 非空，于是 `_reload()` → 构造 `PowerService` → 挂牌 `power` → 又 `notify(['power'])`。
+3. `notify(['power'])` 叫醒 coffee（coffee 也 inject 了 `power`）；此时 finance 也已挂牌，coffee 的 `water/power/finance` 全齐，`_reload()` 跑 coffee 的 `apply`。
+4. coffee `apply` 里 `provide('sell', sell)` → `notify(['sell'])` → 叫醒 inject 了 `sell` 的 bakery → bakery `_reload()` 开业。
 
-- 大厦 → 根 Context（`new Context()`）
-- 楼层 → 子 Context（`ctx.extend()`）
-- 套间 → 插件的子 Context（`ctx.plugin()` 自动 `extend`，每份协议一间）
-- 入驻团队 → 插件实例（`ctx.plugin()` 注册）；分包小组 → 子插件 / 子 Fiber
-- 店长（带着入驻协议上岗）→ Fiber；开业条件 → `inject`；协议附件上的撤场登记 → `ctx.effect()` 收集的 dispose
-- 部门 / 挂牌 → Service / `ctx.provide()`；门口已接通的分机 → `fiber.store`
+这就是为什么日志里 water → power → coffee → bakery 严格按依赖链依次出现，即使它们在代码里的注册顺序是 floor 先把 coffee、bakery 都登记了。
 
-注意「团队」和「部门」是两个角色，但常常由同一个对象兼任：Service 子类插件被 `new` 出来时，这个实例**既是插件实例也是服务实现**（牌子挂的就是 `this`）——团队自己就是部门。
-不过二者不必然一体：一个函数插件可以在 `apply` 里多次 `ctx.provide()` 挂好几块牌子，也可以像纯消费方那样一块都不挂。
-- 招商引资办与名册 → Registry（`Plugin.Runtime` 的集合）
-- 楼管 → reflect（`ReflectService`，Context 这个 Proxy 的 handler）
-- 独立水表 → `isolate(name)`；楼层统一餐标 → `intercept(name, config)`
-- 广播 → `emit` / `parallel`；会签单 → `waterfall`（`serial` / `bail` 是它的变体）
-- 秘书处 → logger（`LoggerService`，开盘即驻的内置常设机构；默认只写内部 ring buffer，对外需挂 exporter）
-- 财务部（保管长期账目的部门）→ 承载长期状态的 Service 实例（挂在根上，咖啡店不靠它开业、用 `ctx.get` 借它记账）
+**`internal/service` 事件是给「树外观察者」的，不是级联驱动力。**
+`notify` 末尾会 `emit('internal/service', name, value)`（`reflect.ts`），但 fiber 之间的级联唤醒在这之前已经由 `notify` 直接调 `_refresh` 完成了。
+这个事件的真正消费者是楼外代码——比如咱们的 `ready()` 助手（`ready.ts`）就靠监听它来「等某个服务上线」，SDK/测试工具也用它观测服务变化。
+把这两件事分开很重要：**级联靠 `notify` 直接调 fiber，事件只是旁路通知。**
+
+**下线是同一条链反向走。**
+`registry.delete(WaterService)` 让 water 的 impl 离开 ACTIVE → `notify(['water'])` → 供电、coffee 的 `_checkImpl('water')` 查不到 → `_store` 清掉该项 → `_refresh` 算出 `INACTIVE` → `_unload()`。
+coffee 卸载又使 `sell` 消失 → `notify(['sell'])` → bakery 跟着 `_unload()`；cleaning 作为 coffee 的子 fiber 随父级回收。
+状态翻转在 `delete` 的同步调用栈内就完成了（所以 strict `get` 当场返回 `undefined`），但 disposer 函数体是 `async` 的，真正打日志要等后续微任务——这正是第三拍看不到撤场日志、第四拍才看到的原因。
+
+> 同一个插件模块可以在不同 `Context` 下挂载多次，每次都有**独立的 Fiber**——「Fiber 是运行实例而非插件定义本身」。`notify` 遍历的是这些运行中的 fiber，不是插件定义。
 
 
 
@@ -670,3 +662,17 @@ ctx.plugin({ name: 'coffee', inject: ['water', 'power'], apply(ctx) { /* 开业�
 | 部门 / 挂牌 | `Service` 子类构造时 `super(ctx,'key')` | `services.ts:22,32,45` |
 | 秘书处 | `logger` | `main.ts:12-17` |
 | 广播系统 | `events`（`ctx.emit` / `ctx.on` …） | `main.ts:34` / `coffee.ts:35` |
+
+
+
+
+**形态 C —— 函数插件**
+还有一种更简洁的函数插件形式，你只需要实现你的apply函数，声明依赖即可;
+>不过在咱们的样例里并没有使用他
+
+```ts
+export const name = 'coffee'
+export function apply(ctx: Context) {
+    console.log('hello')
+  }
+```

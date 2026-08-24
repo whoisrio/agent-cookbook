@@ -78,7 +78,8 @@ export const coffeePlugin = {
 }
 ```
 
-插件通过`registry`提供的`plugin`方法注册时，通过`inject`来声明依赖，
+插件通过`registry`提供的`plugin`方法注册时，通过`inject`来声明依赖，这里的依赖是对服务的依赖，也就是
+xx插件的xx服务通过`provide`激活,依赖他的插件才能走激活流程。
 ```ts
 // 注册插件，返回与 fiber 绑定的 PromiseLike（其 .then 委托给 fiber.await()）
 const coffee = ctx.plugin({

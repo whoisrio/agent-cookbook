@@ -10,45 +10,35 @@ import { CleaningService } from './cleaning'
 // meetingRoom 在 floor.ts（楼层管理）——都是全局合并的类型，coffee 消费时直接可用。
 declare module '@deepseek-ai/cordis' {
   interface Context {
-    sell: (cups: number) => void
+    sell: (cups: number,seller: string) => void
   }
 }
 
 export const coffeePlugin = {
   name: 'coffee',
-  inject: ['water', 'power'] as const,
+  inject: ['water', 'power', 'finance'] as const,
   async apply(ctx: Context) {
-    // 开业流程：每次依赖就绪都会「重新走一遍」——本班营业账在此归零
-    let shiftNote = 0
+    let shiftNote = 0 // 本班营业账：临时状态，每次开业归零，停业即作废
     ctx.logger.info('咖啡店开业！供水=' + ctx.water.supply() + ' 供电=' + ctx.power.available() + 'kW')
 
-    // ① 瑞迪星自营保洁：独立插件，注册在咖啡店名下（子插件）。
-    //    注意：查找链只向上、够不到自己挂的「孩子」，所以咖啡店自己要用保洁，
-    //    得用 ctx.get 直查总账（跟借财务部同款写法）。
+    // 自营保洁：挂在咖啡店名下，随咖啡店退租一并清退（兄弟租户借不到）。
+    // 这里的 await 会让 provide('sell') 推迟到下一个微任务，
+    // 正是「楼外 client 不能在挂完部门后立刻同步读 sell」的根因——要靠 ready() 等。
     await ctx.plugin(CleaningService)
-    ctx.logger.info('咖啡店叫自家保洁：' + ctx.get('cleaning')!.clean())
 
-    // ② 借楼层的共享会议室：楼层管理 provide 的服务，沿链向上就能命中，不用 inject。
-    ctx.logger.info('咖啡店借楼层会议室：' + ctx.meetingRoom.book())
-
-    // 订阅广播：供水部门的停水通知（emit，发完不管，订阅方各自应对）
-    ctx.on('water/maintenance', (msg) => {
-      ctx.logger.info('收到大楼广播：' + msg + ' → 准备提前歇业')
-    })
-
-    // 协议附件登记撤场处理（LIFO：后登记的先执行）
-    ctx.effect(() => () => ctx.logger.info('撤场：摘下门口的画'))
-    ctx.effect(() => () => ctx.logger.info('撤场：停掉订阅的报纸'))
-
-    // 卖一杯：本地记一笔，长期账交给财务部（ctx.get 借根上常驻的财务部）
-    const sell = (cups: number) => {
+    const sell = (cups: number,seller: string = 'nobody') => {
       shiftNote += cups
       ctx.get('finance')!.record(cups)
-      ctx.logger.info('卖出 ' + cups + ' 杯（本班 ' + shiftNote + ' / 全店 ' + ctx.get('finance')!.balance() + '）')
+      ctx.logger.info(seller + '卖出 ' + cups + ' 杯（本班 ' + shiftNote + ' / 全店 ' + ctx.get('finance')!.balance() + '）')
     }
+
+    ctx.logger.info('咖啡店叫自家保洁：' + ctx.get('cleaning')!.clean())
+    ctx.logger.info('咖啡店借楼层会议室：' + ctx.meetingRoom.book())
+
+    // provide 是同步登记进 reflect.store，但依赖方（面包店、楼外的 ready() 监听者）
+    // 要等这个 fiber 翻成 ACTIVE（apply 整个跑完）才会被 internal/service 唤醒。
     ctx.provide('sell', sell)
 
-    // 退租清理：依赖消失时这段被调用，从最后一项往回执行
     return () => {
       ctx.logger.info('咖啡店停业（本班营业账 ' + shiftNote + ' 杯作废；财务部总账仍在）')
     }
