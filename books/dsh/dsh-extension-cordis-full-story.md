@@ -188,30 +188,14 @@ reflect 只传声不拍板，开不开由 fiber 自己的 `epoch` 跃迁定；
   //reflect provide & notify
   provide(name: string, value?: any, check?: () => boolean) {
     return this.ctx.fiber.effect(() => {
-      if (!this.props[name]) {
-        this.props[name] ??= { type: 'service' }
-      } else if (this.props[name].type !== 'service') {
-        throw new Error(`property "${name}" is already declared as ${this.props[name].type}`)
-      }
-      this.props[name] = { type: 'service' }
-
-      this.ctx.root[symbols.isolate][name] ??= Symbol(name)
-      const key = this.ctx[symbols.isolate][name]
-      const impl: Impl = { name, value, fiber: this.ctx.fiber, check }
-      if (this.store[key]) {
-        throw new Error(`service "${name}" has been registered at <${this.store[key].fiber.name}>`)
-      }
+      ...
       this.store[key] = impl
       this.ctx.fiber.store![name] = impl
       if (this.ctx.fiber.state === FiberState.ACTIVE) {
         this.notify([name])
       }
       return async () => {
-        delete this.store[key]
-        const fibers = this.notify([name])
-        await Promise.allSettled(fibers.map(fiber => fiber.await()))
-        // ensure self access before dependencies cleanup
-        delete this.ctx.fiber.store![name]
+        ...
       }
     }, `ctx.provide(${JSON.stringify(name)})`)
   }
@@ -241,7 +225,7 @@ reflect 只传声不拍板，开不开由 fiber 自己的 `epoch` 跃迁定；
   }
 ```
 
-
+Fiber类中的检查、更新、设置Epoch
 ```ts
 //fiber _checkImpl & _refresh & _setEpoch
   _checkImpl(name: string) {
@@ -288,8 +272,6 @@ reflect 只传声不拍板，开不开由 fiber 自己的 `epoch` 跃迁定；
     })
   }
 ```
-
-（同一个插件模块可以在不同 `Context` 下挂载多次，每次挂载都有**独立的 Fiber**——这正是"Fiber 是运行实例而非插件定义本身"的体现。）
 
 ### declare module：类型层注册 vs 运行时注册
 有一点需要说明一下，插件是随时可被激活或者卸载的，运行时cordis的机制保证了你的插件依赖肯定存在；
@@ -524,56 +506,7 @@ async function main() {
 - **第五拍（18:00）** `ctx.registry.delete(floorManagerPlugin)`（`main.ts:71`）。父级退租触发子树级联清退：coffee、其下 cleaning、同挂 floor 的 bakery 全部连带销毁（顺序 LIFO + 子先于父）。
 
 
-### 3. 通知
-
-cordis 里叫「通知」的机制其实有两套，别混为一谈：
-
-- **依赖变化通知（`reflect.notify`）**——服务挂牌/摘牌时按名字反查依赖方、驱动「自动开业/停业」的级联。下面「一」，用 coffeeshop 演示。
-- **消息广播通知（`events`）**——插件之间主动发消息的发布/订阅总线（如「今晚停水」）。下面「二」，用独立的广播样例演示，不和依赖机制搅在一起。
-
-先说「一」。上一拍日志里反复出现「水一到，供电/咖啡店/面包店依次醒来开业」「水一退，整串依次停业」。
-驱动这一切的是楼管 `reflect` 的**通知机制**：任何服务挂牌或摘牌，`reflect` 都遍历整棵树，找到 `inject` 了这个名字的 fiber，让它重新核对依赖、决定自己开业还是停业。
-
-**通知发起点是 `provide` / 卸载。**
-`provide(name, value)` 把 `impl = { name, value, fiber }` 写进 `ReflectService.store` 后，会调 `notify([name])`（`reflect.ts`）。
-服务卸载（提供方 fiber 退场、impl 从 store 删除）同样触发 `notify([name])`。
-在咱们的例子里，供水 `super(ctx, 'water')`、coffee `ctx.provide('sell', sell)`、`registry.delete(WaterService)` 都是通知发起点。
-
-**`notify` 只叫醒「inject 了这个名字」的 fiber。**
-它遍历 `registry` 里所有 runtime 的 fibers，对每个 fiber 检查 `name in fiber.inject`，命中才处理，不命中直接跳过（`reflect.ts` 的 `notify`）。
-所以挂供水只会唤醒 inject 了 `water` 的供电和 coffee，不会惊动面包店；挂 `sell` 只会唤醒 inject 了 `sell` 的 bakery。
-
-**被叫醒的 fiber 做两件事：`_checkImpl` 抄账，`_refresh` 重算状态。**
-
-- `_checkImpl(name)`：消费者去总账 `reflect.store` 查这条依赖，查得到（且提供方 ACTIVE）就把这条 `impl` 抄进自己私有的 `fiber._store`，查不到就从 `_store` 删掉（`fiber.ts`）。
-  它只是「查总账 → 写/清自己这本账」的刷新动作，**绝不调用 `provide`**——`provide` 永远只在插件 `apply` 里由开发者写。
-- `_refresh()`：只读自己的 `_store`，遍历 `inject` 逐项核对，全部齐了算出一个非空 `epoch`，缺任何一项就是 `INACTIVE`（`fiber.ts`）。
-- `_setEpoch()` 做真正的状态跃迁：`INACTIVE → 就绪` 就 `_reload()`（跑 `apply` 开业），`就绪 → INACTIVE` 就 `_unload()`（跑 disposer 撤场）。
-  这对应故事里「开不开店由店长自己定」——`reflect` 只负责通知，决策和执行都在 fiber 自己手里。
-
-**用第二拍的级联把这条链走一遍。**
-
-1. `WaterService` 构造 → `super(ctx,'water')` → store 有了 `water` → `notify(['water'])`。
-2. `notify` 发现供电和 coffee 都 inject 了 `water`，对它们调 `_checkImpl('water')` + `_refresh()`。
-   供电只缺 water，这一项抄进 `_store` 后 epoch 非空，于是 `_reload()` → 构造 `PowerService` → 挂牌 `power` → 又 `notify(['power'])`。
-3. `notify(['power'])` 叫醒 coffee（coffee 也 inject 了 `power`）；此时 finance 也已挂牌，coffee 的 `water/power/finance` 全齐，`_reload()` 跑 coffee 的 `apply`。
-4. coffee `apply` 里 `provide('sell', sell)` → `notify(['sell'])` → 叫醒 inject 了 `sell` 的 bakery → bakery `_reload()` 开业。
-
-这就是为什么日志里 water → power → coffee → bakery 严格按依赖链依次出现，即使它们在代码里的注册顺序是 floor 先把 coffee、bakery 都登记了。
-
-**`internal/service` 事件是给「树外观察者」的，不是级联驱动力。**
-`notify` 末尾会 `emit('internal/service', name, value)`（`reflect.ts`），但 fiber 之间的级联唤醒在这之前已经由 `notify` 直接调 `_refresh` 完成了。
-这个事件的真正消费者是楼外代码——比如咱们的 `ready()` 助手（`ready.ts`）就靠监听它来「等某个服务上线」，SDK/测试工具也用它观测服务变化。
-把这两件事分开很重要：**级联靠 `notify` 直接调 fiber，事件只是旁路通知。**
-
-**下线是同一条链反向走。**
-`registry.delete(WaterService)` 让 water 的 impl 离开 ACTIVE → `notify(['water'])` → 供电、coffee 的 `_checkImpl('water')` 查不到 → `_store` 清掉该项 → `_refresh` 算出 `INACTIVE` → `_unload()`。
-coffee 卸载又使 `sell` 消失 → `notify(['sell'])` → bakery 跟着 `_unload()`；cleaning 作为 coffee 的子 fiber 随父级回收。
-状态翻转在 `delete` 的同步调用栈内就完成了（所以 strict `get` 当场返回 `undefined`），但 disposer 函数体是 `async` 的，真正打日志要等后续微任务——这正是第三拍看不到撤场日志、第四拍才看到的原因。
-
-> 同一个插件模块可以在不同 `Context` 下挂载多次，每次都有**独立的 Fiber**——「Fiber 是运行实例而非插件定义本身」。`notify` 遍历的是这些运行中的 fiber，不是插件定义。
-
-**二、消息广播通知（events）——真正「发消息」的那套。**
+### 3. 事件广播
 
 `events` 是挂到每个 `Context` 上的发布/订阅总线（`ctx.events`，方法也 mixin 到了 `ctx`）。它和「一」的 `reflect.notify` **完全两路**：`events` 是插件**主动**给感兴趣的人发消息，`reflect.notify` 是框架**被动**因依赖变化触发级联；`events` 不驱动开业/停业，只负责传话。
 
@@ -695,3 +628,44 @@ export function apply(ctx: Context) {
     console.log('hello')
   }
 ```
+
+
+
+**通知发起点是 `provide` / 卸载。**
+`provide(name, value)` 把 `impl = { name, value, fiber }` 写进 `ReflectService.store` 后，会调 `notify([name])`（`reflect.ts`）。
+服务卸载（提供方 fiber 退场、impl 从 store 删除）同样触发 `notify([name])`。
+在咱们的例子里，供水 `super(ctx, 'water')`、coffee `ctx.provide('sell', sell)`、`registry.delete(WaterService)` 都是通知发起点。
+
+**`notify` 只叫醒「inject 了这个名字」的 fiber。**
+它遍历 `registry` 里所有 runtime 的 fibers，对每个 fiber 检查 `name in fiber.inject`，命中才处理，不命中直接跳过（`reflect.ts` 的 `notify`）。
+所以挂供水只会唤醒 inject 了 `water` 的供电和 coffee，不会惊动面包店；挂 `sell` 只会唤醒 inject 了 `sell` 的 bakery。
+
+**被叫醒的 fiber 做两件事：`_checkImpl` 抄账，`_refresh` 重算状态。**
+
+- `_checkImpl(name)`：消费者去总账 `reflect.store` 查这条依赖，查得到（且提供方 ACTIVE）就把这条 `impl` 抄进自己私有的 `fiber._store`，查不到就从 `_store` 删掉（`fiber.ts`）。
+  它只是「查总账 → 写/清自己这本账」的刷新动作，**绝不调用 `provide`**——`provide` 永远只在插件 `apply` 里由开发者写。
+- `_refresh()`：只读自己的 `_store`，遍历 `inject` 逐项核对，全部齐了算出一个非空 `epoch`，缺任何一项就是 `INACTIVE`（`fiber.ts`）。
+- `_setEpoch()` 做真正的状态跃迁：`INACTIVE → 就绪` 就 `_reload()`（跑 `apply` 开业），`就绪 → INACTIVE` 就 `_unload()`（跑 disposer 撤场）。
+  这对应故事里「开不开店由店长自己定」——`reflect` 只负责通知，决策和执行都在 fiber 自己手里。
+
+**用第二拍的级联把这条链走一遍。**
+
+1. `WaterService` 构造 → `super(ctx,'water')` → store 有了 `water` → `notify(['water'])`。
+2. `notify` 发现供电和 coffee 都 inject 了 `water`，对它们调 `_checkImpl('water')` + `_refresh()`。
+   供电只缺 water，这一项抄进 `_store` 后 epoch 非空，于是 `_reload()` → 构造 `PowerService` → 挂牌 `power` → 又 `notify(['power'])`。
+3. `notify(['power'])` 叫醒 coffee（coffee 也 inject 了 `power`）；此时 finance 也已挂牌，coffee 的 `water/power/finance` 全齐，`_reload()` 跑 coffee 的 `apply`。
+4. coffee `apply` 里 `provide('sell', sell)` → `notify(['sell'])` → 叫醒 inject 了 `sell` 的 bakery → bakery `_reload()` 开业。
+
+这就是为什么日志里 water → power → coffee → bakery 严格按依赖链依次出现，即使它们在代码里的注册顺序是 floor 先把 coffee、bakery 都登记了。
+
+**`internal/service` 事件是给「树外观察者」的，不是级联驱动力。**
+`notify` 末尾会 `emit('internal/service', name, value)`（`reflect.ts`），但 fiber 之间的级联唤醒在这之前已经由 `notify` 直接调 `_refresh` 完成了。
+这个事件的真正消费者是楼外代码——比如咱们的 `ready()` 助手（`ready.ts`）就靠监听它来「等某个服务上线」，SDK/测试工具也用它观测服务变化。
+把这两件事分开很重要：**级联靠 `notify` 直接调 fiber，事件只是旁路通知。**
+
+**下线是同一条链反向走。**
+`registry.delete(WaterService)` 让 water 的 impl 离开 ACTIVE → `notify(['water'])` → 供电、coffee 的 `_checkImpl('water')` 查不到 → `_store` 清掉该项 → `_refresh` 算出 `INACTIVE` → `_unload()`。
+coffee 卸载又使 `sell` 消失 → `notify(['sell'])` → bakery 跟着 `_unload()`；cleaning 作为 coffee 的子 fiber 随父级回收。
+状态翻转在 `delete` 的同步调用栈内就完成了（所以 strict `get` 当场返回 `undefined`），但 disposer 函数体是 `async` 的，真正打日志要等后续微任务——这正是第三拍看不到撤场日志、第四拍才看到的原因。
+
+> 同一个插件模块可以在不同 `Context` 下挂载多次，每次都有**独立的 Fiber**——「Fiber 是运行实例而非插件定义本身」。`notify` 遍历的是这些运行中的 fiber，不是插件定义。
