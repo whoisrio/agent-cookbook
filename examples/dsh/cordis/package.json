@@ -12,7 +12,9 @@
     "05": "tsx 05-serial-bail.ts",
     "06": "tsx 06-cross-plugin.ts",
     "07": "tsx 07-coffeeshop.ts",
-    "coffeeshop": "tsx coffeeshop/main.ts",
+    "coffee:load": "tsx coffeeshop/01-dependency-load.ts",
+    "coffee:unload": "tsx coffeeshop/02-water-shutdown.ts",
+    "coffee:event": "tsx coffeeshop/03-events.ts",
     "all": "tsx 01-service-inject.ts && tsx 02-multiple-services.ts && tsx 03-waterfall.ts && tsx 04-waterfall-input.ts && tsx 05-serial-bail.ts && tsx 06-cross-plugin.ts && tsx 07-coffeeshop.ts"
   },
   "dependencies": {

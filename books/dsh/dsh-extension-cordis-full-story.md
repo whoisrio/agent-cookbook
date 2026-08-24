@@ -131,7 +131,6 @@ const coffee = ctx.plugin({
 ```
 
 注册后，得到的是`fiber`对象，也就是上面故事里的店长，`fiber`是插件注册到`Context`后的真正运行对象；
-
 ```ts
 // fiber（店长）—— 插件注册到 Context 后的真正运行对象，由 registry 在受理申请时 new 出来
 class Fiber {
