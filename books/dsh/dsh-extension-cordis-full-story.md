@@ -323,8 +323,9 @@ class Fiber {
   }
 ```
 整个激活的过程是一个级联检查的过程，如下，
-某个插件的服务ready后，通过调用 ctx.provide(name, value)，把服务写进 ReflectService.store（同时记一份到自己 fiber 的 store）。
-写完后卡一道门槛——只有 provider 自己已经 ACTIVE（开业状态）时，才触发 notify([name])。
+某个插件的服务ready后，通过调用 ctx.provide(name, value)，新挂牌提供的服务作为自身(fiber)的副作用注册，服务名称必须唯一，
+新provide的服务信息写入fiber自己的store和reflectService的store中供后续的状态变更和全局检查是使用；
+写完后卡一道门槛，只有提供服务的fiber自己已经 ACTIVE（开业状态）时，才触发 notify([name])。
 notify 拿着服务名，只扫那些 inject 里声明要这个服务的 consumer fiber（不扫全场），逐个调 _checkImpl 校验、再 _refresh 重算consumer自己的 epoch。
 consumer 自己翻牌：_refresh 算出新的 epoch 交给 _setEpoch，开不开业由 consumer 自己定——从"缺依赖"变"齐了"就 _reload 开业；反之就 _unload 撤场。
 reflect 只传声，不拍板。
@@ -335,14 +336,15 @@ sequenceDiagram
     autonumber
     participant P as Provider.apply(ctx)
     participant RS as ReflectService.provide
+    Participant PF as Fiber._store
     participant S as ReflectService.store
     participant N as notify([name])
     participant C as Consumer Fiber
     participant E as _setEpoch
 
     P->>RS: ctx.provide(name, value)
-    RS->>S: store[key] = impl（写入服务实现）
-    RS->>S: ctx.fiber.store[name] = impl（provider 自身 store）
+    RS->>S: store[key] = impl（写入ReflectService实现）
+    RS->>PF: ctx.fiber.store[name] = impl（provider 自身 store）
     Note over RS: 门槛判断：ctx.fiber.state === ACTIVE ?
     alt 是（provider 已开业，如运行时动态 re-provide）
         RS->>N: notify([name])
