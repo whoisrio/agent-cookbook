@@ -1,20 +1,14 @@
 # 从三家 API 到 Agent Loop：字段在分家，逻辑在收敛
 
-上一篇聊 Responses API，结尾我留了个观察：各家开源 Provider 未来很长一段时间，大概还是会把 `/v1/chat/completions` 当主要接口提供服务。
 
-这篇接着往下走一步。既然连开源 Provider 都在往同一套接口上靠，那 OpenAI、Anthropic、Google 这三家闭源的，摊开摆一起看，到底还差多少？
-
-我的结论是：**字段差别不小，但逻辑已经收敛完了，而且收敛的方向就一个——工具调用。** 这四套 API 的骨架是同一套东西的四种拼写。真正的分野不在 API 层，在你自己写的那个循环里。
-
-所以这篇的结构是：先把四套字段差异扫一遍（快，半小时你自己也能翻完），然后讲两处各家力度明显不一样的能力（服务端工具、缓存），最后把剩下的篇幅全给 agent loop——因为那才是你真正要自己写、也真正会出事的部分。
 
 ---
 
-## 一、四套拼写，一套逻辑
+## 四套拼写，一套逻辑
 
-先摆事实。下面这张表不用背，看一眼就会发现规律。
-
-第一列是 Chat Completions。它放在这儿不是因为它更好，是因为它是事实标准——国内几乎所有 Provider 都兼容它，你后面接任何一家，大概率还是照这一列写。
+之前聊了openai提供的LLM访问api，从completions到response的api发展，有朋友说想看看A和G的api；
+本质上来说，各家的api的设计逻辑基本上是一致的，从纯聊天到提供工具调用，从本地工具调用到provider服务端工具调用，提供了各家适应的缓存机制。
+因此，大部分的差异，主要是字段级别的差异，我把各家的api差异整理到如下表格，供大家查阅。
 
 | | Chat Completions | OpenAI（Responses） | Anthropic（Messages） | Google（Gemini） |
 |---|---|---|---|---|
@@ -28,107 +22,15 @@
 | 停下来 | `finish_reason` | `status` + `incomplete_reason` | `stop_reason` | `finishReason` |
 | 用量 | `usage.prompt_tokens` | `usage.input_tokens` | `usage.input_tokens` | `usageMetadata.promptTokenCount` |
 
-字段名几乎没有一个对得上的。但你看第二段的往返流程：
-
-```python
-# 四套都是同一个四步循环，区别只在字段怎么拼
-messages = [{"role": "user", "content": "北京今天天气怎么样"}]
-
-while True:
-    resp = call_model(messages, tools=TOOLS)   # 1. 带上工具清单问一次
-    if not resp.wants_tool():                  # 2. 它不要调工具，说完事了
-        break
-    results = [run(t) for t in resp.tool_calls()]  # 3. 你来执行
-    messages += resp.as_message() + results    # 4. 原样 + 结果，塞回去再来一轮
-```
-
-发三件套（系统提示 + 对话 + 工具清单）→ 模型说要调工具 → 你执行 → 把结果塞回去 → 再来一轮。这四套，以及国内所有兼容它的 Provider，跑的都是这同一个循环。
-
-所以字段差异是"你怎么拼这个请求"的差异，不是"这个循环长什么样"的差异。也正因为这样，LangChain、Vercel AI SDK 这类抽象层才能活——它们干的活就是把上表后三列翻译成第一列。
-
-字段之外还剩两处各家力度不一样的地方：服务端工具，和缓存。挨个说。
+今天主要是想聊聊基于api，如何设计和实现agent-loop。
 
 ---
+## 最简单的agent-loop
 
-## 二、两处各家力度不一样的地方
 
-### 服务端工具：你不用写实现，但也管不着
 
-服务端工具指的是那些"你只声明名字、服务端自己跑完"的工具：
-
-- **Anthropic**：`web_search`、`web_fetch`、`code_execution`、`computer use`、`browser use`，外加 MCP connector
-- **OpenAI**：`web_search`、`code_interpreter`、`file_search`、`computer use`，以及 2026 年 2 月发的 Hosted Shell Containers（Debian 12 + Python 3.11 / Node 22 / Java 17 / Go 1.23，`/mnt/data` 持久存储）
-- **Google**：`googleSearch`、`codeExecution`、`urlContext`、`computerUse`
-
-三家都在做同一件事——把执行权从你手里拿走。但你被拿走的东西不一样：OpenAI 和 Anthropic 至少还在响应里给你一个明确信号（Anthropic 是 `pause_turn`，意思是服务端的采样循环跑满默认 10 次还没干完，你把响应原样发回去它接着跑）；Google 的 automatic function calling 是 SDK 层面直接把整个循环吃掉，你看到的只有最终结果。
-
-国内 Provider 这边覆盖是零散的，多数只支持 web search 这一类，而且是各家自己实现的版本。所以**服务端工具是目前可移植性最差的一层**——用了基本等于把这段逻辑锁死在一家。
-
-### 缓存：三种玩法，账也不是一种算法
-
-目标都一样，前缀命中就打折。怎么配、怎么算钱，是三个模型。
-
-**OpenAI 是零配置。** 不需要任何代码改动，够 1024 token 就自动命中，命中量在 `usage.prompt_tokens_details.cached_tokens` 里看。GPT-5.6 之后这块加了三个东西：`prompt_cache_key` 保证共享前缀的请求路由到同一台机器，官方说法是这个参数必须设命中才可靠；`prompt_cache_options.mode: "explicit"` 让你自己放断点、只认你放的；`cache_write_tokens` 把写入量单独报出来，写入按 1.25 倍计费。
-
-**Anthropic 以前是最麻烦的**，要手动往内容块上标 `cache_control`，最多 4 个断点。这个印象今年过期了。2026 年 2 月 19 日 automatic caching GA，请求体顶层加一个字段就行：
-
-```python
-response = client.messages.create(
-    model="claude-opus-5",
-    max_tokens=1024,
-    cache_control={"type": "ephemeral"},   # 就这一个
-    system=SYSTEM,
-    messages=messages,
-)
-```
-
-官方原话是系统会自动把断点放在最后一个可缓存块上，随对话变长自动往前推，**No manual breakpoint management required**。
-
-**Google 是第三种：显式缓存资源。** 你得先建一个缓存对象，拿着它的名字去发请求：
-
-```python
-cache = client.caches.create(
-    model="gemini-3-pro",
-    config=types.CreateCachedContentConfig(
-        contents=[long_document], system_instruction=SYSTEM, ttl="300s"
-    ),
-)
-resp = client.models.generate_content(
-    model="gemini-3-pro",
-    contents="这份材料里提到了哪些日期",
-    config=types.GenerateContentConfig(cached_content=cache.name),
-)
-```
-
-前两家的缓存是请求的副产品，你管不着也不用管；Google 的缓存是一个你创建、你管 TTL、你按存储时长付钱的对象。好处是命中范围和时长你说了算，代价是多一层生命周期要维护。
-
-国内这边都有，但力度参差：DeepSeek 是全自动的，官方定价页写明缓存自动生效、不用改代码，命中按折扣价算；阿里云百炼给了两套，显式缓存要你自己打标记，隐式缓存自动命中但你控制不了命中什么；再往下数，Kimi、GLM、豆包、MiniMax 各家一套，最小触发长度、折扣比例、有效期全不一样。
-
-所以缓存这一层的真实状况是：**能力到处都有，语义没有一处相同。** 你照着一家调好的参数，换一家大概率不生效，而且不报错——你只会看到账单没降。
-
----
-
-## 三、Anthropic 这一年，一组特别干净的对照实验
-
-聊完差异，说个更值得看的东西。
-
-Anthropic 在 2026 年给了一组特别干净的对照实验。同一个公司，同一个"往服务端收"的方向，两件事：一件事收成了，一件事没收成。
-
-收成的是 prompt caching。2 月 19 日 automatic caching 正式 GA，4 月 cache diagnostics 进 beta，7 月又发了 mid-conversation tool changes（可以用 `tool_addition` / `tool_removal` 块中途增删工具，`tools` 数组一个字节不动，缓存照样命中）——一年之内连着三刀，每一刀都是把"保住缓存前缀"这件事，从开发者的自觉纪律变成 API 提供的机制。
-
-没收成的是服务端压缩。那个 `compact_20260112` 能力躺在 API 里，Anthropic 自家的 Claude Code 不用它，开源生态一家都没实现。
-
-同一家公司，同一个方向，一个成一个不成。这个差别比任何单个功能都值得看，因为它给出的分界线特别清楚：**机制能收，策略收不了。**
-
-保住缓存前缀是个机制问题。什么该缓存、缓存在哪、有没有命中，跟你的业务无关，是纯粹的工程细节。所以它可以被收走，而且收走是好事——现在还有 `cache_miss_reason` 告诉你第一次分叉出在 model、system、tools 还是 messages 哪一层。
-
-压缩是个策略问题。压什么、什么时候压、压完留什么、哪些东西碰不得，只有你的应用知道。服务端把它做成一个字段卖给你，等于塞给你一个改不了的默认值。
-
-这条分界线可以直接拿来用：**判断任何"厂商又替你做了一件事"的消息，问一句——这件事里有没有只有你知道的信息。** 有，它收不走；没有，迟早会被收走，而且收走是好事。
-
-而收不走的那一堆，就是下面这个东西。
-
----
+## 事件驱动的agent
+实际应用到生产的agent当然不会如此简单，如上最简demo，只能够同步的处理用户输入的消息当下主流的agent架构基本都是基于事件驱动的agent架构
 
 ## 四、Agent Loop：真正要你自己写的部分
 
