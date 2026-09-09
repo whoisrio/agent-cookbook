@@ -204,10 +204,14 @@ class AgentRuntime:
         if event.type in (EventType.USER_INPUT, EventType.USER_FOLLOWUP):
             await self._run_turn(event)
         elif event.type == EventType.USER_STEERING:
-            # 空闲时收到 steering：直接并入历史，下一轮生效
+            # 空闲时收到 steering：直接并入历史，下一轮生效。
+            # 必须写轨迹——回放就是靠这条记录重建用户消息的，不写就凭空消失。
+            self._trajectory.append(event)
             self.history.append({"role": "user", "content": event.text})
         elif event.type == INTERRUPT:
-            pass  # 没有正在跑的步，忽略即可（loop 仍然活着）
+            # 没有正在跑的步，忽略即可（loop 仍然活着）。事件本身要留痕，
+            # 否则事后查不出"用户按过取消，只是当时没在跑"。
+            self._trajectory.append(event)
 
     # ---- 一轮 ----
 
@@ -246,9 +250,13 @@ class AgentRuntime:
                     cancel=cancel,
                 )
             except StepInterrupted as exc:
-                end_reason = await self._after_interrupt(exc, turn_id, step_id)
-                if end_reason is None:
+                # _after_interrupt 拿返回值兼职两种意思：None 是本轮继续，
+                # 字符串才是结束原因。别直接写进 end_reason——steering 的
+                # None 会一直留到本轮收尾，把 stop 顶掉。
+                stop = await self._after_interrupt(exc, turn_id, step_id)
+                if stop is None:
                     continue  # 是 steering，带着新指令继续下一步
+                end_reason = stop
                 break
 
             self.history.append(response.as_message())

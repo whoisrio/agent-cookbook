@@ -1,0 +1,3 @@
+[console_scripts]
+stage01-demo = baby_event_driven_agent.stages.stage01_receive_events.__main__:cli
+stage01-test = baby_event_driven_agent.stages.stage01_receive_events.testing:main
