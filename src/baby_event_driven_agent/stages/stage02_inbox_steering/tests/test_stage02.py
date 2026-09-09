@@ -147,6 +147,33 @@ def test_steering_folds_into_running_turn(log_path: Path) -> None:
     assert finals[-1]["payload"]["message"]["content"] == "回复：插话"
 
 
+def test_message_arriving_after_last_drain_degrades_to_followup(
+    log_path: Path,
+) -> None:
+    """临界降级：消息落在最后一个 drain 点之后，turn 收尾没带上它——
+    它不该丢，也不该硬塞进已收尾的 turn，而是降级为 followup，
+    worker 的下一次 inbox.get() 自动接住。"""
+    gate = asyncio.Event()
+    h = Harness(log_path, FakeLLM(first_call_gate=gate))  # 一步的 turn
+
+    async def run() -> None:
+        await h.send("第一问")
+        await asyncio.sleep(0.05)  # step 正在飞
+        await h.send("迟到的插话")
+        gate.set()  # 放行唯一一步 → turn 结束，没有下一次 drain
+        await h.wait_turn()  # 第一 turn（插话没被消化）
+        await h.wait_turn()  # 插话作为 followup 的第二 turn
+        await h.stop()
+
+    asyncio.run(run())
+
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    # 没有任何消息被标成 steering
+    assert not [r for r in records if r.get("note") == "steering"]
+    starts = [r for r in records if r.get("note") == "turn start"]
+    assert [s["payload"]["text"] for s in starts] == ["第一问", "迟到的插话"]
+
+
 def test_sessions_have_independent_inboxes_and_histories(log_path: Path) -> None:
     """不同 session 各有收件箱和 worker，history 互不污染。"""
     h = Harness(log_path, FakeLLM())
