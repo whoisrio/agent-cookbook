@@ -7,49 +7,71 @@
 
 ## 我们要什么
 
-一个事件驱动的 agent，v0.1 长这样：
+### 什么是事件驱动的 agent
 
-- 一个 `Event`：类型、session_id、payload。
-- 一个 `EventBus`：谁关心什么事件就注册 handler，事件来了原地调用。
-- 一个 agent：收到 `user_input`，跑一轮 loop（模型 → 工具 → 模型 → 回话），
-  模型输出是流式的：文本增量边到边发给 UI，工具调用增量边到边累积。
-- 一个 session log：所有事件 append-only 写进 jsonl。这章没人读它，但它记录的
-  是唯一真相，后面每章都会回来找它。
-- 一个 CLI UI：stdin 收输入，stdout 流式打回复。
+不用事件驱动的Agent Loop，所有的处理逻辑都要包含在Agent Loop的代码中：不光要拼上下文、调用工具、记录session log，之后每加一个 Harness 能力，比如输入的防护、输出的隐私检查、工具调用审计等等等,都得打开 Agent Loop 动刀。它管的杂事越多，代码越难改，最后长成一个谁都不敢动的巨型函数，而其中任何一处改动都可能碰坏核心的模型调用。
 
-设计决定只有一条值得注意：总线的 publish 原地 await handler，
-所以 agent 的整个 turn 是在总线回调里跑完的。
-在"一次处理一个请求"的前提下，这个决定完全成立——先看它正常干活的样子。
+事件驱动把 Agent Loop 从杂事堆里拉出来：过程中发生的每件事——用户输入、模型增量、工具往返、turn 生命周期——统一建模成事件（Event），Agent Loop 只管跑核心步骤——拼上下文、调模型、执行工具——每走一步把"发生了什么"发布到总线上就算完事。UI 呈现、log 落盘是总线上的另外两个消费者，一个做流式呈现，一个原样落盘成轨迹。
+
+直接调用和事件还有一层本质差别：调用是一次性的，栈走完就没了；事件是数据。是数据就能排队、能落盘、能回放。
+
+总的来说，事件驱动是把复杂流程解耦和提高功能灵活性的关键选择。
+
+下面，咱们就着手一步步搭建事件驱动的agent。
+### 场景
+
+一个简单的企业业务场景的 agent：
+- OpenAI chat/completions兼容端点、流式输出。demo 和测试都指向本地 ollama 的 qwen3.5:4b-32k，零 API 成本；
+- 四个工具，读写成对：查库存 / 改库存（扮演业务接口），查规则 / 改规则（扮演知识检索与运营）。数据就是 knowledge-base/ 下的两个文本文件，写操作真写；
+- UI 暂时是 CLI，要求流式：回答一个字一个字往外蹦。
+
+### 关键对象
+五个对象，一人一句话职责：
+
+- `Event`：事件本体。type + session_id + payload + ts 四个字段，frozen——事件发出去之后就不允许再被改动；
+- `EventBus`：订阅与发布。同步总线，publish 原地 await 所有 handler，Stage 1 刻意保持简单；
+- `Agent`：user_input 的消费者，收到事件跑一轮 loop（模型 → 工具 → 模型 → 回话），按 session 维护 history；
+- `SessionLog`：append-only 轨迹。事件、assistant 消息、工具返回统统追加进 jsonl，它是唯一真相，暂时没人读它；
+- CLI UI：agent_thinking / agent_delta / agent_reply 的消费者，把输出呈现到终端。
+
+一次 turn 的数据流长这样：
+
+```text
+用户敲一行字
+  └─▶ user_input ──▶ Agent 消费，开始 loop（最多 4 步）
+        每一步：请求 LLM 流式输出
+        ├─▶ agent_thinking ──▶ UI 暗色直播（不进 history，不进 log）
+        ├─▶ agent_delta    ──▶ UI 流式打印（不进 log，累积结果才算完整回答）
+        ├─▶ agent_reply    ──▶ UI 收尾 + 写 log（tool_call 或 final）
+        ├─▶ tool_result    ──▶ 写 log（工具真跑过了，事实要留轨迹）
+        └─▶ turn_end       ──▶ 写 log，一轮结束
+```
+
+下面在哪买看看具体的代码。
 
 ## 代码
+### Event:事件
 
-### events：事件、总线、session log
+一切从事件开始。类型、session_id、payload、时间戳，四个字段：
 
 ```python
-import asyncio, json, time
+import json, time
 from dataclasses import dataclass, field
 
 T0 = time.time()
-def t(): return time.time() - T0
+def t(): return time.time() - T0  # 进程内相对时间戳，demo 输出用
 
 @dataclass(frozen=True)
 class Event:
-    type: str            # user_input / agent_reply / turn_end
+    type: str            # user_input / agent_delta / agent_thinking / agent_reply / turn_end
     session_id: str
     payload: dict = field(default_factory=dict)
     ts: float = field(default_factory=time.time)
+```
+### Eventbus:事件总线
+然后，我们需要定义事件处理的总线 EventBus，提供事件的订阅、发布的能力：
 
-class SessionLog:
-    """append-only。暂时没人读它，但它记录的是唯一真相。"""
-    def __init__(self, path):
-        self._path = path
-    def append(self, event, **extra):
-        rec = {"ts": round(event.ts - T0, 2), "type": event.type,
-               "session": event.session_id, "payload": event.payload}
-        rec.update(extra)
-        with open(self._path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
+```python
 class EventBus:
     """同步总线：publish 原地 await handler。"""
     def __init__(self):
@@ -63,10 +85,7 @@ class EventBus:
 
 ### LLM 客户端与工具
 
-模型是真的：OpenAI 兼容端点，配置读仓库根 `.env`（环境变量优先于文件，
-临时换模型不用改文件）。客户端只讲一种"增量协议"——文本增量、工具调用
-增量，流结束即本轮请求结束：
-
+使用`AsyncOpenai`提供的client调用llm，并指定流式输出；
 ```python
 class RealLLM:
     """OpenAI 兼容流式客户端，stream_chat 产出归一化增量块。"""
@@ -77,7 +96,7 @@ class RealLLM:
             raise RuntimeError("缺少 OPENAI_API_KEY：写在仓库根 .env 或环境变量里")
         self.model = _cfg("OPENAI_MODEL")
         self._client = AsyncOpenAI(
-            api_key=api_key, base_url=_cfg("OPENAI_API_BASE") or None, timeout=60.0
+            api_key=api_key, base_url=_cfg("OPENAI_API_BASE") or None, timeout=120.0
         )
 
     async def stream_chat(self, messages):
@@ -88,9 +107,12 @@ class RealLLM:
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
-            # qwen3 系列思考内容走 reasoning_content，不是面向用户的输出，跳过
-            if (delta.model_extra or {}).get("reasoning_content"):
-                continue
+            # 思考内容单独成一路，不跳过：云上走 reasoning_content，
+            # 本地 ollama 走 reasoning，归一化成 reasoning_delta
+            extra = delta.model_extra or {}
+            thinking = extra.get("reasoning_content") or extra.get("reasoning")
+            if thinking:
+                yield {"type": "reasoning_delta", "text": thinking}
             if delta.content:
                 yield {"type": "text_delta", "text": delta.content}
             for tc in delta.tool_calls or []:
@@ -99,174 +121,348 @@ class RealLLM:
                        "id": tc.id or None, "name": fn.name if fn else None,
                        "args_delta": (fn.arguments if fn else "") or ""}
 ```
-
-工具是真工具：`search` 在本地知识库文件里逐行检索（先按空格分词，
-整句分不出词就退化成 2 字滑窗），数据源是同目录的 `knowledge.txt`：
-
-```text
-保温杯：库存 42 件；316L 不锈钢内胆，500ml，杯身磨砂黑。
-玻璃杯：库存 17 件；高硼硅玻璃，400ml，可进微波炉。
-会议室预订：找行政小王，订前先看日历有没有被锁。
-...
-```
-
-tests 里用 `FakeLLM`：和 `RealLLM` 一模一样的 stream_chat 协议，
-arguments 故意拆成两块发，逼消费端的增量累积逻辑真实工作。
-测试要确定性、不花钱、不依赖网络，所以替身只活在 tests 里。
-
-### agent：流式消费，handler 里跑整个 turn
+在这个简单的Agent场景里，我们提供四个工具。两个读操作工具，
+`query_inventory` 查询指定品类的库存；
+`search_rules` 查询业务知识，扮演 RAG 检索，
 
 ```python
-SYSTEM_PROMPT = (
-    "你是一个带工具的通用 agent。search 工具检索的是本地知识库（团队笔记），"
-    "用户问到笔记里可能有的信息时，先检索再根据结果回答。"
-)
-
-class Agent:
-    def __init__(self, bus, log, llm):
-        self.bus, self.log, self.llm = bus, log, llm
-        self.history = {}  # session_id -> messages
-
-    async def on_user_input(self, event):
-        await self._run_turn(event)  # 整个 turn 在总线回调里跑完
-
-    async def _step(self, sid, history):
-        """消费一轮流式输出：文本边到边发 agent_delta，边累积，流结束拼完整消息。"""
-        text_parts, tool_calls = [], {}  # index -> 累积中的调用
-        async for chunk in self.llm.stream_chat(history):
-            if chunk["type"] == "text_delta":
-                text_parts.append(chunk["text"])
-                await self.bus.publish(Event("agent_delta", sid, {"text": chunk["text"]}))
-            elif chunk["type"] == "tool_call_delta":
-                tc = tool_calls.setdefault(chunk["index"], {"id": "", "name": "", "args": ""})
-                if chunk.get("id"):   tc["id"] = chunk["id"]
-                if chunk.get("name"): tc["name"] = chunk["name"]
-                tc["args"] += chunk.get("args_delta", "")
-        if tool_calls:  # 流结束，增量拼成合法的 assistant 消息
-            return {"role": "assistant", "content": "".join(text_parts) or None,
-                    "tool_calls": [{"id": tc["id"], "type": "function",
-                                    "function": {"name": tc["name"], "arguments": tc["args"]}}
-                                   for _, tc in sorted(tool_calls.items())]}
-        return {"role": "assistant", "content": "".join(text_parts)}
-
-    async def _run_turn(self, event):
-        sid = event.session_id
-        history = self.history.setdefault(sid, [])
-        if not history:
-            history.append({"role": "system", "content": SYSTEM_PROMPT})
-        history.append({"role": "user", "content": event.payload["text"]})
-        self.log.append(event, note="turn start")
-        for _ in range(4):
-            msg = await self._step(sid, history)
-            history.append(msg)
-            await self.bus.publish(Event("agent_reply", sid, {"message": msg}))
-            # 完整回答进 log（agent_delta 不记：它是传输层的瞬时增量，
-            # 累积结果就是这条 reply）
-            self.log.append(Event("agent_reply", sid, {"message": msg}),
-                            note="tool_call" if msg.get("tool_calls") else "final")
-            if "tool_calls" not in msg:
-                self.log.append(Event("turn_end", sid, {}), note="turn end")
-                return
-            for call in msg["tool_calls"]:
-                result = await TOOLS[call["function"]["name"]](
-                    json.loads(call["function"]["arguments"]))
-                history.append({"role": "tool", "tool_call_id": call["id"],
-                                "content": result})
-        self.log.append(Event("turn_end", sid, {}), note="max steps")
+{
+    "type": "function",
+    "function": {
+        "name": "query_inventory",
+        "description": "查询品类库存与规格（业务数据）。品类名如：保温杯、玻璃杯",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "description": "品类名"}
+            },
+            "required": ["category"],
+        },
+    },
+},
+{
+    "type": "function",
+    "function": {
+        "name": "search_rules",
+        "description": "检索团队规则、流程、制度（如会议室预订、VPN 申请、报销）",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "检索词，多个关键词用空格分隔",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+}
 ```
 
-两个实战细节值得停一下：
+两个写操作工具，
+`update_inventory`，更新指定品类的库存；
+`update_rules`,更新知识库；
 
-- **system prompt 不能省**。第一版没有它，模型把"保温杯还有库存吗"当闲聊，
-  回了一句"我无法访问实时库存"——它根本不知道 search 能查到什么。
-- **工具调用增量必须累积**。实测流式下 arguments 是分块到的：
-  首块带 `id` 和 `name`，后面几块各自带一段 JSON 字符串，
-  拼齐、流结束，才是一条合法的 assistant 消息。
+```python
+{
+    "type": "function",
+    "function": {
+        "name": "update_inventory",
+        "description": "添加新品类，或更新某品类的库存数量与规格",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "description": "品类名"},
+                "stock": {"type": "integer", "description": "库存件数"},
+                "spec": {"type": "string", "description": "规格描述，可省略"},
+            },
+            "required": ["category", "stock"],
+        },
+    },
+},
+{
+    "type": "function",
+    "function": {
+        "name": "update_rules",
+        "description": "添加一条新规则，或按标题更新已有规则的内容",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "规则标题，如：报销"},
+                "content": {"type": "string", "description": "规则内容"},
+            },
+            "required": ["title", "content"],
+        },
+    },
+},
 
-### CLI：一问答完，再问下一句
+```
+工具的 description 写得越清楚，模型选错工具的概率越低。
 
-UI 订阅两个事件：`agent_delta` 收到就原地打印（不换行、立刻 flush，
+#### System prompt
+把工具的description拼装到system prompt中，在生产的agent里，还会将skills，mcp，以及AGENTs.md，SOUL.md等内容拼装到system prompt；
+在CLAUDE等Agent里，还会在system prompt里进一步把不易变(公共的system prompt、tools)和相对来说可能会变(skills，AGENTs.md等等)再区分动静态区域来管理，以便更好的控制prompt cache的命中；
+不过在咱们的例子里，先不处理这么多。
+```python
+def build_system_prompt(schemas: list[dict[str, Any]] | None = None) -> str:
+    """system prompt 从 tool schemas 生成：工具的分工只写在 description 一处。"""
+    schemas = schemas if schemas is not None else TOOL_SCHEMAS
+    lines = ["你是智能助手，必须基于事实来回答用户的提问，**严禁编造**，得不到事实，就回答不知道。可用工具："]
+    for s in schemas:
+        fn = s["function"]
+        params = "、".join(fn["parameters"].get("properties", {}))
+        lines.append(f"- {fn['name']}：{fn['description']}" + (f"（参数：{params}）" if params else ""))
+    lines.append(
+        "必须基于事实回答用户问题。用户的问题或请求涉及上面某个工具时，"
+        "选对工具、先拿到真实结果再回答；获取不到准确信息就回答不知道，严禁编造。"
+        "用户要求记录或修改时，用对应的写工具落库，然后一句话确认改了什么。"
+    )
+    return "\n".join(lines)
+```
+
+生成出来的 prompt 长这样：
+
+```text
+你是智能助手，必须基于事实来回答用户的提问，**严禁编造**，得不到事实，就回答不知道。可用工具：
+- query_inventory：查询品类库存与规格（业务数据）。品类名如：保温杯、玻璃杯（参数：category）
+- update_inventory：添加新品类，或更新某品类的库存数量与规格（参数：category、stock、spec）
+- search_rules：检索团队规则、流程、制度（如会议室预订、VPN 申请、报销）（参数：query）
+- update_rules：添加一条新规则，或按标题更新已有规则的内容（参数：title、content）
+必须基于事实回答用户问题。……
+```
+
+### AGENT
+
+Agent 里，核心就两个方法：`_run_turn` 跑一轮 loop，`_step` 消费一轮流式输出。Agent 自身很薄，持有的状态只有一份按 session 隔离的 history：
+
+```python
+class Agent:
+    def __init__(
+        self,
+        bus: EventBus,
+        log: SessionLog,
+        llm: LLMClient,
+    ) -> None:
+        self.bus = bus
+        self.log = log
+        self.llm = llm
+        self.history: dict[str, list[dict[str, Any]]] = {}  # session_id -> messages
+```
+
+history 每个 session 一份消息序列，第一轮开始时垫一条 system prompt。loop 本身很朴素：最多 4 步，每步向模型要一次流式输出；模型要工具就执行、把结果喂回去再要一次；模型不要工具了，turn 就结束：
+
+```python
+async def _run_turn(self, event: Event) -> None:
+    sid = event.session_id
+    history = self.history.setdefault(sid, [])
+    if not history:
+        history.append({"role": "system", "content": SYSTEM_PROMPT})
+    history.append({"role": "user", "content": event.payload["text"]})
+    self.log.append(event, note="turn start")
+    for _ in range(MAX_STEPS):                 # 上限 4 步
+        msg = await self._step(sid, history)   # 消费一轮流式输出
+        history.append(msg)
+        await self.bus.publish(Event("agent_reply", sid, {"message": msg}))
+        self.log.append(
+            Event("agent_reply", sid, {"message": msg}),
+            note="tool_call" if msg.get("tool_calls") else "final",
+        )
+        if "tool_calls" not in msg:            # 模型不再要工具，turn 结束
+            self.log.append(Event("turn_end", sid, {}), note="turn end")
+            return
+        for call in msg["tool_calls"]:
+            name = call["function"]["name"]
+            if name not in TOOLS:
+                result = f"未知工具：{name}"
+            else:
+                result = await TOOLS[name](
+                    json.loads(call["function"]["arguments"])
+                )
+            history.append({"role": "tool",
+                            "tool_call_id": call["id"], "content": result})
+            self.log.append(                   # 工具真跑过了，事实要留轨迹
+                Event("tool_result", sid,
+                      {"tool_call_id": call["id"],
+                       "name": name, "result": result}),
+                note="tool result",
+            )
+    self.log.append(Event("turn_end", sid, {}), note="max steps")
+```
+
+`_step` 是增量消费的地方。模型一次请求吐出三种增量，各有各的去处：
+
+```python
+async for chunk in self.llm.stream_chat(history):
+    if chunk["type"] == "reasoning_delta":
+        # 思考：边到边发 UI 直播，不进 history、不进 log
+        await self.bus.publish(
+            Event("agent_thinking", sid, {"text": chunk["text"]})
+        )
+    elif chunk["type"] == "text_delta":
+        text_parts.append(chunk["text"])
+        await self.bus.publish(
+            Event("agent_delta", sid, {"text": chunk["text"]})
+        )
+    elif chunk["type"] == "tool_call_delta":
+        tc = tool_calls.setdefault(
+            chunk["index"], {"id": "", "name": "", "args": ""}
+        )  # id / name 就地更新，args 累加——arguments 常分多块到达
+```
+
+流结束时三种增量各归各位：文本拼成完整 content，工具调用拼成完整的
+tool_calls，组装成一条 assistant 消息返回，`_run_turn` 拿到它发布 agent_reply。
+
+注意思考内容的待遇：只直播，不进 history 也不进 log。它是模型这一步的
+推理窗口，provider 下一轮也不会回收 reasoning，轨迹重放用不到它，
+log 里自然没有它的位置。
+
+#### session log：append-only trajectory 记录
+
+我们把事件、与 LLM 交互的历史，通通 append-only 写入 jsonl 作为 trajectory 记录，以便后续基于轨迹做分析。
+轨迹不只是对话：assistant 的每次工具调用和工具的返回也在里面——
+它们是模型上下文的一部分，缺了它们，"模型为什么这么答"就无从分析。
+
+```python
+class SessionLog:
+    """append-only。暂时没人读它，但它记录的是唯一真相。"""
+    def __init__(self, path):
+        self._path = path
+    def append(self, event, **extra):
+        rec = {"ts": round(event.ts - T0, 2), "type": event.type,
+               "session": event.session_id, "payload": event.payload}
+        rec.update(extra)
+        with open(self._path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+```
+
+### CLI UI：呈现 Agent 的输出
+
+CLI UI 作为 LLM 输出事件的消费者，用于呈现 Agent 的输出。
+UI 订阅三个事件：`agent_thinking` 收到就用暗色打印（终端里用 ANSI dim，
+一眼和正文区分开），`agent_delta` 收到就原地打印（不换行、立刻 flush，
 这就是流式呈现的全部），`agent_reply` 收到打一行收尾。
+思考与正文是两路流，UI 在两路切换时先换行，避免混排在一起。
 
 ```python
 async def main():
-    bus, log = EventBus(), SessionLog("session.jsonl")
+    # session log 落在包级 sessions/ 目录，按 stage 分目录
+    sessions_dir = Path(__file__).resolve().parents[2] / "sessions" / "stage01"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    bus = EventBus()
+    log = SessionLog(str(sessions_dir / "session.jsonl"))
     agent = Agent(bus, log, RealLLM())
     bus.subscribe("user_input", agent.on_user_input)
 
+    # 上一条流式增量属于哪路：思考/正文切换时先换行，两类内容不混排
+    last_kind = [""]
+
+    async def ui_thinking(e):
+        if last_kind[0] != "thinking":
+            print(flush=True)
+            last_kind[0] = "thinking"
+        print(f"\033[2m{e.payload['text']}\033[0m", end="", flush=True)  # 暗色
+
     async def ui_delta(e):
+        if last_kind[0] != "text":
+            print(flush=True)
+            last_kind[0] = "text"
         print(e.payload["text"], end="", flush=True)
 
     async def ui_reply(e):
-        msg = e.payload["message"]
-        if msg.get("tool_calls"):
-            calls = ", ".join(f"{c['function']['name']}({c['function']['arguments']})"
-                              for c in msg["tool_calls"])
-            print(f"\n[{t():5.2f}s] (A) → 工具调用：{calls}")
-        else:
-            print(f"\n[{t():5.2f}s] (A) —— 回答完毕")
+        ...                  # 打一行收尾：工具调用 / 回答完毕
 
+    bus.subscribe("agent_thinking", ui_thinking)
     bus.subscribe("agent_delta", ui_delta)
     bus.subscribe("agent_reply", ui_reply)
 
-    print(f"[{t():5.2f}s] (A) 用户输入：保温杯还有库存吗")
-    await bus.publish(Event("user_input", "A", {"text": "保温杯还有库存吗"}))
-    print(f"\n[{t():5.2f}s] (A) 收到完整回答，用户接着问：玻璃杯呢")
-    await bus.publish(Event("user_input", "A", {"text": "玻璃杯呢"}))
-    print(f"\n[{t():5.2f}s] demo 结束")
+    for q in ["保温杯还有库存吗",
+              "帮我把马克杯加进库存：8 件，陶瓷，350ml",
+              "马克杯还有货吗",
+              "报销有什么规定",
+              "林志玲好看么"]:
+        print(f"[{t():5.2f}s] (A) 用户输入：{q}")
+        await bus.publish(Event("user_input", "A", {"text": q}))
 
 asyncio.run(main())
 ```
 
+
 ## 跑一下（真实 LLM 实测输出）
 
-模型 qwen3.7-flash（OpenAI 兼容端点），时间戳从进程启动算起
-（前 2 秒多是 Python 解释器和 SDK 的导入时间）：
+模型是本地 ollama 的 qwen3.5:4b-32k（OpenAI 兼容端点），零 API 成本。
+时间戳从进程启动算起（前 4 秒多是解释器、SDK 导入和模型冷启动）。
+五轮对话，把读、写、读回、查规则、闲聊拒绝各走一遍。
+
+输出里 `⋯` 开头的段落是思考内容（终端里是暗色的 `agent_thinking`，
+此处去掉色码、用 `⋯` 标出），其余正文是 `agent_delta`：
 
 ```text
-[ 2.73s] (A) 用户输入：保温杯还有库存吗
+[ 4.21s] (A) 用户输入：保温杯还有库存吗
 
-[ 5.99s] (A) → 工具调用：search({"query": "保温杯 库存"})
-保温杯还有库存，目前剩余 42 件。
+⋯ 用户询问保温杯是否有库存，我需要使用 query_inventory 工具来查询保温杯的库存信息。参数 category 应该设置为"保温杯"。
+[ 7.10s] (A) → 工具调用：query_inventory({"category":"保温杯"})
+⋯ 用户询问保温杯是否有库存，我已经通过query_inventory工具获取到了相关数据：保温杯库存为42件，规格是316L不锈钢内胆、500ml、杯身磨砂黑。现在我可以直接回答用户的问题。
+有库存，保温杯目前还有42件，规格为316L不锈钢内胆、500ml、杯身磨砂黑。
+[ 9.89s] (A) —— 回答完毕
 
-具体信息如下：
-- **内胆**：316L 不锈钢
-- **容量**：500ml
-- **外观**：杯身磨砂黑
-[ 6.74s] (A) —— 回答完毕
+[ 9.90s] (A) 用户输入：帮我把马克杯加进库存：8 件，陶瓷，350ml
 
-[ 6.76s] (A) 收到完整回答，用户接着问：玻璃杯呢
-玻璃杯还有库存，剩余 **17** 件。
+⋯ 用户要求将马克杯添加到库存中，我需要调用update_inventory工具来执行这个操作。参数需要包括：
+⋯ - category: "马克杯"
+⋯ - stock: 8
+⋯ - spec: "陶瓷, 350ml"
 
-具体参数如下：
-- **材质**：高硼硅玻璃
-- **容量**：400ml
-- **特点**：可进微波炉
-[ 8.61s] (A) —— 回答完毕
+⋯ 让我调用这个工具。
+[13.53s] (A) → 工具调用：update_inventory({"category":"马克杯","stock":8,"spec":"陶瓷，350ml"})
+⋯ 用户要求将马克杯加入库存：8件，陶瓷，350ml。我已经调用了update_inventory工具并得到了成功返回。现在我需要一句话确认改动了什么。
+已将马克杯更新为8件，规格为陶瓷、350ml。
+[15.57s] (A) —— 回答完毕
 
-[ 8.62s] demo 结束
+[15.58s] (A) 用户输入：马克杯还有货吗
+
+⋯ 用户问马克杯还有没有货，我需要查询马克杯的当前库存情况。
+[17.37s] (A) → 工具调用：query_inventory({"category":"马克杯"})
+⋯ 用户问马克杯还有货吗，根据上一步查询结果，马克杯有库存8件，规格为陶瓷、350ml。可以直接回答。
+马克杯还有货，目前库存为8件，规格为陶瓷、350ml。
+[19.78s] (A) —— 回答完毕
+
+[19.80s] (A) 用户输入：报销有什么规定
+
+⋯ 用户询问报销有什么规定，我需要使用search_rules工具来检索关于报销的相关规则。
+[21.49s] (A) → 工具调用：search_rules({"query":"报销"})
+⋯ 用户问报销有什么规定，我刚才通过search_rules工具查到了"报销：月底 25 号前提交，超过 500 元要附发票原件。"这个信息，可以直接回复给用户。
+根据规定，报销需满足以下要求：月底25号前提交，超过500元需要附发票原件。
+[24.41s] (A) —— 回答完毕
+
+[24.43s] (A) 用户输入：迪丽热巴和杨幂谁更好看?
+
+⋯ 这是一个主观审美评价的问题，不是业务相关请求。我作为智能助手，应该回答不知道或者给出客观的中性回答，不涉及个人审美偏好。我需要避免对人物进行可能涉及外貌评判的主观描述。
+
+⋯ 不过这个提问与我的工具功能无关——既不需要查询库存、查询规则，也不需要修改数据或规则。根据指导原则中"必须基于事实来回答用户的提问，严禁编造"的要求，对于主观性问题我无法基于事实给出明确答案，应该回答不知道或直接说明无法评价。
+
+⋯ 考虑到这是一个可能涉及公众人物的评论问题，作为AI助手，我应该保持中立客观的态度。
+抱歉，我没法对人物进行外貌评价。作为一个AI助手，我的功能主要是处理工作相关的查询和任务，比如库存、规则等方面的问题。如果您有其他关于工作流程的事情需要帮忙，请随时告诉我。
+[29.76s] (A) —— 回答完毕
+
+[29.77s] demo 结束
 ```
 
-值得看三个细节：
+值得看四个细节：
 
-- 5.99s 到 6.74s 之间那段"保温杯还有库存……"不是一次性打印的，
-  是 `agent_delta` 一块一块到达、原地 flush 出来的流式呈现。
-- 数字都是真的：42 件、316L、500ml 全部来自 `knowledge.txt`，
-  是 search 工具检索后模型组织出来的回答。
-- 第二问"玻璃杯呢"模型**没有再调 search**——第一轮的 tool 结果里
-  已经带着玻璃杯那行，它直接从上下文组织了回答。这是真模型自己的
-  选择，不是代码里写死的。
+- 前四轮各选对了工具：查库存、写库存、再查库存、查规则，模型是靠  工具描述和 system prompt 自己路由的，代码里没有任何 if-else 指路。
+- 第 5 轮闲聊，模型一个工具都没调，思考里明确"与我的工具功能无关"，并援引了 system prompt 里"必须基于事实、严禁编造"的要求——
+  `build_system_prompt` 生成的那句收尾，在真实模型上是真的起作用的。说明qwen3.5-4b虽然是个本地小模型，在处理简单的任务下，依然能够遵从用户的指令。
+当然，生产级别的Agent，杜绝模型胡编乱造，不能简单的只靠Systemprompt的约束，后续咱们再一步一步优化。
 
-session log 里两轮 turn 有头有尾，完整回答都进了 log（append-only）：
-
+再看看，session log 里五轮 turn 有头有尾。
 ```json
-{"ts": 2.73, "type": "user_input", "session": "A", "payload": {"text": "保温杯还有库存吗"}, "note": "turn start"}
-{"ts": 5.99, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": null, "tool_calls": [{"id": "call_9924f5f5c59d4555b2b537c0", "type": "function", "function": {"name": "search", "arguments": "{\"query\": \"保温杯 库存\"}"}}]}}, "note": "tool_call"}
-{"ts": 6.74, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": "保温杯还有库存，目前剩余 42 件。……"}}, "note": "final"}
-{"ts": 6.75, "type": "turn_end", "session": "A", "payload": {}, "note": "turn end"}
-{"ts": 6.76, "type": "user_input", "session": "A", "payload": {"text": "玻璃杯呢"}, "note": "turn start"}
-{"ts": 8.61, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": "玻璃杯还有库存，剩余 **17** 件。……"}}, "note": "final"}
-{"ts": 8.62, "type": "turn_end", "session": "A", "payload": {}, "note": "turn end"}
+{"ts": 4.21, "type": "user_input", "session": "A", "payload": {"text": "保温杯还有库存吗"}, "note": "turn start"}
+{"ts": 7.1, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": null, "tool_calls": [{"id": "call_wocv9h3e", "type": "function", "function": {"name": "query_inventory", "arguments": "{\"category\":\"保温杯\"}"}}]}}, "note": "tool_call"}
+{"ts": 7.19, "type": "tool_result", "session": "A", "payload": {"tool_call_id": "call_wocv9h3e", "name": "query_inventory", "result": "保温杯：库存 42 件；316L 不锈钢内胆，500ml，杯身磨砂黑。"}, "note": "tool result"}
+...
+{"ts": 24.43, "type": "user_input", "session": "A", "payload": {"text": "迪丽热巴和杨幂谁更好看?"}, "note": "turn start"}
+{"ts": 29.76, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": "抱歉，我没法对人物进行外貌评价。作为一个AI助手，我的功能主要是处理工作相关的查询和任务，比如库存、规则等方面的问题。如果您有其他关于工作流程的事情需要帮忙，请随时告诉我。"}}, "note": "final"}
+{"ts": 29.77, "type": "turn_end", "session": "A", "payload": {}, "note": "turn end"}
 ```
 
 v0.1 在它的能力范围内是个真实可用的 agent。
@@ -291,13 +487,3 @@ steering（插进正在跑的回答）和 followup（排在回答之后）。
 顺带看清一个事实，下一章会反复用到：asyncio 给了你并发，没给你串行化。
 串行化要自己买，收件箱就是那个价钱。
 
-## 验证
-
-- 环境：Python 3.13.12，假 LLM / 假工具，无需 API key；代码在仓库
-  `src/baby_event_driven_agent/stages/stage01_receive_events/`。
-- 实跑：`stage01-demo`（pyproject `[project.scripts]` 注册的命令）输出即正文
-  时间线（2026-09-08 实际运行，非手写）。
-- pytest：`stage01-test` 3 passed——顺序问答与 log 完整性、多 session history
-  隔离、log append-only。
-- 测试不用 pytest 的 tmp_path fixture（WorkBuddy 沙箱 shim 会拦
-  pytest-of-unknown 的 mkdir），用 tempfile.mkdtemp 自建自清理。

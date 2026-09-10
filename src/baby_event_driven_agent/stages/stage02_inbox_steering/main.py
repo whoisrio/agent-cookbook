@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import asyncio
-import tempfile
 from pathlib import Path
 
 from .agent import Agent
@@ -28,7 +27,10 @@ from .llm import RealLLM
 
 
 async def main() -> None:
-    log_path = str(Path(tempfile.gettempdir()) / "stage02_session.jsonl")
+    # session log 落在包级 sessions/ 目录，按 stage 分目录
+    sessions_dir = Path(__file__).resolve().parents[2] / "sessions" / "stage02"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = str(sessions_dir / "session.jsonl")
     bus = EventBus()
     log = SessionLog(log_path)
     agent = Agent(bus, log, RealLLM())
@@ -36,6 +38,7 @@ async def main() -> None:
 
     turn_done = asyncio.Event()
     tool_started = asyncio.Event()
+    steering_seen = False
 
     async def ui_delta(e: Event) -> None:
         print(e.payload["text"], end="", flush=True)

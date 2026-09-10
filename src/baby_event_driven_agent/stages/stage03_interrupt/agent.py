@@ -1,19 +1,19 @@
-"""agent：收件箱 + 常驻 worker，steering 在 step 边界生效。
+"""agent：收件箱 + 常驻 worker + 可中断的在飞步骤。
 
-与 stage01 的关键差别：总线的 user_input handler 只把消息投进收件箱
-就返回，turn 不再占着总线回调。每个 session 一个收件箱加一个常驻
-worker task（第一次收到该 session 的消息时启动），worker 循环
-"取消息 → 跑 turn"，turn 结束回到取消息——排在 turn 之后的消息
-（followup）就是下一次 get 到的东西。
+在 stage02（收件箱 / steering / followup）之上新增中断能力：
 
-消息语义是消费那一刻定的，不是提交时定的：
-- worker 空闲时取到 → 新 turn 的输入（followup）
-- turn 在跑、step 边界 drain 到 → 拼进当前上下文继续走（steering）
-- 同一条消息，落在哪个窗口就是什么，自己不背语义
-
-worker 永不自行退出（只响应 stop 的 cancel），所以"消息进队之后
-task 恰好死掉"的竞态在这个设计里根本不存在——退出清理是 stop 的
-显式职责，不是每个 turn 的尾部负担。
+- 中断不是消息，不进收件箱，不走 steering/followup 的分类——它是
+  控制信号，直接作用在"正在飞的那一步"上。
+- 每 session 记录当前在飞的 step task（_inflight）。on_interrupt
+  收到信号时，无 await 地检查并 cancel 它——asyncio 单线程里这段
+  是原子的，没有"信号残留杀错下一个 turn"的问题：cancel 作用在
+  具体的 task 对象上，不在飞的 session 查不到 task，信号自然落空。
+- 取消的粒度是单步，不是 worker：step 被掐掉后 turn 记 step_cancelled
+  并收尾，worker 回到收件箱接着取消息，history 里已完成的步骤全部
+  保留（被掐的那步的部分输出不完整，不进 history——provider 对
+  消息序列的格式要求是完整的 assistant 消息）。
+- stop()（进程收尾）与中断是两回事：stop 连 worker 一起收，中断
+  只动当前 step，agent 活着。
 """
 
 from __future__ import annotations
@@ -56,6 +56,8 @@ class Agent:
         self.history: dict[str, list[dict[str, Any]]] = {}  # session_id -> messages
         self.inboxes: dict[str, asyncio.Queue[Event]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
+        # 每 session 当前在飞的 step task：中断的靶子。空闲时是 None。
+        self._inflight: dict[str, asyncio.Task[Any] | None] = {}
 
     # -------------------------------------------------- 总线侧：只投递
 
@@ -70,8 +72,25 @@ class Agent:
         if sid not in self._workers or self._workers[sid].done():
             self._workers[sid] = asyncio.create_task(self._worker(sid))
 
+    async def on_interrupt(self, event: Event) -> None:
+        """注册成总线的 user_interrupt handler：控制信号，不进收件箱。
+
+        命中条件是"该 session 此刻有在飞的 step"。检查和 cancel 之间
+        没有 await，是原子的；step 恰好刚完成（task.done()）时信号
+        落空——取消请求和完成竞速，完成的赢者已定，这是真实语义。
+        中断请求本身无论命中与否都进 log：它是发生过的事实。
+        """
+        sid = event.session_id
+        task = self._inflight.get(sid)
+        if task is not None and not task.done():
+            task.cancel()
+        self.log.append(event, note="interrupt received")
+
     async def stop(self) -> None:
-        """显式收尾：取消所有 worker 并等它们退出。"""
+        """进程收尾：连在飞的 step 和所有 worker 一起取消并等待退出。"""
+        for task in self._inflight.values():
+            if task is not None and not task.done():
+                task.cancel()
         for task in self._workers.values():
             task.cancel()
         for task in self._workers.values():
@@ -126,7 +145,7 @@ class Agent:
                 if not tool_started:
                     # 第一个工具增量到达即宣布"模型要调工具了"——此刻 step
                     # 还在飞（后面还有增量、工具执行、下一个 step），
-                    # demo 用它做确定性插话时机：必然赶得上下一个 step 边界。
+                    # demo 用它做确定性插话/中断时机。
                     tool_started = True
                     await self.bus.publish(Event("tool_call_started", sid, {}))
                 tc = tool_calls.setdefault(
@@ -152,6 +171,44 @@ class Agent:
             }
         return {"role": "assistant", "content": "".join(text_parts)}
 
+    async def _run_step(
+        self, sid: str, history: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """一个可中断的完整单元：消费流 + 执行工具（若有）。
+
+        工具结果不在 task 里直接写 history——中断作废的是整个 step，
+        task 成功后由 turn 协程统一 append，保证 history 里出现的
+        永远是"完整的 assistant 消息 + 紧随的 tool 结果"这种合法序列。
+        """
+        msg = await self._step(sid, history)
+        tool_results: list[dict[str, Any]] = []
+        for call in msg.get("tool_calls") or []:
+            name = call["function"]["name"]
+            if name not in TOOLS:
+                result = f"未知工具：{name}"
+            else:
+                result = await TOOLS[name](json.loads(call["function"]["arguments"]))
+            # 工具返回在这里就进 log（而不是等 turn 协程统一 append）：
+            # 工具真的执行了、可能已改动外部世界，即便这个 step 随后被
+            # 中断作废，发生过的事实也该在轨迹里。history 则相反，由
+            # turn 协程统一写，保证序列永远合法。
+            self.log.append(
+                Event(
+                    "tool_result",
+                    sid,
+                    {"tool_call_id": call["id"], "name": name, "result": result},
+                ),
+                note="tool result",
+            )
+            tool_results.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": result,
+                }
+            )
+        return msg, tool_results
+
     async def _run_turn(self, event: Event) -> None:
         sid = event.session_id
         history = self.history.setdefault(sid, [])
@@ -161,7 +218,23 @@ class Agent:
         self.log.append(event, note="turn start")
         for _ in range(MAX_STEPS):
             await self._drain_steering(sid, history)
-            msg = await self._step(sid, history)
+            step_task = asyncio.create_task(self._run_step(sid, history))
+            self._inflight[sid] = step_task
+            try:
+                msg, tool_results = await step_task
+            except asyncio.CancelledError:
+                # 区分两种取消：step_task 被 on_interrupt 掐掉（本 turn
+                # 就此收尾），或者 turn 协程自己被 stop() 掐掉（继续往外抛）。
+                if not step_task.cancelled():
+                    raise
+                self._inflight[sid] = None
+                self.log.append(Event("step_cancelled", sid, {}), note="interrupt")
+                await self.bus.publish(Event("step_cancelled", sid, {}))
+                await self._end_turn(sid, "interrupted")
+                return
+            finally:
+                if self._inflight.get(sid) is step_task:
+                    self._inflight[sid] = None
             history.append(msg)
             await self.bus.publish(Event("agent_reply", sid, {"message": msg}))
             # 完整回答进 log（agent_delta 不记：它是传输层的瞬时增量，
@@ -170,35 +243,10 @@ class Agent:
                 Event("agent_reply", sid, {"message": msg}),
                 note="tool_call" if msg.get("tool_calls") else "final",
             )
-            if "tool_calls" not in msg:
+            if not tool_results:
                 await self._end_turn(sid, "turn end")
                 return
-            for call in msg["tool_calls"]:
-                name = call["function"]["name"]
-                if name not in TOOLS:
-                    result = f"未知工具：{name}"
-                else:
-                    result = await TOOLS[name](
-                        json.loads(call["function"]["arguments"])
-                    )
-                history.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": result,
-                    }
-                )
-                # 工具返回进 log：它是模型下一轮 context 的一部分，不记的话
-                # 轨迹中间是断的，"模型为什么这么答"无从分析。工具真的执行了
-                # （可能已改动外部世界），发生过的事实就该在轨迹里。
-                self.log.append(
-                    Event(
-                        "tool_result",
-                        sid,
-                        {"tool_call_id": call["id"], "name": name, "result": result},
-                    ),
-                    note="tool result",
-                )
+            history.extend(tool_results)
         await self._end_turn(sid, "max steps")
 
     async def _end_turn(self, sid: str, note: str) -> None:

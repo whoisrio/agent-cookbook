@@ -6,20 +6,23 @@
 
 ## 需求来了
 
-Stage 1 的 v0.1 有个说好的边界：一次处理一个请求。publish 原地 await handler，
-整个 turn 占着总线回调。真实用户不管这些——回答还在跑，他就想把下一句发出去。
-可能是追问（答完了接着处理），可能是插话（正在回答的东西里顺便带上它）。
+Stage 1 的 v0.1 有个预设的边界：一次处理一个请求。publish 原地 await handler，整个 turn 占着总线回调。
+真实用户场景可不会遵从这样的预设，回答还在跑，他就想把下一句发出去。
+可能是追问（一轮交互完成了，接着处理），即followup；
+也可能是插话（把当前的输入，直接插入到当前的对话轮次中），即steering。
+市面上绝大多数agent都支持这两种能力，比如workbuddy，
 
-所以 Stage 2 的需求是两条：
+比如claude code
 
-- 消息要**先有地方排队**，发布的人不被 turn 拖住。
-- 排队的消息要能**插进正在跑的回答**（steering），或者**排在回答之后**
-  （followup）。
+>差几张followup和steering的截图
+
+所以 Stage 2 ，咱们就给这个事件驱动的agent，添加上followup和steering的能力
 
 ## 设计：收件箱 + 常驻 worker
 
-改动只发生在 agent 的入口。总线 handler 不再跑 turn，只做一件事——
-投进收件箱，立刻返回：
+回顾一下，在stage1中咱们的agent往总线注册消息订阅的时候，handler接收到消息时，直接启动了agent；
+要支持followup和steering，在咱们的agent中，就需要一个收件箱来存储agent需要处理的消息，handler接收到消息的时候，不再是直接启动agent，而是先往agent的消息收件箱先写入消息，读取消息的逻辑，在agentloop中执行；
+我们把agentloop设计成asyncio.Task，以便根据当前session的agentloop的状态来判断是否需要重新创建task；
 
 ```python
 class Agent:
@@ -100,56 +103,81 @@ turn_end 在这一章也升级成了真事件：Stage 1 它只写 log（没人�
 
 ## 跑一下（真实 LLM 实测输出）
 
-三个动作按真实时间顺序发生：问保温杯（完整一个 turn）；紧接着问玻璃杯
-（worker 已空闲 → followup，立刻开新 turn）；1 秒后趁玻璃杯的 turn
-还在跑插话（→ 下一个 step 边界被 drain 进当前 turn）。
+三个动作：问保温杯（完整一个 turn）；紧接着问报销（worker 已空闲 →
+followup，立刻开新 turn，且它的答案不在第一轮检索结果里，模型必然发起
+search）；趁报销这轮**工具调用正在飞**时插话 VPN。
+
+插话时机不是 sleep 碰运气，是事件驱动的：agent 在第一个工具调用增量到达时
+发 `tool_call_started` 事件，demo 等到它才插话——此刻 step 确定在飞，
+后面还有增量、工具执行、下一个 step 边界，drain 必然有机会捞到。
+但"发得早"不保证"被 steering 消化"：若插话落在最后一个 drain 点之后
+（临界降级），worker 会在 turn 结束后把它当 followup 取走。两种结局
+demo 都会在屏幕上如实打出来（★ steering 生效 / 降级行），肉眼可辨。
+
+本次实测（`OPENAI_MODEL=qwen3.7-flash stage02-demo`）：
 
 ```text
-[ 3.00s] (A) 用户输入：保温杯还有库存吗
+[ 0.32s] (A) 用户输入：保温杯还有库存吗
 
-[ 8.01s] (A) → 工具调用：search({"query": "保温杯 库存"})
-保温杯还有库存，现有 42 件。具体规格为：316L 不锈钢内胆，500ml，杯身磨砂黑。
-[ 8.95s] (A) —— 回答完毕
+[ 5.29s] (A) → 工具调用：search({"query": "保温杯 库存"})
+是的，保温杯还有库存。目前库存有 42 件。
+[ 8.00s] (A) —— 回答完毕
 
-[ 8.97s] (A) 用户接着问：帮我查一下玻璃杯的库存
+[ 8.00s] (A) 用户接着问：报销有什么规定
 
-[ 9.97s] (A) 用户插话（此刻上一条还在跑）：顺便说说会议室怎么订
+[10.68s] (A) 用户插话（此刻工具调用正在飞）：顺便说说VPN怎么申请
 
-[18.50s] (A) → 工具调用：search({"query": "玻璃杯 库存"})
+[10.92s] (A) → 工具调用：search({"query": "报销 规定"})
 
-[19.85s] (A) → 工具调用：search({"query": "会议室 预订"})
-玻璃杯的库存有 17 件，规格是高硼硅玻璃，400ml，且可以进微波炉。
+[10.92s] (A) ★ steering 生效：「顺便说说VPN怎么申请」拼进当前 turn 的上下文，不开新 turn
 
-关于会议室预订，您可以联系行政小王进行安排。注意在预订前，请先查看日历确认
-会议室没有被锁定。
-[21.17s] (A) —— 回答完毕
+[18.38s] (A) → 工具调用：search({"query": "VPN 申请"})
+关于报销和 VPN 申请的规定如下：……
+[20.60s] (A) —— 回答完毕
 ```
 
-注意 9.97s 那句插话去哪了：它没有开新 turn，而是等玻璃杯那步跑完，
-在 step 边界被 drain 进当前上下文——模型随后**自己发起了一次
-`search("会议室 预订")`**，最后在同一轮里把两个问题一起答了。
+★ 那一行就是 steering 的可视化瞬间：10.68s 发出的插话，在 10.92s 的
+step 边界被 drain 进当前上下文——模型随后**自己发起了一次
+`search("VPN 申请")`**，最后在同一轮里把两个问题一起答了。
 分类、排队、拼上下文，全程没有一行代码写死"这是插话"。
 
-session log 把这个故事记得更清楚（节选）：
+真实运行里两种结局都出现过。另一次实测中，同样的插话晚了约 10 毫秒——
+worker 在 tool_call 回复后原子地跑完了"执行工具 + step 边界 drain"，
+插话落在了最后一个 drain 点之后：屏幕上没有 ★，turn 收尾也没带上它，
+它作为 followup 开了新 turn。这正是插话语义的边界：**steering 的意义
+只存在于"当前 turn 还活着且尚未越过最后一个 drain 点"的时候**，
+错过窗口就自然降级成普通用户消息——没有任何特殊代码处理"降级"，
+worker 的下一次 `inbox.get()` 天然接住。
+
+session log 把这个故事记得更清楚（节选，本次 ★ 命中的那轮）：
 
 ```json
-{"ts": 8.97, "type": "user_input", "session": "A", "payload": {"text": "帮我查一下玻璃杯的库存"}, "note": "turn start"}
-{"ts": 18.5, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": null, "tool_calls": [{"function": {"name": "search", "arguments": "{\"query\": \"玻璃杯 库存\"}"}}]}}, "note": "tool_call"}
-{"ts": 9.97, "type": "user_input", "session": "A", "payload": {"text": "顺便说说会议室怎么订"}, "note": "steering"}
-{"ts": 19.85, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": null, "tool_calls": [{"function": {"name": "search", "arguments": "{\"query\": \"会议室 预订\"}"}}]}}, "note": "tool_call"}
+{"ts": 8.0, "type": "user_input", "session": "A", "payload": {"text": "报销有什么规定"}, "note": "turn start"}
+{"ts": 10.92, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": null, "tool_calls": [{"function": {"name": "search", "arguments": "{\"query\": \"报销 规定\"}"}}]}}, "note": "tool_call"}
+{"ts": 10.68, "type": "user_input", "session": "A", "payload": {"text": "顺便说说VPN怎么申请"}, "note": "steering"}
+{"ts": 18.38, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": null, "tool_calls": [{"function": {"name": "search", "arguments": "{\"query\": \"VPN 申请\"}"}}]}}, "note": "tool_call"}
 ```
 
-第三行值得盯 10 秒：它的 `ts` 是 9.97——消息**到达**的时刻——却排在
-18.5 的记录后面，因为 log 按消费顺序追加，它是在 step 边界被 drain 的
+第三行值得盯 10 秒：它的 `ts` 是 10.68——消息**到达**的时刻——却排在
+10.92 的记录后面，因为 log 按消费顺序追加，它是在 step 边界被 drain 的
 那一刻写进去的。到达时间和消费时间是两个时刻，这一行就是"分类权在
 消费端"的字面证据。
 
+这轮的完整序列也值得看一眼——assistant → tool_result → （steering
+拼进来）→ assistant → tool_result → assistant，四步一个 turn：
+报销的检索结果刚回来，插话已经在上下文里，模型决定再检索一次 VPN，
+最后一条 assistant 把两件事一起答完。
+
 ## 设计边界，以及下一章的需求
 
-steering 有个天然的等待：它只在 step 边界生效，**正在飞的那一步等不了**。
-上面的实测里这个等待真实发生了——插话 9.97s 发出，那一步 18.5s 才落地，
-用户等了 8.5 秒才看到自己的话被消化。模型请求一旦发出，当前设计里
-没有任何东西能把它掐掉。
+demo 的兜底逻辑里藏着一个本章最重要的教训：插话降级成 followup 后，
+**demo 绝不能在第一个 turn_end 就 stop()**——那会把还在收件箱里的
+插话连 worker 一起掐死。消息没丢，是等它的人先走了。
+
+steering 还有个天然的等待：它只在 step 边界生效，**正在飞的那一步
+等不了**。本次实测插话 10.68s 发出、10.92s 被消化，只等了 0.24 秒——
+运气好，正好赶上边界。但那不是设计保证的：如果当时在飞的是一次
+8 秒的模型请求，用户就干等 8 秒，当前设计里没有任何东西能把它掐掉。
 
 而用户不等的时候会做什么？按停止。所以下一个需求：**中断**——
 正在飞的模型请求要能被掐掉，而且不能把 agent 掐死。
@@ -161,12 +189,12 @@ steering 有个天然的等待：它只在 step 边界生效，**正在飞的那
   兼容端点（本次实测用 `OPENAI_MODEL=qwen3.7-flash` 覆盖，原配模型额度
   已耗尽；demo 用真模型，会产生少量 token 费用）。
 - 实跑：`stage02-demo` 输出即正文时间线与 session log（2026-09-09 真实
-  LLM 运行，非手写）。
-- pytest：`stage02-test` 4 passed，全部离线（FakeLLM 与 RealLLM 同协议）——
+  LLM 运行，非手写）。demo 的插话时机由 `tool_call_started` 事件驱动，
+  非固定 sleep；两种结局（★ steering / 临界降级 followup）都在真实
+  运行中出现过，屏幕可见。
+- pytest：`stage02-test` 5 passed，全部离线（FakeLLM 与 RealLLM 同协议）——
   handler 只投递立刻返回、followup 开新 turn、steering 在 step 边界生效
-  （用 first_call_gate 把"消息在 step 在飞时到达"做成确定性时序）、
-  多 session 收件箱与 history 隔离。FakeLLM 的 `first_call_tool` 把 turn
-  撑成两步——一步的 turn 没有 step 边界，插话只能降级成 followup，
-  这本身就是语义的一部分（消费那一刻分类）。
+  （first_call_gate 确定性时序）、**插话错过最后一个 drain 点降级为
+  followup 且不丢**（临界降级测试）、多 session 收件箱与 history 隔离。
 - 测试不用 pytest 的 tmp_path fixture（WorkBuddy 沙箱 shim 会拦
   pytest-of-unknown 的 mkdir），用 tempfile.mkdtemp 自建自清理。

@@ -1,6 +1,9 @@
 # 环境变量
 .env
 
+# agent demo 的 session log（运行时产物）
+src/baby_event_driven_agent/sessions/
+
 # Python
 __pycache__/
 *.pyc

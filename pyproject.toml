@@ -24,11 +24,13 @@ dependencies = [
 
 [project.scripts]
 # 事件驱动 agent 系列（books/event-driven-agent/）：每个 stage 一条 demo + 一条 test。
-# demo 指向该 stage 的 __main__；test 指向该 stage 的 testing.py（包内 pytest.main）。
-stage01-demo = "baby_event_driven_agent.stages.stage01_receive_events.__main__:cli"
+# demo 指向该 stage 的 main.py；test 指向该 stage 的 testing.py（包内 pytest.main）。
+stage01-demo = "baby_event_driven_agent.stages.stage01_receive_events.main:cli"
 stage01-test = "baby_event_driven_agent.stages.stage01_receive_events.testing:main"
-stage02-demo = "baby_event_driven_agent.stages.stage02_inbox_steering.__main__:cli"
+stage02-demo = "baby_event_driven_agent.stages.stage02_inbox_steering.main:cli"
 stage02-test = "baby_event_driven_agent.stages.stage02_inbox_steering.testing:main"
+stage03-demo = "baby_event_driven_agent.stages.stage03_interrupt.main:cli"
+stage03-test = "baby_event_driven_agent.stages.stage03_interrupt.testing:main"
 
 [build-system]
 requires = ["setuptools>=75.0"]

@@ -25,9 +25,14 @@
 
 - 起点 v0.1，真实可用：同步 EventBus，handler 注册上去，UI 发事件、handler 直接在
   总线回调里跑完整个 agent loop。单用户、一问一答、turn 跑完再接下一条——完全正常。
-- 模型是真的：.env 配 OpenAI 兼容端点，流式调用。文本增量（agent_delta 事件）
-  边到边发 UI；工具调用增量边到边累积，流结束拼出完整 assistant 消息。
-  FakeLLM 与 RealLLM 同一个 stream_chat 增量协议，只给 tests 用。
+- 模型是真的：.env 配 OpenAI 兼容端点（demo / 测试指向本地 ollama 的
+  qwen3.5:4b-32k），流式调用。文本增量（agent_delta）和思考增量
+  （agent_thinking，进窗口不进 log）边到边发 UI；工具调用增量边到边累积，
+  流结束拼出完整 assistant 消息。
+  Stage 1 不养假 LLM；Stage 2 / 3 的测试要确定性时序，才引入 FakeLLM。
+- 工具四件套，读写成对：query_inventory / update_inventory 扮演业务接口
+  （inventory.txt 模拟业务库），search_rules / update_rules 扮演规则检索
+  与知识运营（rules.txt 模拟规则库，逐行匹配，不是真 RAG）。写操作真写文件。
 - 落地机制：事件、总线、订阅分发、append-only session log、system prompt。
 - 能力边界（下一章需求一到就撞上）：设计里没有"排队"和"打断"这两个概念。
   回答跑着的时候用户插话纠正，会原地起第二个并发 turn 写同一份 history；
@@ -47,20 +52,30 @@
   但 task 恰好死了"的窗口根本不存在；spawn 检查靠 asyncio 单线程里
   put/check 之间无 await 的天然原子性。一步的 turn 没有 step 边界，
   插话自然降级成 followup——语义自洽，不用特判。
+- 可视化与临界降级：drain 消费时发 steering_consumed 事件（★ 上屏，
+  不用翻 log）；demo 插话时机由 tool_call_started 事件驱动（step 确定在飞），
+  但"发得早"不保证"被消化"——落在最后一个 drain 点之后的消息降级为
+  followup（worker 下次 get() 天然接住），demo 必须等第二个 turn_end，
+  不能在第一个 turn_end 就 stop()（否则收件箱里的消息被连人带队掐死）。
 - 下章需求预告：steering 只能在 step 边界生效，正在飞的那一步等不了
-  （实测真模型一步飞了 8.5 秒，插话就等了 8.5 秒）——用户想直接掐掉重来。
+  （等待时长取决于在飞请求，可能是 0.24 秒也可能是 8 秒）——
+  用户想直接掐掉重来。
 
 ## Stage 3：用户中断
 
 - 需求：回答跑偏了，用户不等了，按停止——正在飞的模型请求要能掐掉，而且
   不能把整个 agent 掐死。
-- 机制：中断不是消息，是控制信号，要能插队 → ctrl 队列 + 优先级双队列。
-  CancelSignal 两段式取消——先 set 信号给 grace 窗口让 IO 层体面收尾
-  （关 HTTP 流），超时再 task.cancel() 强撕。
-- 实现时踩的真坑：用两个 asyncio.Queue 做优先级，竞速取队列，输家手里已取出的
-  事件静默丢失，500/500 全丢。解法：deque 把"唤醒"和"取"拆两步，Event 只管唤醒，
-  取是同步 popleft，取前怎么取消都不丢。
-- 关键论点：取消的粒度是单步，不是终止执行体。loop 活着，会话状态完整。
+- 机制：中断不是消息，不进收件箱——是控制信号，直接作用在"正在飞的那一步"。
+  每 session 记录当前在飞的 step task（_inflight），on_interrupt 无 await 地
+  查表并 cancel（原子，无信号残留问题）；step 包成可取消单元（流消费 + 工具
+  执行一起），工具结果由 turn 协程在 task 成功后统一 append，保证 history
+  里永远是合法序列，被掐的 step 不留半截消息。
+- 设计取舍（正文讲清为什么不开高优先级队列）：竞速取两个 asyncio.Queue 会
+  静默丢事件（早期实现的真实坑）——中断不给队列就没有可丢的东西。
+- 关键语义：取消粒度是单步不是执行体（worker 活着、history 完好）；取消与
+  完成竞速，信号落在 task.done() 之后就是落空（如实打印）；stop()（进程收尾）
+  与中断（单步）是两个入口；中断不作废历史——被中断的问题留在 history，
+  实测模型下一轮主动补答（不想保留就在中断时撤掉该 user 消息，两路都通）。
 - 下章需求预告：中断之后 turn 结束了，用户的纠正要从头再来——能不能不结束？
 
 ## Stage 4：redirect（同一个 turn 内原地转向）

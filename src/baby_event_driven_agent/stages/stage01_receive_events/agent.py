@@ -14,19 +14,16 @@ from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from .events import Event, EventBus, SessionLog
-from .llm import TOOLS
+from .llm import TOOLS, build_system_prompt
 
 logger = logging.getLogger(__name__)
 
 MAX_STEPS = 4
 
-# 没有 system prompt，模型不知道 search 能查到什么——实测它会把
-# "保温杯还有库存吗"当成闲聊，回答"我无法访问实时库存"。必须告诉它
-# 工具检索的是本地知识库。
-SYSTEM_PROMPT = (
-    "你是一个带工具的通用 agent。search 工具检索的是本地知识库（团队笔记），"
-    "用户问到笔记里可能有的信息时，先检索再根据结果回答。"
-)
+# 完全没有 system prompt 时，实测模型会把"保温杯还有库存吗"当闲聊，
+# 回一句"我无法访问实时库存"——得告诉它工具能摸到什么。工具的分工
+# 不在这里手写，从 schemas 生成（路由信息只写在 description 一处）。
+SYSTEM_PROMPT = build_system_prompt()
 
 
 class LLMClient(Protocol):
@@ -56,7 +53,12 @@ class Agent:
         text_parts: list[str] = []
         tool_calls: dict[int, dict[str, str]] = {}  # index -> 累积中的调用
         async for chunk in self.llm.stream_chat(history):
-            if chunk["type"] == "text_delta":
+            if chunk["type"] == "reasoning_delta":
+                # 思考内容：边到边发 UI，但不进 history 也不进 log
+                await self.bus.publish(
+                    Event("agent_thinking", sid, {"text": chunk["text"]})
+                )
+            elif chunk["type"] == "text_delta":
                 text_parts.append(chunk["text"])
                 await self.bus.publish(
                     Event("agent_delta", sid, {"text": chunk["text"]})
@@ -119,5 +121,16 @@ class Agent:
                         "tool_call_id": call["id"],
                         "content": result,
                     }
+                )
+                # 工具返回进 log：它是模型下一轮 context 的一部分，不记的话
+                # 轨迹中间是断的，"模型为什么这么答"无从分析。工具真的执行了
+                # （可能已改动外部世界），发生过的事实就该在轨迹里。
+                self.log.append(
+                    Event(
+                        "tool_result",
+                        sid,
+                        {"tool_call_id": call["id"], "name": name, "result": result},
+                    ),
+                    note="tool result",
                 )
         self.log.append(Event("turn_end", sid, {}), note="max steps")
