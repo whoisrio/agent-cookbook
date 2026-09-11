@@ -1,4 +1,4 @@
-from .llm import model, openai_client, config
+from .llm import config, model, openai_client, structured
 from .stream_helper import stream_json
 
-__all__ = ["model", "openai_client", "config", "stream_json"]
+__all__ = ["config", "model", "openai_client", "structured", "stream_json"]
