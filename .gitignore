@@ -11,6 +11,7 @@ __pycache__/
 uv.lock
 .pytest_cache
 .claude
+.workbuddy/
 # setuptools 构建元数据（src/agent_cookbook.egg-info/）
 *.egg-info/
 # Jupyter
