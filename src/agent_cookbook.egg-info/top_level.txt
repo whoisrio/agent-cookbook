@@ -1,5 +1,0 @@
-agent_bus
-agent_cookbook
-baby_agent
-baby_agent_ts
-baby_event_driven_agent

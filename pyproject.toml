@@ -23,8 +23,9 @@ dependencies = [
 ]
 
 [project.scripts]
-# 事件驱动 agent 系列（books/event-driven-agent/）：每个 stage 一条 demo + 一条 test。
-# demo 指向该 stage 的 main.py；test 指向该 stage 的 testing.py（包内 pytest.main）。
+# 事件驱动 agent 系列（正文 books/event-driven-agent/，代码 src/baby_event_driven_agent/）。
+# 每个 stage 一条 demo + 一条 test：demo 指向该 stage 的 main.py；
+# test 指向该 stage 的 testing.py（包内 pytest.main）。
 stage01-demo = "baby_event_driven_agent.stages.stage01_receive_events.main:cli"
 stage01-test = "baby_event_driven_agent.stages.stage01_receive_events.testing:main"
 stage02-demo = "baby_event_driven_agent.stages.stage02_inbox_steering.main:cli"
@@ -42,6 +43,8 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
+# 只装 src/：examples/ 放 notebook 与演练代码，不参与包发现，
+# 否则 setuptools 会把 examples 下的 langgraph / python / dsh / pi 注册成顶层包，遮蔽真正的依赖。
 where = ["src"]
 
 [tool.pytest.ini_options]
