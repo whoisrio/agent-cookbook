@@ -257,7 +257,7 @@ def build_system_prompt(schemas: list[dict[str, Any]] | None = None) -> str:
 
 Agent 里，核心就两个方法：`_run_turn` 跑一轮 loop，`_step` 消费一轮流式输出。
 
-history 每个 session 一份消息序列，第一轮开始时垫一条 system prompt。loop 本身很朴素：最多 4 步，每步向模型要一次流式输出；模型要工具就执行、把结果喂回去再要一次；模型不要工具了，turn 就结束：
+history 每个 session 一份消息序列，第一轮开始时垫一条 system prompt。loop 本身是标准的loop：拼装message调用模型，模型要工具就执行，把结果喂回去继续调用模型，模型不要工具了，turn 就结束：
 
 ```python
 async def _run_turn(self, event: Event) -> None:
@@ -297,38 +297,10 @@ async def _run_turn(self, event: Event) -> None:
     self.log.append(Event("turn_end", sid, {}), note="max steps")
 ```
 
-`_step` 是增量消费的地方。模型一次请求吐出三种增量，各有各的去处：
-
-```python
-async for chunk in self.llm.stream_chat(history):
-    if chunk["type"] == "reasoning_delta":
-        # 思考：边到边发 UI 直播，不进 history、不进 log
-        await self.bus.publish(
-            Event("agent_thinking", sid, {"text": chunk["text"]})
-        )
-    elif chunk["type"] == "text_delta":
-        text_parts.append(chunk["text"])
-        await self.bus.publish(
-            Event("agent_delta", sid, {"text": chunk["text"]})
-        )
-    elif chunk["type"] == "tool_call_delta":
-        tc = tool_calls.setdefault(
-            chunk["index"], {"id": "", "name": "", "args": ""}
-        )  # id / name 就地更新，args 累加——arguments 常分多块到达
-```
-
-流结束时三种增量各归各位：文本拼成完整 content，工具调用拼成完整的
-tool_calls，组装成一条 assistant 消息返回，`_run_turn` 拿到它发布 agent_reply。
-
-注意思考内容的待遇：只直播，不进 history 也不进 log。它是模型这一步的
-推理窗口，provider 下一轮也不会回收 reasoning，轨迹重放用不到它，
-log 里自然没有它的位置。
-
 ### SessionLog：append-only trajectory 记录
 
 我们把事件、与 LLM 交互的历史，通通 append-only 写入 jsonl 作为 trajectory 记录，以便后续基于轨迹做分析。
-轨迹不只是对话：assistant 的每次工具调用和工具的返回也在里面——
-它们是模型上下文的一部分，缺了它们，"模型为什么这么答"就无从分析。
+轨迹不只是对话：assistant 的每次工具调用和工具的返回也在里面——它们是模型上下文的一部分，缺了它们，"模型为什么这么答"就无从分析。
 
 ```python
 class SessionLog:
@@ -394,7 +366,7 @@ async def main():
 asyncio.run(main())
 ```
 
-五个对象凑齐了，回头看一次全景——一次 turn 的数据流长这样：
+五个对象凑齐了，一次 turn 的数据流大致如下：
 
 ```text
 用户敲一行字
