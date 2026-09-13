@@ -9,50 +9,52 @@
 
 ### 什么是事件驱动的 agent
 
-不用事件驱动的Agent Loop，所有的处理逻辑都要包含在Agent Loop的代码中：不光要拼上下文、调用工具、记录session log，之后每加一个 Harness 能力，比如输入的防护、输出的隐私检查、工具调用审计等等等,都得打开 Agent Loop 动刀。它管的杂事越多，代码越难改，最后长成一个谁都不敢动的巨型函数，而其中任何一处改动都可能碰坏核心的模型调用。
+一个最朴素的 Agent Loop ：拼上下文、调模型、执行工具,没有工具可执行了，就返回结果。
 
-事件驱动把 Agent Loop 从杂事堆里拉出来：过程中发生的每件事——用户输入、模型增量、工具往返、turn 生命周期——统一建模成事件（Event），Agent Loop 只管跑核心步骤——拼上下文、调模型、执行工具——每走一步把"发生了什么"发布到总线上就算完事。UI 呈现、log 落盘是总线上的另外两个消费者，一个做流式呈现，一个原样落盘成轨迹。
+```python
+def agentloop(self,input):
 
-直接调用和事件还有一层本质差别：调用是一次性的，栈走完就没了；事件是数据。是数据就能排队、能落盘、能回放。
+    while True:
+        # 1. 拼上下文
+        # 2. 调模型
+        # 3. 执行工具
+        # 4. 返回结果
+```
+但现实很快会变复杂，输入的防护、上下文的压缩、输出的隐私检查、工具调用审计、session log落盘等等等……每加一个能力，都得打开 Agent Loop 动刀。
+```python
+def agentloop(self,input):
+    #防prompt注入
+    while True:
+        # context compact
+        # 1. 拼上下文
+        # log
 
-总的来说，事件驱动是把复杂流程解耦和提高功能灵活性的关键选择。
+        # 2. 调模型
+
+        #审计
+        # 3. 执行工具
+        #输入隐私检查
+
+        # 4. 返回结果
+```
+loop 里塞的杂事越多，核心逻辑就越被淹没。最终它会长成一个谁都不敢碰的上帝函数。任何一处改动，都可能牵连核心的模型调用链路。
+
+事件驱动把 Agent Loop 从杂事堆里解耦出来：过程中发生的每件事——用户输入、模型增量、工具往返、turn 的生命周期——统一建模为 Event。Agent Loop 只管跑核心步骤，每走一步把"发生了什么"发布到总线上就算完事。而事件天然可排队、可落盘、可回放，Agent 的思考轨迹也因此沉淀为可复用的资产。
+
+说白了，事件驱动让 Agent Loop 回归它该做的事——跑核心循环。剩下的，交给事件总线。
 
 下面，咱们就着手一步步搭建事件驱动的agent。
-### 场景
+## 场景
 
-一个简单的企业业务场景的 agent：
-- OpenAI chat/completions兼容端点、流式输出。demo 和测试都指向本地 ollama 的 qwen3.5:4b-32k，零 API 成本；
-- 四个工具，读写成对：查库存 / 改库存（扮演业务接口），查规则 / 改规则（扮演知识检索与运营）。数据就是 knowledge-base/ 下的两个文本文件，写操作真写；
-- UI 暂时是 CLI，要求流式：回答一个字一个字往外蹦。
+咱们从一个简单的电商的业务场景的 agent开始
+- 基础模型就用本地小模型(qwen3.5:4b-32k)，通过ollama来驱动，ollama支持OpenAI chat/completions兼容端点、流式输出。
+- 提供四个工具给这个agent，读写成对：查库存 / 改库存（扮演业务接口），查规则 / 改规则（扮演知识检索与运营）。
+- UI 暂时是 CLI，采用流式：回答一个字一个字往外蹦。
 
-### 关键对象
-五个对象，一人一句话职责：
-
-- `Event`：事件本体。type + session_id + payload + ts 四个字段，frozen——事件发出去之后就不允许再被改动；
-- `EventBus`：订阅与发布。同步总线，publish 原地 await 所有 handler，Stage 1 刻意保持简单；
-- `Agent`：user_input 的消费者，收到事件跑一轮 loop（模型 → 工具 → 模型 → 回话），按 session 维护 history；
-- `SessionLog`：append-only 轨迹。事件、assistant 消息、工具返回统统追加进 jsonl，它是唯一真相，暂时没人读它；
-- CLI UI：agent_thinking / agent_delta / agent_reply 的消费者，把输出呈现到终端。
-
-一次 turn 的数据流长这样：
-
-```text
-用户敲一行字
-  └─▶ user_input ──▶ Agent 消费，开始 loop（最多 4 步）
-        每一步：请求 LLM 流式输出
-        ├─▶ agent_thinking ──▶ UI 暗色直播（不进 history，不进 log）
-        ├─▶ agent_delta    ──▶ UI 流式打印（不进 log，累积结果才算完整回答）
-        ├─▶ agent_reply    ──▶ UI 收尾 + 写 log（tool_call 或 final）
-        ├─▶ tool_result    ──▶ 写 log（工具真跑过了，事实要留轨迹）
-        └─▶ turn_end       ──▶ 写 log，一轮结束
-```
-
-下面在哪买看看具体的代码。
-
-## 代码
-### Event:事件
-
-一切从事件开始。类型、session_id、payload、时间戳，四个字段：
+## 关键对象
+五个关键对象：
+### Event
+事件，type + session_id + payload + ts 四个字段，设置为frozen,事件发出去之后就不允许再被改动；
 
 ```python
 import json, time
@@ -68,8 +70,8 @@ class Event:
     payload: dict = field(default_factory=dict)
     ts: float = field(default_factory=time.time)
 ```
-### Eventbus:事件总线
-然后，我们需要定义事件处理的总线 EventBus，提供事件的订阅、发布的能力：
+### EventBus
+`EventBus`：消息总线，提供消息的订阅和发布；在stage1，publish消息后，await所有handler执行；
 
 ```python
 class EventBus:
@@ -83,7 +85,24 @@ class EventBus:
             await h(event)
 ```
 
-### LLM 客户端与工具
+### Agent
+user_input 的消费者，收到事件跑一轮 loop（模型 → 工具 → 模型 → 回话），按 session 维护 history。Agent 自身很薄，持有的状态只有一份按 session 隔离的 history：
+
+```python
+class Agent:
+    def __init__(
+        self,
+        bus: EventBus,
+        log: SessionLog,
+        llm: LLMClient,
+    ) -> None:
+        self.bus = bus
+        self.log = log
+        self.llm = llm
+        self.history: dict[str, list[dict[str, Any]]] = {}  # session_id -> messages
+```
+
+#### 模型客户端
 
 使用`AsyncOpenai`提供的client调用llm，并指定流式输出；
 ```python
@@ -121,6 +140,9 @@ class RealLLM:
                        "id": tc.id or None, "name": fn.name if fn else None,
                        "args_delta": (fn.arguments if fn else "") or ""}
 ```
+
+#### 工具
+
 在这个简单的Agent场景里，我们提供四个工具。两个读操作工具，
 `query_inventory` 查询指定品类的库存；
 `search_rules` 查询业务知识，扮演 RAG 检索，
@@ -231,23 +253,9 @@ def build_system_prompt(schemas: list[dict[str, Any]] | None = None) -> str:
 必须基于事实回答用户问题。……
 ```
 
-### AGENT
+#### AgentLoop
 
-Agent 里，核心就两个方法：`_run_turn` 跑一轮 loop，`_step` 消费一轮流式输出。Agent 自身很薄，持有的状态只有一份按 session 隔离的 history：
-
-```python
-class Agent:
-    def __init__(
-        self,
-        bus: EventBus,
-        log: SessionLog,
-        llm: LLMClient,
-    ) -> None:
-        self.bus = bus
-        self.log = log
-        self.llm = llm
-        self.history: dict[str, list[dict[str, Any]]] = {}  # session_id -> messages
-```
+Agent 里，核心就两个方法：`_run_turn` 跑一轮 loop，`_step` 消费一轮流式输出。
 
 history 每个 session 一份消息序列，第一轮开始时垫一条 system prompt。loop 本身很朴素：最多 4 步，每步向模型要一次流式输出；模型要工具就执行、把结果喂回去再要一次；模型不要工具了，turn 就结束：
 
@@ -316,7 +324,7 @@ tool_calls，组装成一条 assistant 消息返回，`_run_turn` 拿到它发�
 推理窗口，provider 下一轮也不会回收 reasoning，轨迹重放用不到它，
 log 里自然没有它的位置。
 
-#### session log：append-only trajectory 记录
+### SessionLog：append-only trajectory 记录
 
 我们把事件、与 LLM 交互的历史，通通 append-only 写入 jsonl 作为 trajectory 记录，以便后续基于轨迹做分析。
 轨迹不只是对话：assistant 的每次工具调用和工具的返回也在里面——
@@ -379,11 +387,24 @@ async def main():
               "帮我把马克杯加进库存：8 件，陶瓷，350ml",
               "马克杯还有货吗",
               "报销有什么规定",
-              "林志玲好看么"]:
+              "迪丽热巴和杨幂谁更好看?"]:
         print(f"[{t():5.2f}s] (A) 用户输入：{q}")
         await bus.publish(Event("user_input", "A", {"text": q}))
 
 asyncio.run(main())
+```
+
+五个对象凑齐了，回头看一次全景——一次 turn 的数据流长这样：
+
+```text
+用户敲一行字
+  └─▶ user_input ──▶ Agent 消费，开始 loop（最多 4 步）
+        每一步：请求 LLM 流式输出
+        ├─▶ agent_thinking ──▶ UI 暗色直播（不进 history，不进 log）
+        ├─▶ agent_delta    ──▶ UI 流式打印（不进 log，累积结果才算完整回答）
+        ├─▶ agent_reply    ──▶ UI 收尾 + 写 log（tool_call 或 final）
+        ├─▶ tool_result    ──▶ 写 log（工具真跑过了，事实要留轨迹）
+        └─▶ turn_end       ──▶ 写 log，一轮结束
 ```
 
 
@@ -471,19 +492,11 @@ append-only 这个决定从这一章开始生效：事件只追加、不改写�
 
 ## 设计边界，以及下一章的需求
 
-有一件事 v0.1 没有设计：**排队**。
+如上就是最简单的通过事件驱动的agent loop，其实还存在不少明显的问题，你看出来了几个。
 
-publish 原地 await handler，意味着 agent 的整个 turn 占着总线回调不放。
-这个前提下，"用户在回答还在跑的时候又发一条消息"没有安身之处——
-设计里没有任何东西接住它、让它等。
-
-而真实用户一定会这么干：回答要跑两秒，他 0.2 秒后就想到问题问错了，
-想纠正；或者问完一个问题紧接着想问下一个，不想盯着屏幕等。
-
-所以下一个需求很明确：消息要先有地方排队，agent 决定什么时候消费、
-怎么解释消费到的消息。这就是 Stage 2 的收件箱，附带两个新语义——
-steering（插进正在跑的回答）和 followup（排在回答之后）。
-
-顺带看清一个事实，下一章会反复用到：asyncio 给了你并发，没给你串行化。
-串行化要自己买，收件箱就是那个价钱。
+比如，**消息插入**和**消息排队**。
+现在的消息总线，发布者消息后，需要原地 await handler，
+比如用户发了消息，要等待agent loop跑完才能发另外一条消息，
+而真实的用户很有可能是希望发完一条消息之后，立刻再补充新的内容，如上这个最简设计是承载不了这样的操作的。
+下一节咱们就来看看，如何做。
 
