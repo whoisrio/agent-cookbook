@@ -1,8 +1,9 @@
-# Stage 3：用户中断
+# Stage 3：打断与转向（interrupt + redirect）
 
 > 配套代码：`src/baby_event_driven_agent/stages/stage03_interrupt/`，
 > `stage03-demo` 跑演示（真模型），`stage03-test` 跑离线测试。
-> 本 stage 保留 stage02 的全部能力（收件箱、steering、followup），在此之上加一种新东西：中断。
+> 本 stage 保留 stage02 的全部能力（收件箱、steering、followup），在此之上加一种新东西：
+> 打断在飞的一步，并决定掐完之后是结束（interrupt）还是原地转向（redirect）。
 
 ## 需求
 
@@ -150,7 +151,7 @@ session log 里中断的痕迹（节选）：
 中断请求本身（`user_interrupt`）无论命中与否都进 log——它是发生过的事实；
 是否命中由 `step_cancelled` 有没有出现来判断。
 
-## 设计边界，以及下一章的需求
+## 从“停”到“转向”：本章后半的 redirect
 
 中断解决的是“怎么停”，但停完之后用户面对的是一个问题：
 被掐掉的那个 turn 结束了，如果用户的意思不是“别答了”而是“我改主意了，换个问法”，
@@ -160,7 +161,10 @@ session log 里中断的痕迹（节选）：
 把这两种意图区分开，需要一种新机制：
 同样是掐掉正在飞的一步，turn 不结束，被掐断的输出还要按 provider 的格式要求补齐消息序列，
 然后立刻重发。
-这就是下一章的 redirect。
+这一机制就是本章后半要展开的 redirect。
+
+再往后（Stage 4）：loop 往总线 emit 的东西越来越多，上行的量一上来，
+总线和 UI 就顶不住了——那是下一章的事。
 
 ## 验证
 

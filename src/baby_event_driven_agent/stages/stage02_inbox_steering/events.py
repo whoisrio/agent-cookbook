@@ -1,8 +1,16 @@
 """事件、总线、append-only session log。
 
-总线只做一件事：订阅了谁，事件来了原地 await 谁。
-agent 的整个 turn 在总线回调里跑完——这是本 stage 的设计决定，
-代价（没有排队）由后续 stage 的收件箱偿还。
+总线从这一章起分了方向，两条路不再混在一起：
+
+- inbound（命令）：publish(event, to) —— **同步**，把命令交给目标 agent 登记的
+  投递函数就返回。不 await、不扇出，投递与执行由此分离。
+- outbound（事件）：emit(event) —— **异步**，把 agent 发出的事件扇出给订阅者。
+  本章的 emit 仍是 await handler 的简单扇出；异步分发 / QoS / 背压 / 治理
+  留到 Stage 4。
+
+publish 变成同步还带来一个结构性好处：它返回 None，调用方既 await 不了、
+也 create_task 不了——"乱起一个并发 task、把同一个 session 的 history 写坏"
+这件事从签名上就不可能发生。串行改由"收件箱 + 单 worker"保证。
 """
 
 from __future__ import annotations
@@ -32,7 +40,7 @@ class Event:
 class SessionLog:
     """append-only。Stage 1 没人读它，但它记录的是唯一真相。
 
-    Stage 6 靠它回放重建状态，Stage 7 靠它做可重复的 eval。
+    Stage 5 靠它回放重建状态，Stage 6 靠它做可重复的 eval。
     """
 
     def __init__(self, path: str) -> None:
@@ -51,17 +59,42 @@ class SessionLog:
 
 
 Handler = Callable[[Event], Awaitable[None]]
+Sink = Callable[[Event], None]  # inbound 投递函数：同步、无返回
 
 
 class EventBus:
-    """同步总线：publish 原地 await handler。"""
+    """两条方向，两条路。
+
+    inbound 按 agent_id 路由到投递函数（同步）；outbound 按事件类型扇出给
+    订阅者（异步）。同一个方法不再既当命令投递、又当事件扇出。
+    """
 
     def __init__(self) -> None:
+        self._sinks: dict[str, Sink] = {}
         self._subs: dict[str, list[Handler]] = defaultdict(list)
 
+    # ---- 注册 ----
+
+    def register(self, agent_id: str, sink: Sink) -> None:
+        """登记一个 agent 的入站投递函数：publish 按 id 找到它。"""
+        self._sinks[agent_id] = sink
+
     def subscribe(self, type: str, handler: Handler) -> None:
+        """订阅 outbound 事件。"""
         self._subs[type].append(handler)
 
-    async def publish(self, event: Event) -> None:
+    # ---- inbound：命令 ----
+
+    def publish(self, event: Event, to: str) -> None:
+        """同步投递到目标 agent，立即返回。命令不做扇出。"""
+        sink = self._sinks.get(to)
+        if sink is None:
+            raise KeyError(f"没有这个 agent：{to!r}")
+        sink(event)
+
+    # ---- outbound：事件 ----
+
+    async def emit(self, event: Event) -> None:
+        """把 agent 发出的事件扇出给订阅者。"""
         for handler in self._subs.get(event.type, []):
             await handler(event)

@@ -1,39 +1,88 @@
-# Stage 2：收件箱——followup 和 steering
+# Stage 2：收件箱 + 总线分方向
 
 > 配套代码：`src/baby_event_driven_agent/stages/stage02_inbox_steering/`，
 > 可跑（`stage02-demo` / `stage02-test`）、带 tests。
-> 模型和工具与 Stage 1 完全相同，这章只动一个地方：消息进来之后怎么排队。
+> 保留 stage01 的全部能力，本章改两处：**总线分方向**（inbound 同步入队 /
+> outbound 异步扇出）和**收件箱 + 常驻 worker**。
 
 ## 需求来了
 
-Stage 1 的 v0.1 有个预设的边界：一次处理一个请求。publish 原地 await handler，整个 turn 占着总线回调。
-真实用户场景可不会遵从这样的预设，回答还在跑，他就想把下一句发出去。
-可能是追问（一轮交互完成了，接着处理），即followup；
-也可能是插话（把当前的输入，直接插入到当前的对话轮次中），即steering。
-市面上绝大多数agent都支持这两种能力，比如workbuddy，
+Stage 1 有个预设的边界：一次处理一个请求。真实用户不会遵守这个预设，回答还在跑，他就想把下一句发出去。
+可能是插话（把当前的输入，直接插入到当前的对话轮次中），即 steering；
+也可能是追问（一轮交互完成了，接着处理），即 followup。
 
-比如claude code
+市面上绝大多数 agent 都支持这两种能力，比如 workbuddy、claude code。
 
 >差几张followup和steering的截图
 
-所以 Stage 2 ，咱们就给这个事件驱动的agent，添加上followup和steering的能力
+所以 Stage 2，咱们就给这个事件驱动的 agent，添加上 followup 和 steering 的能力。
 
-## 设计：收件箱 + 常驻 worker
+## 先看 Stage 1 卡在哪
 
-回顾一下，在stage1中咱们的agent往总线注册消息订阅的时候，handler接收到消息时，直接启动了agent；
-要支持followup和steering，在咱们的agent中，就需要一个收件箱来存储agent需要处理的消息，handler接收到消息的时候，不再是直接启动agent，而是先往agent的消息收件箱先写入消息，读取消息的逻辑，在agentloop中执行；
-我们把agentloop设计成asyncio.Task，以便根据当前session的agentloop的状态来判断是否需要重新创建task；
+Stage 1 在它自己的能力范围内是好用的——单用户、一问一答。但它的结构里埋着三处上限，需求一升级就撞上。
+
+**一是投递与执行绑死。** `publish` 一路 `await` 到 handler 跑完整个 turn：
+
+```python
+async def publish(self, event):
+    for handler in self._subs.get(event.type, []):
+        await handler(event)          # handler 就地跑完整个 turn 才返回
+```
+
+于是"回答还在跑"的时候，第二条消息没有安身之处——调用方卡在 `await` 里，消息无处排队。
+
+**二是 publish 语义混杂。** 同一个方法，一会儿当"投递命令"（`user_input`），一会儿当"扇出事件"（`agent_delta`）。一条通道背两种语义，量小的时候无害，一旦要排队、要分优先级，就必须拆开。
+
+**三是单 task 串行，没有收件箱、也没有控制通道。** 
+
+要支持用户输入"打断"和"排队"这两个能力，就得把前两处一起拆掉：**总线分方向**，再加一个**收件箱**。
+
+## 设计一：总线分方向
+
+总线从这一章起分成两条路，各走各的：
+- **inbound（命令）**：`publish(event, to)` —— **同步**，把命令交给目标 agent 登记的投递函数就返回。不 await、不扇出。
+- **outbound（事件）**：`emit(event)` —— **异步**，把 agent 发出的事件扇出给订阅者。
+
+```python
+Handler = Callable[[Event], Awaitable[None]]   # outbound 订阅者：异步
+Sink = Callable[[Event], None]                 # inbound 投递函数：同步
+
+class EventBus:
+    def __init__(self):
+        self._sinks: dict[str, Sink] = {}
+        self._subs: dict[str, list[Handler]] = defaultdict(list)
+
+    def register(self, agent_id, sink):        # agent 登记入站投递函数
+        self._sinks[agent_id] = sink
+    def subscribe(self, type, handler):        # 订阅 outbound 事件
+        self._subs[type].append(handler)
+
+    def publish(self, event, to):              # inbound：同步投递，立即返回
+        sink = self._sinks.get(to)
+        if sink is None:
+            raise KeyError(f"没有这个 agent：{to!r}")
+        sink(event)
+
+    async def emit(self, event):               # outbound：异步扇出
+        for handler in self._subs.get(event.type, []):
+            await handler(event)
+```
+
+> 本章的 `emit` 还是 `await handler` 的**简单扇出**。异步分发、QoS、背压、拦截治理，留到 Stage 4 讲。
+
+## 设计二：收件箱 + 常驻 worker
+
+handler 的位置，agent 现在登记的是**同步的投递函数** `enqueue`：只往收件箱塞，立刻返回。
 
 ```python
 class Agent:
-    def __init__(self, bus, log, llm):
-        self.bus, self.log, self.llm = bus, log, llm
-        self.history = {}                                   # session_id -> messages
-        self.inboxes: dict[str, asyncio.Queue] = {}         # session_id -> 收件箱
+    def __init__(self, bus, log, llm, agent_id="agent"):
+        ...
+        self.inboxes: dict[str, asyncio.Queue] = {}   # session_id -> 收件箱
         self._workers: dict[str, asyncio.Task] = {}
+        bus.register(agent_id, self.enqueue)          # inbound 命令路由到这里
 
-    async def on_user_input(self, event):
-        """总线的 user_input handler：投进收件箱立刻返回。"""
+    def enqueue(self, event):                         # 同步：只投递
         sid = event.session_id
         self.inboxes.setdefault(sid, asyncio.Queue()).put_nowait(event)
         if sid not in self._workers or self._workers[sid].done():
@@ -44,7 +93,6 @@ class Agent:
 
 ```python
     async def _worker(self, sid):
-        """常驻消费循环：取一条消息跑一个 turn，跑完接着取。"""
         inbox = self.inboxes[sid]
         while True:
             event = await inbox.get()
@@ -54,18 +102,17 @@ class Agent:
 两个设计决定值得停下来看：
 
 **worker 永不自行退出。** 它只响应显式的 `stop()`（cancel 所有 worker 并等待）。
-反过来设计——每个 turn 起一个 task、跑完自杀——就要面对一个尴尬的竞态：
-turn 的最终检查已经过了，task 正在收尾，消息此刻进来，task 死了，
-消息永远没人取。让 worker 不退出，这个竞态就根本不存在；
+这样设计，是需要worker能够及时响应消息。
+```python
+   while True:
+       event = await inbox.get()
+```
 退出清理是 `stop()` 的显式职责，不是每个 turn 的尾部负担。
 
-**spawn 检查为什么是原子的？** `put_nowait` 和 `done()` 检查之间没有 await，
-asyncio 单线程事件循环里这段代码不会被打断。这是 asyncio 的一个基本事实：
-原子性不靠锁，靠"中间没有让出控制权的点"。
+消息投递采用 put_nowait()投递，函数是同步的，`put_nowait` 和 `done()` 检查之间**没有任何 await 点**。
 
 ## 关键论点：分类时机在消费端
-
-同一条用户消息，可能是 followup，也可能是 steering——取决于它**被消费的
+同一条用户消息，可能是 followup，也可能是 steering，取决于它**被消费的
 那一刻** worker 在干什么：
 
 ```python
@@ -79,7 +126,7 @@ asyncio 单线程事件循环里这段代码不会被打断。这是 asyncio 的
         """step 边界 drain：此刻 inbox 里的消息全部当 steering，拼进当前上下文。
 
         消费发生时发 steering_consumed 事件——UI 靠它看见
-        "插话在这一刻生效了"，而不是靠翻 session log。
+        "插话在这一刻生效了"。
         """
         inbox = self.inboxes[sid]
         texts = []
@@ -89,7 +136,7 @@ asyncio 单线程事件循环里这段代码不会被打断。这是 asyncio 的
             history.append({"role": "user", "content": ev.payload["text"]})
             self.log.append(ev, note="steering")
         if texts:
-            await self.bus.publish(Event("steering_consumed", sid, {"texts": texts}))
+            await self.bus.emit(Event("steering_consumed", sid, {"texts": texts}))
 ```
 
 `_run_turn` 的每个 step 开始前 drain 一次，drain 到的消息直接拼进当前
@@ -98,8 +145,7 @@ asyncio 单线程事件循环里这段代码不会被打断。这是 asyncio 的
 那一刻——这比"提交时打标"干净得多：UI 只需要往一个口子里投消息，
 不需要替 agent 预判时间窗口。
 
-turn_end 在这一章也升级成了真事件：Stage 1 它只写 log（没人需要等它），
-现在 UI 要等一轮结束再发下一条，所以 `_run_turn` 收尾时把它 publish 上总线。
+turn_end 在这一章也升级成了真事件：stage 1时，用户消息的事件处理是在事件发出后直接await完成的，stage 2 用户输入的事件是投递到agent的收件箱，所以发出turn_end事件，让外部能感知到turn的结束。
 
 ## 跑一下（真实 LLM 实测输出）
 
@@ -115,6 +161,10 @@ search）；趁报销这轮**工具调用正在飞**时插话 VPN。
 demo 都会在屏幕上如实打出来（★ steering 生效 / 降级行），肉眼可辨。
 
 本次实测（`OPENAI_MODEL=qwen3.7-flash stage02-demo`）：
+
+> 记录待更新：下面这段输出录于工具集还是 read/write/search 的早期版本（所以看到
+> `search`），当前代码暴露的是 `query_inventory` / `search_rules` 等。事件序列与
+> steering 行为不受影响，但工具名对不上——待用当前代码复跑后替换。
 
 ```text
 [ 0.32s] (A) 用户输入：保温杯还有库存吗
@@ -170,31 +220,23 @@ session log 把这个故事记得更清楚（节选，本次 ★ 命中的那轮
 
 ## 设计边界，以及下一章的需求
 
-demo 的兜底逻辑里藏着一个本章最重要的教训：插话降级成 followup 后，
-**demo 绝不能在第一个 turn_end 就 stop()**——那会把还在收件箱里的
-插话连 worker 一起掐死。消息没丢，是等它的人先走了。
+demo 的兜底逻辑盖住了一个本章很隐蔽的 bug, `stop()` 会丢消息，而且丢得
+悄无声息。worker 被 cancel 的那一刻，两种东西一起没了：
 
-steering 还有个天然的等待：它只在 step 边界生效，**正在飞的那一步
-等不了**。本次实测插话 10.68s 发出、10.92s 被消化，只等了 0.24 秒——
-运气好，正好赶上边界。但那不是设计保证的：如果当时在飞的是一次
-8 秒的模型请求，用户就干等 8 秒，当前设计里没有任何东西能把它掐掉。
+- 还排在收件箱里、没被取走的：消费者没了，它们再也不会被处理。它们连
+  session log 里都没痕迹——log 只在消费时追加，只有 UI 还记得自己发过。
+- 已经取出来、`_run_turn` 还没跑完的那条：出队即离开收件箱，掐掉之后不会
+  回到队里。log 里留下一条 `turn start`，`turn end` 永远不来——用户以为
+  在跑，其实什么都没了。
 
-而用户不等的时候会做什么？按停止。所以下一个需求：**中断**——
-正在飞的模型请求要能被掐掉，而且不能把 agent 掐死。
-这就需要一条和收件箱完全不同的车道：控制信号。Stage 3 见。
+两种都没有任何提示：调用方既收不到 `turn_end`，也不知道还剩几条没消化。
 
-## 验证
+目前实现的 steering 还有一层天然等待：它只在 step 边界生效，**正在飞的
+那一步等不了**。实测插话 10.68s 发出、10.92s 被消化，只等了 0.24 秒——
+运气好，正好赶上边界。但那不是设计保证的：如果当时在飞的是一次 8 秒的
+模型请求，用户就干等 8 秒，当前设计里没有任何东西能把它掐掉。
 
-- 环境：Python 3.13.12，openai SDK 2.46；模型走仓库根 `.env` 的 OpenAI
-  兼容端点（本次实测用 `OPENAI_MODEL=qwen3.7-flash` 覆盖，原配模型额度
-  已耗尽；demo 用真模型，会产生少量 token 费用）。
-- 实跑：`stage02-demo` 输出即正文时间线与 session log（2026-09-09 真实
-  LLM 运行，非手写）。demo 的插话时机由 `tool_call_started` 事件驱动，
-  非固定 sleep；两种结局（★ steering / 临界降级 followup）都在真实
-  运行中出现过，屏幕可见。
-- pytest：`stage02-test` 5 passed，全部离线（FakeLLM 与 RealLLM 同协议）——
-  handler 只投递立刻返回、followup 开新 turn、steering 在 step 边界生效
-  （first_call_gate 确定性时序）、**插话错过最后一个 drain 点降级为
-  followup 且不丢**（临界降级测试）、多 session 收件箱与 history 隔离。
-- 测试不用 pytest 的 tmp_path fixture（WorkBuddy 沙箱 shim 会拦
-  pytest-of-unknown 的 mkdir），用 tempfile.mkdtemp 自建自清理。
+而用户不等的时候会做什么？按停止。所以下一个需求：**打断正在飞的那一步**
+——而且打断有两种意图：只是想停（turn 结束），或者"我改主意了，接着干"
+（turn 不结束，原地转向）。这就需要一条和收件箱完全不同的车道：控制信号。
+Stage 3（打断与转向）见。

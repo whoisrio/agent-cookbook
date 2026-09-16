@@ -460,7 +460,7 @@ asyncio.run(main())
 
 v0.1 在它的能力范围内是个真实可用的 agent。
 append-only 这个决定从这一章开始生效：事件只追加、不改写。
-到 Stage 6，回放重建状态靠它；到 Stage 7，可重复的 eval 也靠它。
+到 Stage 5，回放重建状态靠它；到 Stage 6，可重复的 eval 也靠它。
 
 ## 设计边界，以及下一章的需求
 
