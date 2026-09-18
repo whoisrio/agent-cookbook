@@ -32,7 +32,7 @@ class Event:
 class SessionLog:
     """append-only。Stage 1 没人读它，但它记录的是唯一真相。
 
-    Stage 6 靠它回放重建状态，Stage 7 靠它做可重复的 eval。
+    Stage 5 靠它回放重建状态，Stage 6 靠它做可重复的 eval。
     """
 
     def __init__(self, path: str) -> None:

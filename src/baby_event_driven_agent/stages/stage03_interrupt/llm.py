@@ -1,8 +1,8 @@
 """LLM 客户端与工具（工具与 stage01 相同，四件套读写成对）。
 
-RealLLM：OpenAI 兼容的流式客户端，配置读仓库根 .env，环境变量优先。
-FakeLLM 是 tests 的离线替身（见文末）——steering / interrupt 的测试
-需要确定性时序，真模型给不了，所以这里还留着替身。
+RealLLM：OpenAI 兼容的流式客户端，配置读仓库根 .env，环境变量优先；
+测试也直接打它（本地 ollama），不再有替身——中断的时序靠 agent 侧事件驱动：
+等到目标流状态出现（tool_call_started / agent_delta / agent_thinking …）再发信号。
 
 增量协议（归一化 chunk）：
 - {"type": "text_delta", "text": str}       一段可见文本增量
@@ -268,54 +268,3 @@ class RealLLM:
                     "name": fn.name if fn else None,
                     "args_delta": (fn.arguments if fn else "") or "",
                 }
-
-
-class FakeLLM:
-    """与 RealLLM 同协议的离线替身，只给 tests 用。
-
-    first_call_gate 不为 None 时，第一次 stream_chat 在产出任何增量前
-    等待该 Event——测试先让 step 飞起来，再往 inbox 投消息，
-    steering 的时序就是确定的而不是 sleep 碰运气。
-    first_call_tool 为 True 时第一次调用发起 query_inventory（把 turn 撑成两步，
-    中间才有 step 边界给 steering 用）。
-    """
-
-    def __init__(
-        self,
-        first_call_gate: asyncio.Event | None = None,
-        first_call_tool: bool = False,
-    ) -> None:
-        self.first_call_gate = first_call_gate
-        self.first_call_tool = first_call_tool
-        self.calls = 0
-
-    async def stream_chat(
-        self, messages: list[dict[str, Any]]
-    ) -> AsyncIterator[dict[str, Any]]:
-        self.calls += 1
-        if self.calls == 1:
-            if self.first_call_gate is not None:
-                await self.first_call_gate.wait()
-            if self.first_call_tool:
-                yield {
-                    "type": "tool_call_delta",
-                    "index": 0,
-                    "id": "c1",
-                    "name": "query_inventory",
-                    "args_delta": '{"category": ',
-                }
-                yield {
-                    "type": "tool_call_delta",
-                    "index": 0,
-                    "id": None,
-                    "name": None,
-                    "args_delta": '"保温杯"}',
-                }
-                return
-        last = messages[-1]
-        if last.get("role") == "tool":
-            for piece in ("根据检索结果", "回答：", last.get("content", "")):
-                yield {"type": "text_delta", "text": piece}
-            return
-        text = last.get("content") or ""
-        yield {"type": "text_delta", "text": f"回复：{text}"}

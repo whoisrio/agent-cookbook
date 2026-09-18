@@ -1,6 +1,9 @@
-# 事件驱动 Agent 架构：六步进化（大纲草稿 v4）
+# 事件驱动 Agent 架构：六步进化（大纲草稿 v5）
 
-> 状态：骨架草稿 v4，遗留决定已清。每章定稿后再写正文和代码。
+> 状态：骨架草稿 v5，遗留决定已清。每章定稿后再写正文和代码。
+> v5 相对 v4 的结构调整：原 Stage 4「上行洪峰」与原 Stage 5「生产消息机制」合并为
+> 新的 **Stage 4「消息机制」**；腾出的位置给新的 **Stage 5「会话与轨迹」**——
+> 先有管道（传输层），再谈状态（逻辑层），eval 排最后不变。
 >
 > 配套代码：`src/baby_event_driven_agent/stages/stage01_receive_events/` 起，
 > 到 `stage06_eval/`，每阶段独立可跑（自成包，带 tests/）。
@@ -16,7 +19,8 @@
   接不住的是新需求，不是旧代码。
 - 实现新机制时踩的坑必须是真的：优先用现有代码注释里记录过的真实坑（如
   asyncio.Queue 双队列竞速 500/500 丢事件），不编造。
-- session log 从第 1 章就有，append-only，哪怕暂时没人回放。history 只是 log 的投影。
+- session log 从第 1 章就有，append-only，哪怕暂时没人回放。history 只是 log 的投影
+  （投影的完整定义在 Stage 5：压缩动作本身也进 log）。
 - 每章末尾有"验证"小节：跑了什么、实测输出是什么、有没有未实跑项，如实标注。
 - 代码目录不跟书走，放 `src/baby_event_driven_agent/stages/`：pytest / uv / 包管理
   开箱即用，阶段目录自成包可独立运行；正文里每章开头给代码路径和关键 diff。
@@ -111,7 +115,14 @@
 - 下章需求预告：loop 现在往总线上 emit 的东西越来越多（生命周期 + token 流），
   上行的量一上来，总线和 UI 就顶不住了。
 
-## Stage 4：上行洪峰——agent 在 loop 中间发出消息
+## Stage 4：消息机制——事件离开 agent 之后要走多远
+
+（原 Stage 4「上行洪峰」与原 Stage 5「生产消息机制」合并：两者是同一个问题的两段——
+进程内先被洪峰挤垮，跨进程才谈得上落盘与重放。）
+
+> 正文：`04-message-mechanism.md`（2026-09-18 定稿）；
+> 代码：`src/baby_event_driven_agent/stages/stage04_message_bus/`，
+> `stage04-demo` / `stage04-test`（19 passed：17 条离线 + 2 条真模型）。
 
 - 需求：agent 在 loop 中间把生命周期事件和 token 流不断 emit 回总线，上行一下子
   变成高频、可丢、多观察者的大流量。CLI 流式呈现（回答一个字一个字往外蹦）只是
@@ -124,28 +135,64 @@
   3. UI 刷不动 → 背压合并缓冲：满了或者到了帧界就刷，二者其一（不能只等满，
      否则 UI 一顿一顿）
   4. 事件多了没法定 位 → 事件信封：type / session_id / seq / correlation id
-  5. 发出去的消息要不要管 → 拦截/否决/改写治理（现有 extensions.py 并入本章）
+     （seq 下一章要当轨迹坐标用：压缩区间、回放位点、eval 切片都靠它）
+  5. 发出去的消息要不要管 → 拦截/否决/改写治理（现有 extensions.py 并入本章，
+     篇幅压成一小节，细节可挪附录）。**并补上参考实现里没有的那半**：人工确认——
+     规则只判"要不要问人"（当场，`Decision.ask`），答复由人给（之后，
+     `approval_required` → future → inbound 的 `user_approval` 旁路 resolve）；
+     超时按拒绝（fail-closed），一问必有一答（回执强制），迟到/号不对的答复也留痕
+     （`approval_reply`），走 `bus.record` 这条同步落盘入口
+  6. 事件多到内存放不下、进程一退就没了 → **落盘**：崩溃安全（长度前缀 + CRC）、
+     分段与索引、保留与脱敏；以及**消费位点**（重放从哪开始、断点续放）
 - 关键论点：上行和下行不对称。下行低频不可丢，上行高频可丢，混在一条通道
   迟迟早早出事故。
 - 本章只强化 outbound：Stage 2 拉出来的 emit 从"简单 await 扇出"升级为
-  "异步分发 + QoS + 背压 + 信封 + 治理"，inbound 的 publish 不动。
-- 下章需求预告：单进程跑通了，要走向多进程、事件要落盘、出了问题要重放现场。
+  "异步分发 + QoS + 背压 + 信封 + 落盘 + 位点 + 治理"，inbound 的 publish 不动。
+- 边界声明：本章只解决"事件怎么到达它的消费者"（**传输层**），不解决"状态是什么"
+  （Stage 5）。落盘、位点、重放在这里是工程实现，它们的语义由下一章定义。
+- 降级项（按"需求真出现才上"的判据）：多进程部署 / Kafka / 多副本 / 按 session
+  分区序 —— 本书的 agent 从未真的走向多进程，收成本章末一节"走出单机：真要多进程
+  部署时"，或挪附录，不占整章。
+- 下章需求预告：事件留下来了、也能重放了，但"会话"本身还不存在——log 记得住发生过
+  什么，却记不住"我是谁、上次聊到哪"；进程一重启，同一个 session_id 会静默变成
+  一段新历史。而且会话一长，上下文就装不下了。
 
-## Stage 5：扩展到生产消息机制
+## Stage 5：会话与轨迹——状态与真相
 
-- 需求：部署从单进程走向多进程、事件要落盘、出了问题要重放现场。
-- 判据先讲清楚：多进程部署、持久化、replay 三个需求真的出现了才上，别一上来
-  就 Kafka。
-- 落地机制：持久化 log、at-least-once、按 session 分区序、消费位点。
-- 收官闭环：append-only session log 从 Stage 1 埋到现在终于闭环——history 是
-  log 的投影，重启回放重建状态。Kafka consumer offset 和 agent checkpoint
-  是一对平行结构，放这讲。
+- 需求（两个一起来，各驱动一半）：
+  - 用户第二天回来说"接着上次报销的事聊"，agent 一问三不知；更糟的是进程重启后
+    同一个 session_id 会静默变成一段新历史，而磁盘上还躺着上一段。
+  - 会话跑长了上下文装不下；一旦压缩，"重放出来的上下文跟当时不一样"——
+    可复现性没了。
+- 落地机制（用的是 Stage 4 造好的零件：落盘、位点、seq）：
+  1. **会话身份与生命周期**：session_id 由 `SessionStore` 分配（不是调用方随口
+     给）；`start` / `resume` / `close` 三入口，判据是"store 里有没有这个 sid"；
+     `session_started` / `session_resumed` / `session_end` 都要进 log——否则一个
+     log 文件里两段进程的历史首尾相接，回放时看不出中间断过（和 Stage 2
+     "排队的消息连 log 里都没痕迹"是同一类坑）；同 session 单写者。
+  2. **投影**：三层模型——事实层（append-only log）/ 视图层（messages）/
+     投影函数 `f(log, policy)`。Stage 1 起那句"history 是 log 的投影"在这里才完整。
+  3. **压缩**：`context_compacted {from_seq, to_seq, summary, policy_version, hash}`
+     本身是一条事件、照样进 log；只在 step 边界触发——**第四种边界动作**，与
+     steering / interrupt / redirect 并列（在流中间改 messages，在飞请求的上下文
+     会漂移）。不变式：给定 `(log, policy_version)` → 唯一 messages。
+     大工具结果指针化（blob + 引用 + hash），顺带解决 log 膨胀与脱敏。
+  4. **重建**：resume 走 checkpoint 还是全量重放；重放边界与**半截 turn 修复**
+     （崩在半路的 log 尾部可能是"user + 半截 assistant"，或缺一半的 tool 结果）
+     ——第二次复用 Stage 3 的消息形状表（第一次是 redirect）；checkpoint =
+     位点（读到哪）+ 视图快照（上下文是什么），平行 Kafka consumer offset，
+     物理实现在 Stage 4。
+- 关键论点：append-only 的是**事实层**；视图层允许有损，但每一次有损变换都要在
+  事实层留痕——否则 log 不是唯一真相，只是"唯一真相的一半"。
+- 收官闭环：session log 从 Stage 1 埋到现在终于闭环，重启回放重建状态。
+- 下章需求预告：能跑了、能重放了，但"改了 prompt、换了模型、重构了 loop，行为
+  有没有变坏"仍然没有答案。
 
 ## Stage 6：rubric 和 eval
 
 - 起点：agent 跑通了，但"改了 prompt、换了模型、重构了 loop，行为有没有变坏"
   没有答案。靠手感回归就是靠运气。eval 为薄弱环节的读者（包括作者自己）补课。
-- 地基是前五步攒下的：append-only session log + replay（Stage 5）正是 eval 的
+- 地基是前五步攒下的：Stage 4 的落盘与位点、Stage 5 的会话与重建，正是 eval 的
   输入——eval = 重放录制好的 session + 对结果打分。没有 log 就没有可重复的 eval。
 - 落地机制：
   - rubric：把"这个 agent 干得好不好"写成可判定的评分标准。硬断言和软评分分开：
@@ -155,6 +202,10 @@
     聚合报告。
   - Stage 2~3 的行为语义全部变成 eval 用例：steering 生效时机、redirect 竞态
     降级、ctrl 插队不丢事件——以前只能靠手点，现在进回归集。
+  - golden trajectory 的粒度 = 一个 session：存**事实层 + policy_version**，不存
+    压缩后的 messages（否则被某一次压缩策略绑死）；硬断言走事实层，judge 的输入
+    走视图层、报告注明"模型当时看到的是压缩后的上下文"；换过压缩策略的两次评测
+    不可直接比较，需标注。
 - 要过的坎：LLM-as-judge 不稳定——同一轨迹两次打分不一样。处理：评分输出结构化
   （强制 JSON + 逐项理由）、rubric 逐条独立判、软评分只看趋势不当断言。
 - 关键论点：event log 不只是调试用的，它是 eval 的数据源。append-only 是从
