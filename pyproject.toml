@@ -32,6 +32,8 @@ stage02-demo = "baby_event_driven_agent.stages.stage02_inbox_steering.main:cli"
 stage02-test = "baby_event_driven_agent.stages.stage02_inbox_steering.testing:main"
 stage03-demo = "baby_event_driven_agent.stages.stage03_interrupt.main:cli"
 stage03-test = "baby_event_driven_agent.stages.stage03_interrupt.testing:main"
+stage04-demo = "baby_event_driven_agent.stages.stage04_message_bus.main:cli"
+stage04-test = "baby_event_driven_agent.stages.stage04_message_bus.testing:main"
 
 [build-system]
 requires = ["setuptools>=75.0"]
