@@ -198,14 +198,14 @@ class Agent:
                 # 工具返回进 log：它是模型下一轮 context 的一部分，不记的话
                 # 轨迹中间是断的，"模型为什么这么答"无从分析。工具真的执行了
                 # （可能已改动外部世界），发生过的事实就该在轨迹里。
-                self.log.append(
-                    Event(
-                        "tool_result",
-                        sid,
-                        {"tool_call_id": call["id"], "name": name, "result": result},
-                    ),
-                    note="tool result",
+                tool_event = Event(
+                    "tool_result",
+                    sid,
+                    {"tool_call_id": call["id"], "name": name, "result": result},
                 )
+                self.log.append(tool_event, note="tool result")
+                # 结果也发上总线：demo 的 UI 靠它打出「执行工具」一行。
+                await self.bus.emit(tool_event)
         await self._end_turn(sid, "max steps")
 
     async def _end_turn(self, sid: str, note: str) -> None:

@@ -30,12 +30,13 @@
 不决定意图。动作 2 和 3 故意用同一个时机、同一格（工具调用已在飞），唯一区别就是
 信封里的 intent —— 想说明"同一格，两个意图，两种收尾"。
 
-每一行都带**行首标签**，五类内容一眼分得开：
+每一行都带**行首标签**，角色一眼分得开：
 
     用户 │ 用户说了什么
     思考 │ assistant 的 thinking（暗色流）
-    回答 │ assistant 的可见输出（亮蓝流）
-    工具 │ 工具调用与真实结果（绿色）
+    LLM(回答) │ assistant 的可见输出（亮蓝流）
+    LLM(要求执行工具) │ 模型要求调用的工具（绿色）
+    执行工具 │ 工具真实执行与结果（绿色）
     系统 │ 生命周期：掐掉 / 边界命中 / turn 结束（按 intent 上色）
     说明 │ 旁白，只解释这一段在演示什么（灰色缩进，不属于对话）
 
@@ -129,7 +130,7 @@ async def main() -> None:
 
     async def ui_delta(e: Event) -> None:
         if last_kind[0] != "text":
-            stream_head("回答", BLUE)
+            stream_head("LLM(回答)", BLUE)
             last_kind[0] = "text"
         print(f'{e.payload["text"]}', end="", flush=True)
 
@@ -141,16 +142,16 @@ async def main() -> None:
                 f"{c['function']['name']}({c['function']['arguments']})"
                 for c in msg["tool_calls"]
             )
-            line("工具", GREEN, f"→ 模型发起调用：{calls}")
+            line("LLM(要求执行工具)", GREEN, f"→ {calls}")
         else:
-            line("系统", GREEN, "回答完毕，本步不再调工具")
+            line("LLM(回答)", GREEN, "回答完毕，本步不再调工具")
 
     async def ui_tool_result(e: Event) -> None:
         p = e.payload
         if p.get("skipped"):
-            line("工具", RED, f"← {p['name']} 未执行（{p['result']}）")
+            line("执行工具", RED, f"← {p['name']} 未执行（{p['result']}）")
         else:
-            line("工具", GREEN, f"← {p['name']} 结果：{brief(p['result'])}")
+            line("执行工具", GREEN, f"← {p['name']} 结果：{brief(p['result'])}")
 
     async def ui_tool_start(e: Event) -> None:
         tool_started.set()

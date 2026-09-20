@@ -20,6 +20,7 @@ dependencies = [
     "langchain-community>=0.3.0",
     "langchain-experimental>=0.4.0",
     "textual>=0.80.0",
+    "typesafe-sdk>=0.7.0",
 ]
 
 [project.scripts]
