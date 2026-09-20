@@ -37,7 +37,9 @@ import asyncio
 import json
 import shutil
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 from . import llm as llm_mod
 from .agent import Agent, BLOCKED_PREFIX
@@ -48,7 +50,10 @@ from .outbound import CoalescingBuffer
 from .persistence import EventLog
 from .subscribers import (
     approval_policy,
+    arrival_probe,
+    buffer_feeder,
     counter,
+    latency_probe,
     permission_guard,
     slow_observer,
 )
@@ -69,6 +74,12 @@ SLOW = 0.005
 
 def line(label: str, color: str, text: str) -> None:
     print(f"\n{BOLD}{color}[{label}] {RESET}{color}{text}{RESET}")
+
+
+def bar(depth: int, cap: int = 64, width: int = 8) -> str:
+    """队列水位条：8 格，满格 = 队列满。"""
+    filled = round(min(depth, cap) * width / cap)
+    return "█" * filled + "░" * (width - filled)
 
 
 def note(text: str) -> None:
@@ -143,22 +154,85 @@ async def main() -> None:
         f"直接往总线灌 {FLOOD} 个 token 增量（stream 道，队列 64，满了丢最新），"
         "中间夹一条 turn_end（state 道，不可丢）。看两条道各自的账。",
     )
-    async def flood(session: str, n: int, yield_every: int = 10) -> None:
+    async def flood(
+        session: str,
+        n: int,
+        yield_every: int = 10,
+        samples: list[tuple[int, int, int, int]] | None = None,
+        at: int | None = None,
+        mid: Callable[[], Awaitable[None]] | None = None,
+        progress: list[int] | None = None,
+    ) -> None:
         """灌洪峰。每 yield_every 条让出一次：真实 token 之间有 await（等 HTTP
         流），emit 自己不主动让出——lane worker 能跑起来靠的是 agent loop 的
-        await 点，这里用 sleep(0) 模拟它。"""
+        await 点，这里用 sleep(0) 模拟它。samples 不为 None 时，每 200 条记一次
+        两条道的（已灌条数，stream 深度，stream 已丢，state 深度）：
+        洪峰进行中两条道各是什么水位，看得见。at + mid：灌到第 at 条时执行
+        mid（洪峰中间夹事件）；progress 是单元素 list，每条更新，观测者用它
+        记“送达时灌到第几条”。"""
         for i in range(n):
+            if progress is not None:
+                progress[0] = i
+            if at is not None and mid is not None and i == at:
+                await mid()
             await bus.emit(Event("agent_delta", session, {"text": "字"}))
             if i % yield_every == 0:
+                if samples is not None and (i + 1) % 200 == 0:
+                    ln = bus.stats()["lanes"]
+                    samples.append(
+                        (
+                            i + 1,
+                            ln["stream"]["queued"],
+                            ln["stream"]["dropped"],
+                            ln["state"]["queued"],
+                        )
+                    )
                 await asyncio.sleep(0)
 
-    bus.subscribe(slow_observer(0.0005, session="F", name="flood-consumer"))
+    bus.subscribe(slow_observer(0.02, session="F", name="flood-consumer"))
     flood_seen: dict[str, int] = {}
     bus.subscribe(counter(flood_seen, session="F"))
+    lags: list[float] = []
+    bus.subscribe(latency_probe(lags, session="F"))
+    samples: list[tuple[int, int, int, int]] = []
+    pos = [0]  # flood 的当前进度；观测者在 state worker 里跑，用它记送达时刻
+    arrivals: list[dict[str, Any]] = []
+
+    def show_arrival(r: dict[str, Any]) -> None:
+        lanes = r["lanes"]
+        line(
+            "道",
+            GREEN,
+            f"→ {r['type']} 送达（洪峰第 {r['at']} 条；此刻 stream 道 "
+            f"{bar(lanes['stream']['queued'])} {lanes['stream']['queued']}/64，"
+            f"已丢 {lanes['stream']['dropped']}）",
+        )
+
+    bus.subscribe(
+        arrival_probe(
+            arrivals,
+            session="F",
+            types=("turn_end", "agent_reply"),
+            progress=pos,
+            snapshot=bus.stats,
+            on_arrival=show_arrival,
+        )
+    )
+
+    async def insert_turn_end() -> None:
+        ln = bus.stats()["lanes"]
+        line(
+            "道",
+            YELLOW,
+            f"洪峰正猛：stream 道 {bar(ln['stream']['queued'])} "
+            f"{ln['stream']['queued']}/64，已丢 {ln['stream']['dropped']:4d} │ "
+            f"state 道 {bar(ln['state']['queued'], 1024)}——此刻插入一条 turn_end",
+        )
+        await bus.emit(Event("turn_end", "F", {"reason": "flood test"}))
+
     t0 = time.perf_counter()
-    await flood("F", FLOOD)
-    # 洪峰之后紧跟着两条“不可丢”的：turn_end，以及完整答案 agent_reply
-    await bus.emit(Event("turn_end", "F", {"reason": "flood test"}))
+    await flood("F", FLOOD, samples=samples, at=FLOOD // 2, mid=insert_turn_end, progress=pos)
+    # 洪峰之后紧跟着完整答案 agent_reply（不可丢，state 道）
     await bus.emit(
         Event(
             "agent_reply",
@@ -167,8 +241,16 @@ async def main() -> None:
         )
     )
     flood_cost = time.perf_counter() - t0
+    produced_at = time.perf_counter()
     await bus.drain(timeout=60.0)
+    tail = time.perf_counter() - produced_at
     st = bus.stats()
+    for filled, sq, sd, pq in samples:
+        line(
+            "道",
+            YELLOW,
+            f"灌到 {filled:4d} 条：stream 道 {bar(sq)} {sq:2d}/64，已丢 {sd:4d} │ state 道 {pq}",
+        )
     line(
         "统计",
         GREEN,
@@ -183,10 +265,20 @@ async def main() -> None:
         f"{flood_seen.get('turn_end', 0)} 条、agent_reply 收到 "
         f"{flood_seen.get('agent_reply', 0)} 条",
     )
+    if lags:
+        lags.sort()
+        line(
+            "道",
+            YELLOW,
+            f"送达延迟：送到的 {len(lags)} 条里最快 {lags[0] * 1000:.0f}ms、"
+            f"最迟 {lags[-1]:.2f}s；生产 {flood_cost:.2f}s 就结束了，"
+            f"消费者又追了 {tail:.2f}s 才清空积压",
+        )
     note(
-        "两条道各有自己的 worker：token 流堵了只丢自己的，turn_end 排在洪峰之后"
-        "也照样先到 —— 这就是 QoS 分道要买的东西。丢的是可丢的：屏幕上会少几个字，"
-        "但完整答案走 state 道（agent_reply）一条没丢，UI 拿它兜底就能补齐。"
+        "两条道各有自己的 worker：token 流堵了只丢自己的；turn_end 在洪峰过半、"
+        "stream 道满格丢弃时插入，照样直达 —— 这就是 QoS 分道要买的东西。丢的"
+        "是可丢的：屏幕上会少几个字，但完整答案走 state 道（agent_reply）一条"
+        "没丢，UI 拿它兜底就能补齐。"
     )
 
     # 2b：同样的洪峰，消费者不慢 + UI 侧合并缓冲 → 不丢，且刷屏次数远少于事件数
@@ -195,24 +287,39 @@ async def main() -> None:
     await flood_buf.start()
     g_seen: dict[str, int] = {}
     bus.subscribe(counter(g_seen, session="G"))
-
-    async def flood_ui(event: Event) -> None:
-        if event.session_id == "G":
-            flood_buf.add(str(event.payload.get("text", "")))
-
-    bus.subscribe(Subscription("flood.ui", ("agent_delta",), flood_ui, mode=OBSERVE))
-    await flood("G", 800)
+    g_lags: list[float] = []
+    bus.subscribe(buffer_feeder(flood_buf, session="G"))
+    bus.subscribe(latency_probe(g_lags, session="G"))
+    g_samples: list[tuple[int, int, int, int]] = []
+    await flood("G", 800, samples=g_samples)
+    for filled, sq, sd, pq in g_samples:
+        line(
+            "道",
+            YELLOW,
+            f"灌到 {filled:4d} 条：stream 道 {bar(sq)} {sq:2d}/64，已丢 {sd:4d} │ state 道 {pq}",
+        )
     await bus.drain(timeout=30.0)
     await flood_buf.stop()
     line(
         "统计",
         GREEN,
-        f"同样的洪峰换个快消费者：{g_seen.get('agent_delta', 0)} 个增量一条没丢，"
-        f"合并缓冲把它们刷成了 {flood_buf.flushes} 帧",
+        f"同样的洪峰换个快消费者：{g_seen.get('agent_delta', 0)} 个增量一条没丢；"
+        f"逐条上屏是 {g_seen.get('agent_delta', 0)} 帧，合并缓冲刷成了 {flood_buf.flushes} 帧",
     )
+    if g_lags:
+        g_lags.sort()
+        line(
+            "道",
+            GREEN,
+            f"送达延迟：最迟 {g_lags[-1] * 1000:.1f}ms——每条都实时到，"
+            "消费者没被拖垮",
+        )
     note(
-        "背压的两半在这里：队列满了丢最新（可丢的那一半），攒够了或到帧界再刷"
-        "（合并的那一半）。少刷的这几百次 IO，就是“UI 刷不动”的解药。"
+        "“没丢”是让出点挣来的，不是缓冲的功劳：每 yield 一次，worker 都能在一个"
+        "调度片里清空积的 10 条（各 handler 内部无 await），队列永远不满。把 "
+        "yield 去掉：800 条一个调度片灌完，worker 一条都捞不到，队列 64 条之外的"
+        "全会丢——那时消费者快慢根本不起作用。缓冲买到的是另一半：上屏 IO 从 "
+        f"{g_seen.get('agent_delta', 0)} 次降到十来次，这才是“UI 刷不动”的解药。"
     )
 
     # ------------------------------------------------------------- 第 3 段

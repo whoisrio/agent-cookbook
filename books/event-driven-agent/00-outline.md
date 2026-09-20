@@ -1,9 +1,12 @@
-# 事件驱动 Agent 架构：六步进化（大纲草稿 v5）
+# 事件驱动 Agent 架构：六步进化（大纲草稿 v5.1）
 
-> 状态：骨架草稿 v5，遗留决定已清。每章定稿后再写正文和代码。
+> 状态：骨架草稿 v5.1，遗留决定已清。每章定稿后再写正文和代码。
 > v5 相对 v4 的结构调整：原 Stage 4「上行洪峰」与原 Stage 5「生产消息机制」合并为
 > 新的 **Stage 4「消息机制」**；腾出的位置给新的 **Stage 5「会话与轨迹」**——
 > 先有管道（传输层），再谈状态（逻辑层），eval 排最后不变。
+> v5.1：Stage 5 拆成 **5a「会话与真相」（投影 + 异常恢复）** 和
+> **5b「压缩与上下文」**——恢复和压缩共享"log + 投影"这块地基，但一个是异常路径、
+> 一个是正常路径的有损变换，读者对象和验证手段不同，拆开讲。
 >
 > 配套代码：`src/baby_event_driven_agent/stages/stage01_receive_events/` 起，
 > 到 `stage06_eval/`，每阶段独立可跑（自成包，带 tests/）。
@@ -20,7 +23,7 @@
 - 实现新机制时踩的坑必须是真的：优先用现有代码注释里记录过的真实坑（如
   asyncio.Queue 双队列竞速 500/500 丢事件），不编造。
 - session log 从第 1 章就有，append-only，哪怕暂时没人回放。history 只是 log 的投影
-  （投影的完整定义在 Stage 5：压缩动作本身也进 log）。
+  （投影的完整定义在 Stage 5a：压缩动作本身也进 log，在 5b）。
 - 每章末尾有"验证"小节：跑了什么、实测输出是什么、有没有未实跑项，如实标注。
 - 代码目录不跟书走，放 `src/baby_event_driven_agent/stages/`：pytest / uv / 包管理
   开箱即用，阶段目录自成包可独立运行；正文里每章开头给代码路径和关键 diff。
@@ -149,7 +152,7 @@
 - 本章只强化 outbound：Stage 2 拉出来的 emit 从"简单 await 扇出"升级为
   "异步分发 + QoS + 背压 + 信封 + 落盘 + 位点 + 治理"，inbound 的 publish 不动。
 - 边界声明：本章只解决"事件怎么到达它的消费者"（**传输层**），不解决"状态是什么"
-  （Stage 5）。落盘、位点、重放在这里是工程实现，它们的语义由下一章定义。
+  （Stage 5a）。落盘、位点、重放在这里是工程实现，它们的语义由下一章定义。
 - 降级项（按"需求真出现才上"的判据）：多进程部署 / Kafka / 多副本 / 按 session
   分区序 —— 本书的 agent 从未真的走向多进程，收成本章末一节"走出单机：真要多进程
   部署时"，或挪附录，不占整章。
@@ -157,33 +160,63 @@
   什么，却记不住"我是谁、上次聊到哪"；进程一重启，同一个 session_id 会静默变成
   一段新历史。而且会话一长，上下文就装不下了。
 
-## Stage 5：会话与轨迹——状态与真相
+## Stage 5a：会话与真相——log、投影与异常恢复
+
+（原 Stage 5「会话与轨迹」拆分的前半：先立"事实层 + 投影"这块地基，压缩是它
+上面的一种有损变换，放 5b。）
 
 - 需求（两个一起来，各驱动一半）：
   - 用户第二天回来说"接着上次报销的事聊"，agent 一问三不知；更糟的是进程重启后
     同一个 session_id 会静默变成一段新历史，而磁盘上还躺着上一段。
-  - 会话跑长了上下文装不下；一旦压缩，"重放出来的上下文跟当时不一样"——
-    可复现性没了。
+  - 上一条逼出 resume，resume 就撞上异常路径：崩在半路的 log 尾部长什么样、
+    怎么判、怎么修——恢复不是附加题，是"以 log 为基准"的另一半。
 - 落地机制（用的是 Stage 4 造好的零件：落盘、位点、seq）：
   1. **会话身份与生命周期**：session_id 由 `SessionStore` 分配（不是调用方随口
      给）；`start` / `resume` / `close` 三入口，判据是"store 里有没有这个 sid"；
      `session_started` / `session_resumed` / `session_end` 都要进 log——否则一个
      log 文件里两段进程的历史首尾相接，回放时看不出中间断过（和 Stage 2
      "排队的消息连 log 里都没痕迹"是同一类坑）；同 session 单写者。
-  2. **投影**：三层模型——事实层（append-only log）/ 视图层（messages）/
-     投影函数 `f(log, policy)`。Stage 1 起那句"history 是 log 的投影"在这里才完整。
-  3. **压缩**：`context_compacted {from_seq, to_seq, summary, policy_version, hash}`
-     本身是一条事件、照样进 log；只在 step 边界触发——**第四种边界动作**，与
-     steering / interrupt / redirect 并列（在流中间改 messages，在飞请求的上下文
-     会漂移）。不变式：给定 `(log, policy_version)` → 唯一 messages。
-     大工具结果指针化（blob + 引用 + hash），顺带解决 log 膨胀与脱敏。
-  4. **重建**：resume 走 checkpoint 还是全量重放；重放边界与**半截 turn 修复**
-     （崩在半路的 log 尾部可能是"user + 半截 assistant"，或缺一半的 tool 结果）
-     ——第二次复用 Stage 3 的消息形状表（第一次是 redirect）；checkpoint =
-     位点（读到哪）+ 视图快照（上下文是什么），平行 Kafka consumer offset，
-     物理实现在 Stage 4。
+  2. **投影形式化**：三层模型——事实层（append-only log）/ 视图层（messages）/
+     投影函数 `f(log, policy)`。Stage 1 起那句"history 是 log 的投影"在这里才
+     完整。两条纪律（对照 pi / hermes 的实现讲，见 books/pi、books/hermes）：
+     **占位符在投影层补、不写回 log**（hermes 的措辞："durable transcript kept
+     them"——原始行原封不动，修复只作用于喂给模型的内存序列）；发给 provider
+     前再有一道 sanitize 收口（pi 的 `transformMessages`），保证消息序列约束
+     永远满足，修复分两档：只读断尾丢弃、有副作用的断尾补 UNKNOWN 占位。
+  3. **异常恢复（逐级收口前面各章埋的线头）**：
+     - 字节级残尾：长度前缀 + CRC 判定（Stage 4 改动六已造好，这里只消费）——
+       "没写完的不算已发生"，读到残尾为止，前面的一条不少；
+     - 语义残尾·半截 turn：崩在半路的 log 尾部可能是"user + 半截 assistant"，
+       或缺一半的 tool 结果——第二次复用 Stage 3 的消息形状表（第一次是
+       redirect）修剪，同样遵守"投影层修，不改事实层"；
+     - 语义残尾·悬挂审批：孤立 `approval_required`（后面没有 `approval_decided`）
+       按"未授权"闭合，补 `abandoned` 裁决——"一问必有一答"在崩溃路径上也成立；
+       人的答复晚到（没人在等）已由 Stage 4 的 `record` 留痕，这里接得住；
+     - 重放幂等：resume = 位点续读，checkpoint = 位点（读到哪）+ 视图快照
+       （上下文是什么），平行 Kafka consumer offset，物理实现在 Stage 4；
+       重放不产生重复事实。
 - 关键论点：append-only 的是**事实层**；视图层允许有损，但每一次有损变换都要在
   事实层留痕——否则 log 不是唯一真相，只是"唯一真相的一半"。
+- 关键论点：恢复的前提有两个——log 本身**可判定**（写一半能认出来，Stage 4 的
+  工程）+ 事实**自描述**（读得懂"那次没走完"，本章的定义）。缺一个，恢复都
+  只能靠猜。
+- 下章需求预告：会话立住了、也能从崩溃里重建了，但会话一长上下文装不下；
+  一旦压缩，"重放出来的上下文跟当时不一样"——可复现性没了。
+
+## Stage 5b：压缩与上下文——有损变换的纪律
+
+（原 Stage 5 的后半。压缩 = 对投影的又一次变换，纪律从 5a 继承。）
+
+- 需求：会话跑长了上下文装不下；一旦压缩，"重放出来的上下文跟当时不一样"——
+  可复现性没了。
+- 落地机制：
+  1. **压缩是事件**：`context_compacted {from_seq, to_seq, summary, policy_version,
+     hash}` 本身进 log——有损变换在事实层留痕，5a 那条关键论点的正面落地。
+  2. **只在 step 边界触发**——第四种边界动作，与 steering / interrupt / redirect
+     并列（在流中间改 messages，在飞请求的上下文会漂移）。
+  3. **不变式**：给定 `(log, policy_version)` → 唯一 messages。这是 eval 的地基：
+     golden trajectory 存事实层 + policy_version，不存压缩结果（Stage 6 用）。
+  4. **大工具结果指针化**（blob + 引用 + hash），顺带解决 log 膨胀与脱敏。
 - 收官闭环：session log 从 Stage 1 埋到现在终于闭环，重启回放重建状态。
 - 下章需求预告：能跑了、能重放了，但"改了 prompt、换了模型、重构了 loop，行为
   有没有变坏"仍然没有答案。
@@ -192,8 +225,9 @@
 
 - 起点：agent 跑通了，但"改了 prompt、换了模型、重构了 loop，行为有没有变坏"
   没有答案。靠手感回归就是靠运气。eval 为薄弱环节的读者（包括作者自己）补课。
-- 地基是前五步攒下的：Stage 4 的落盘与位点、Stage 5 的会话与重建，正是 eval 的
-  输入——eval = 重放录制好的 session + 对结果打分。没有 log 就没有可重复的 eval。
+- 地基是前五步攒下的：Stage 4 的落盘与位点、Stage 5a 的投影与恢复、5b 的压缩
+  不变式，正是 eval 的输入——eval = 重放录制好的 session + 对结果打分。
+  没有 log 就没有可重复的 eval。
 - 落地机制：
   - rubric：把"这个 agent 干得好不好"写成可判定的评分标准。硬断言和软评分分开：
     硬断言是确定性检查（工具调用序列对不对、redirect 补出来的消息格式合不合法、
@@ -210,4 +244,8 @@
   （强制 JSON + 逐项理由）、rubric 逐条独立判、软评分只看趋势不当断言。
 - 关键论点：event log 不只是调试用的，它是 eval 的数据源。append-only 是从
   Stage 1 贯穿到 Stage 6 的同一根线。
+- 同一根线上的其他投影（后记）：eval 切片（`f(log, slice)`）和**记忆提取**
+  （`f(log, memory_policy) → 记忆条目`）是对同一事实层的另外两种投影，与压缩
+  同构——都受 5a 两条纪律约束：可以有损，但不改事实层；记忆条目要能回指 log
+  （seq 区间），否则审计不了"这条记忆是从哪段经历来的"。
 - 结尾：六步回头看一张对照表（问题 → 机制 → 代价）。

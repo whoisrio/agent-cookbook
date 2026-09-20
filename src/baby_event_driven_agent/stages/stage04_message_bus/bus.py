@@ -18,6 +18,15 @@ emit 的四个步骤，顺序就是语义：
 
 state 道满了会 `await put`——生命周期事件不可丢，宁可让 loop 慢下来（背压回
 生产者）；stream 道满了直接丢最新并计数：token 少一帧只是屏幕少一个字。
+
+**seq 的语义要说准**：seq 是**落盘顺序**，不是 emit 的调用顺序——emit 先
+await 治理（第 1 步），有匹配的拦截者时会真让出，此窗口内别的 task 的事件
+会先落盘先拿号。两个推论：
+
+- 全局 log 里 seq 与 ts（构造时刻）可能逆序：**回放排序一律用 seq，不用 ts**。
+- 会话内因果不破：同一 session 只有一个 worker，turn 内的 emit 全部 await
+  串行，同一 session 不会有第二个 emit 同时在飞——按 session 过滤后，
+  seq 就是事件发生顺序（test_seq_is_persist_order_not_call_order 钉死）。
 """
 
 from __future__ import annotations
@@ -242,6 +251,11 @@ class EventBus:
 
     @staticmethod
     async def _notify(sub: Subscription, event: Event) -> None:
+        """转发给观测者。**没有超时，这是声明过的边界**：handler 挂死会挂住整条
+        lane worker，而 lane 全局共享——所有 session 的这条道连坐（拦截者有
+        wait_for + 预算，观测者没有）。"慢"有界、"死"无界；"观测者超时算不算
+        已消费"是新语义，留给需求真出现的那天（04 章降级项）。
+        """
         try:
             await sub.handler(event)
         except Exception as exc:  # noqa: BLE001 - 观测者失败与 agent 无关
