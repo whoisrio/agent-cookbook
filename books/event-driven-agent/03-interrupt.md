@@ -267,6 +267,11 @@ session log 也得把 turn 是怎么结束的说明白。三种结局各留一�
 之后 turn **不结束**——它最终记的 reason 是这个 turn 真正结束时的原因（`turn end`
 或 `max steps`），纠正消息在同一个 turn 里被重发，中间没有 turn 边界。
 
+还有一条贯穿所有场景的规矩：补进 history 的每一条合成消息（中断标记、封口占位、
+纠正 user、assistant 空壳、未执行占位）在 log 里都带 `synthetic: true`，且 `note`
+记着补它的原因（`marker` / `redirect` / `tool skipped` / `interrupted`）——
+**修复动作本身也是事实**，回放时能看出哪些消息是框架补的、为什么补。
+
 
 ## 代码改动
 搞清楚如上设计，来看看具体的代码改动。这一章是叠在 stage02 上的增量：
@@ -401,11 +406,25 @@ stage03-demo 07-tool-running-stop     # 只跑"工具执行中被 stop"那一格
 （`gate_in` / `gate_open`），保证中断落在"工具正在执行"那一格。每个 case 末尾都把 history
 尾部原样打出来——收尾规则对不对，一眼可验。
 
+每个 case 的 session log 落在同一份 `sessions/stage03/session.jsonl`（append-only，
+按 `session` 字段区分 case）。下面每个场景里都附上它的真实 log 片段（原文，仅省略
+超长文本），和动图对照着看：动图是"屏幕上看见了什么"，log 是"事实层记了什么"。
+
 ### 00-baseline：基准 · 完整一轮
 
 ![00-baseline：完整一轮](../../src/baby_event_driven_agent/rec/stage03/docs/00-baseline.gif)
 
 worker 空闲、投递即开新 turn：先确立 agent 可用，后面每一格都拿它当参照。
+
+session log（没有中断的 turn 长这样，当参照系）：
+
+```json
+{"ts": 0.22, "type": "user_input", "payload": {"text": "保温杯还有库存吗"}, "note": "turn start"}
+{"ts": 6.07, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": null, "tool_calls": [{"id": "call_ppnmdcv0", …, "function": {"name": "query_inventory", …}}]}}, "note": "tool_call"}
+{"ts": 6.07, "type": "tool_result", "payload": {"tool_call_id": "call_ppnmdcv0", "name": "query_inventory", "result": "保温杯：库存 42 件；316L 不锈钢内胆，500ml，杯身磨砂黑。", "skipped": false}, "note": "tool result"}
+{"ts": 8.98, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "有的，目前保温杯 inventory 还有 42 件；规格为316L不锈钢内胆，500ml，杯身磨砂黑。"}}, "note": "final"}
+{"ts": 8.98, "type": "turn_end", "payload": {"reason": "turn end"}, "note": "turn end"}
+```
 
 ### 01-sent-stop：场景 1 · 已发 LLM、未回复（stop）
 
@@ -419,12 +438,36 @@ worker 空闲、投递即开新 turn：先确立 agent 可用，后面每一格�
 {"role": "user", "content": "[本轮已被用户中断，不要回答上面那条问题]"}
 ```
 
+session log（掐在飞：`step_cancelled` 出现了）：
+
+```json
+{"ts": 0.41, "type": "user_input", "payload": {"text": "你好，用一句话介绍你自己"}, "note": "turn start"}
+{"ts": 0.63, "type": "user_interrupt", "payload": {"intent": "stop"}, "note": "interrupt received"}
+{"ts": 0.64, "type": "step_cancelled", "payload": {"intent": "stop"}, "note": "interrupt"}
+{"ts": 0.64, "type": "user_input", "payload": {"text": "[本轮已被用户中断，不要回答上面那条问题]", "synthetic": true}, "note": "marker"}
+{"ts": 0.64, "type": "turn_end", "payload": {"reason": "interrupted"}, "note": "interrupted"}
+```
+
 ### 02-sent-redirect：场景 1 · 同一个落点，只差 intent（redirect）
 
 ![02-sent-redirect](../../src/baby_event_driven_agent/rec/stage03/docs/02-sent-redirect.gif)
 
 turn 不结束：补一条**折了 `REDIRECT_NOTE` 的纠正 user**，同一 turn 内重发。和 01 对照着看，
 "停"和"转向"只差最后一条消息。
+
+session log（`step_cancelled` 带 `intent=redirect`；同一个 turn 里接着跑完，最后
+`turn_end` 的 reason 是 `turn end` 不是 `interrupted`）：
+
+```json
+{"ts": 0.26, "type": "user_input", "payload": {"text": "你好，用一句话介绍你自己"}, "note": "turn start"}
+{"ts": 0.37, "type": "user_interrupt", "payload": {"intent": "redirect", "text": "别自我介绍了，改成说说报销规定"}, "note": "interrupt received"}
+{"ts": 0.37, "type": "step_cancelled", "payload": {"intent": "redirect"}, "note": "interrupt"}
+{"ts": 0.37, "type": "user_input", "payload": {"text": "[上一轮回答被用户打断，以下是用户的纠正]\n\n别自我介绍了，改成说说报销规定", "synthetic": true}, "note": "redirect"}
+{"ts": 2.89, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules…]}}, "note": "tool_call"}
+{"ts": 2.89, "type": "tool_result", "payload": {"…", "result": "报销：月底 25 号前提交，超过 500 元要附发票原件。", "skipped": false}, "note": "tool result"}
+{"ts": 5.23, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "公司的报销规定是：月底 25 号前提交，超过 500 元需要附上发票原件。"}}, "note": "final"}
+{"ts": 5.23, "type": "turn_end", "payload": {"reason": "turn end"}, "note": "turn end"}
+```
 
 ### 03-thinking-stop / 04-thinking-redirect：场景 2 · 只在吐 thinking
 
@@ -435,6 +478,28 @@ turn 不结束：补一条**折了 `REDIRECT_NOTE` 的纠正 user**，同一 tur
 thinking 不进 history，所以 stop 和场景 1 一样补 user 中断标记；redirect 则**先补一个 assistant
 空壳占位**（只声明被打断，不回灌思维链），再补折标注的纠正 user。
 
+session log（03 与 01 同形状；04 里能看到空壳 assistant 占位和它前后的两条 synthetic）：
+
+```json
+{"ts": 1.28, "type": "user_interrupt", "payload": {"intent": "stop"}, "note": "interrupt received"}
+{"ts": 1.28, "type": "step_cancelled", "payload": {"intent": "stop"}, "note": "interrupt"}
+{"ts": 1.28, "type": "user_input", "payload": {"text": "[本轮已被用户中断，不要回答上面那条问题]", "synthetic": true}, "note": "marker"}
+{"ts": 1.28, "type": "turn_end", "payload": {"reason": "interrupted"}, "note": "interrupted"}
+```
+
+```json
+{"ts": 0.49, "type": "user_interrupt", "payload": {"intent": "redirect", "text": "先别查了，改成订会议室"}, "note": "interrupt received"}
+{"ts": 0.49, "type": "step_cancelled", "payload": {"intent": "redirect"}, "note": "interrupt"}
+{"ts": 0.49, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[response interrupted]"}, "synthetic": true}, "note": "interrupted"}
+{"ts": 0.49, "type": "user_input", "payload": {"text": "[上一轮回答被用户打断，以下是用户的纠正]\n\n先别查了，改成订会议室", "synthetic": true}, "note": "redirect"}
+{"ts": 7.67, "type": "agent_reply", "payload": {"…": "…"}, "note": "tool_call"}
+{"ts": 12.0, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "已将“报销”和“VPN申请”规则修改为“会议室预订”，新规定如下：…"}}, "note": "final"}
+{"ts": 12.0, "type": "turn_end", "payload": {"reason": "turn end"}, "note": "turn end"}
+```
+
+（04 那轮模型收到纠正后实际调了 `update_rules` 真改了规则库——工具是真执行的，
+这也是 knowledge-base 会被 demo 改动的原因。）
+
 ### 05-toolcall-stop / 06-toolcall-redirect：场景 3 · 参数还没吐完
 
 ![05-toolcall-stop](../../src/baby_event_driven_agent/rec/stage03/docs/05-toolcall-stop.gif)
@@ -443,6 +508,31 @@ thinking 不进 history，所以 stop 和场景 1 一样补 user 中断标记；
 
 流里已经有 `tool_call_delta`，但半截 tool_call 不是合法消息、也没执行过 → **整步丢**。
 stop 补 user 中断标记；redirect 只补折标注的纠正 user——没收到完整返回就当没收到。
+
+session log（形状与场景 2 完全一致：整步丢 = 没有任何 assistant 输出要补）：
+
+```json
+{"ts": 2.82, "type": "user_interrupt", "payload": {"intent": "stop"}, "note": "interrupt received"}
+{"ts": 2.82, "type": "step_cancelled", "payload": {"intent": "stop"}, "note": "interrupt"}
+{"ts": 2.82, "type": "user_input", "payload": {"text": "[本轮已被用户中断，不要回答上面那条问题]", "synthetic": true}, "note": "marker"}
+{"ts": 2.82, "type": "turn_end", "payload": {"reason": "interrupted"}, "note": "interrupted"}
+```
+
+```json
+{"ts": 2.17, "type": "user_interrupt", "payload": {"intent": "redirect", "text": "先别查了，改成订会议室"}, "note": "interrupt received"}
+{"ts": 2.17, "type": "step_cancelled", "payload": {"intent": "redirect"}, "note": "interrupt"}
+{"ts": 2.17, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[response interrupted]"}, "synthetic": true}, "note": "interrupted"}
+{"ts": 2.17, "type": "user_input", "payload": {"text": "[上一轮回答被用户打断，以下是用户的纠正]\n\n先别查了，改成订会议室", "synthetic": true}, "note": "redirect"}
+{"ts": 3.92, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules("会议室")…]}}, "note": "tool_call"}
+{"ts": 3.92, "type": "tool_result", "payload": {"…", "result": "公司会议室需提前24小时通过IT部门系统预约，每人每日最多占用3个独立时段…", "skipped": false}, "note": "tool result"}
+{"ts": 6.46, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "公司会议室需提前24小时通过IT部门系统预约，每人每日最多占用3个独立时段，超时或连续占用超过2小时需要经理特批。"}}, "note": "final"}
+{"ts": 6.46, "type": "turn_end", "payload": {"reason": "turn end"}, "note": "turn end"}
+```
+
+等等——06 里 redirect 后出现了 assistant 空壳，场景 3 不是说"整步丢、只补一条纠正 user"吗？
+对照场景 2 的 redirect（04）就明白了：**空壳补的是"模型已经开始输出"这个事实**——05/06 的
+中断时机等的是 `tool_call_started`，此刻 thinking 也已经吐过（模型先想后调工具），所以丢掉
+整步之后仍要一个占位声明"这里打断过"。stop 不补它，是因为尾部已有 user 中断标记把问题封死。
 
 ### 07-tool-running-stop / 08-tool-running-redirect：场景 4 · tool 执行中
 
@@ -461,6 +551,41 @@ stop 补 user 中断标记；redirect 只补折标注的纠正 user——没收�
 上面还有一条真实的 assistant（带 `tool_calls`）和它前面的 user——那一步是跑完了的，所以保留。
 redirect 只差最后一条：不放封口，换成**纯纠正 user**（工具阶段语义就是 steering，不加标注）。
 
+session log。07 是**边界命中**的标本：`user_interrupt` 紧跟着 `tool_call` 事件到，但慢工具
+gate 里 step 恰好跑完，取消落空——没有 `step_cancelled`，代之以 `turn_interrupted`
+（此刻没有 step 可取消，只有边界可命中）；两条 tool_result 一真一占位，然后封口：
+
+```json
+{"ts": 0.28, "type": "user_input", "payload": {"text": "报销和 VPN 分别有什么规定，都要查"}, "note": "turn start"}
+{"ts": 3.82, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules × 2…]}}, "note": "tool_call"}
+{"ts": 3.82, "type": "user_interrupt", "payload": {"intent": "stop"}, "note": "interrupt received"}
+{"ts": 3.83, "type": "tool_result", "payload": {"…", "result": "报销：月底 25 号前提交，超过 500 元要附发票原件。", "skipped": false}, "note": "tool result"}
+{"ts": 3.83, "type": "tool_result", "payload": {"…", "result": "[被用户中断，未执行]", "skipped": true}, "note": "tool skipped"}
+{"ts": 3.83, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[本轮已被用户中断，不再基于上面的工具结果作答]"}, "synthetic": true}, "note": "marker"}
+{"ts": 3.83, "type": "turn_interrupted", "payload": {"intent": "stop"}, "note": "boundary"}
+{"ts": 3.83, "type": "turn_end", "payload": {"reason": "interrupted"}, "note": "interrupted"}
+```
+
+08 的 redirect 在同一刻命中：同样一真一占位两条 tool_result，但没有封口——换成**纯纠正
+user**（`synthetic: true` 但内容不带标注），边界标记 `turn_interrupted` 带 `intent=redirect`，
+turn 不结束，下一个 step 拿着纠正继续查"会议室"：
+
+```json
+{"ts": 3.11, "type": "user_interrupt", "payload": {"intent": "redirect", "text": "先别查了，改成订会议室"}, "note": "interrupt received"}
+{"ts": 3.11, "type": "tool_result", "payload": {"…", "result": "报销：月底 25 号前提交，超过 500 元要附发票原件。", "skipped": false}, "note": "tool result"}
+{"ts": 3.11, "type": "tool_result", "payload": {"…", "result": "[被用户中断，未执行]", "skipped": true}, "note": "tool skipped"}
+{"ts": 3.11, "type": "user_input", "payload": {"text": "先别查了，改成订会议室", "synthetic": true}, "note": "redirect"}
+{"ts": 3.11, "type": "turn_interrupted", "payload": {"intent": "redirect"}, "note": "boundary"}
+{"ts": 5.24, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules("会议室")…]}}, "note": "tool_call"}
+{"ts": 11.63, "type": "turn_end", "payload": {"reason": "turn end"}, "note": "turn end"}
+```
+
+把 01 和 07 的 log 摆在一起，两条收尾路径一目了然：**掐在飞**是
+`user_interrupt → step_cancelled → turn_end(interrupted)`，**边界命中**是
+`user_interrupt → turn_interrupted → turn_end(interrupted)`——中间那个标记不同
+（有没有 step 可取消），两头的 `reason=interrupted` 相同。中断请求本身无论命中
+与否都进 log（它是发生过的事实），是否命中看后面跟的是哪个标记。
+
 ### 09-tools-done-stop：场景 5 · tool 刚好跑完（stop）
 
 ![09-tools-done-stop](../../src/baby_event_driven_agent/rec/stage03/docs/09-tools-done-stop.gif)
@@ -469,40 +594,33 @@ redirect 只差最后一条：不放封口，换成**纯纠正 user**（工具�
 assistant 封口占位——**不是因为残缺，是因为 turn 要收口**：这一格的工具是完整的，封口只是
 告诉下一次读 history 的人"别再基于这些结果作答"。
 
+session log（和 07 的差别只在 `skipped: true` 那条没了——工具全跑完了；`turn_interrupted`
+照旧在，说明这次 stop 也是边界命中）：
+
+```json
+{"ts": 0.36, "type": "user_input", "payload": {"text": "报销有什么规定"}, "note": "turn start"}
+{"ts": 2.65, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules…]}}, "note": "tool_call"}
+{"ts": 2.65, "type": "tool_result", "payload": {"…", "result": "报销：月底 25 号前提交，超过 500 元要附发票原件。", "skipped": false}, "note": "tool result"}
+{"ts": 2.65, "type": "user_interrupt", "payload": {"intent": "stop"}, "note": "interrupt received"}
+{"ts": 2.65, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[本轮已被用户中断，不再基于上面的工具结果作答]"}, "synthetic": true}, "note": "marker"}
+{"ts": 2.65, "type": "turn_interrupted", "payload": {"intent": "stop"}, "note": "boundary"}
+{"ts": 2.65, "type": "turn_end", "payload": {"reason": "interrupted"}, "note": "interrupted"}
+```
+
 ### 10-half-answer-stop：场景 6 · 回答只说了一半（stop）
 
 ![10-half-answer-stop](../../src/baby_event_driven_agent/rec/stage03/docs/10-half-answer-stop.gif)
 
 流里只有 `text_delta`，半句没写完的最终回答**丢弃**（不进 history），尾部仍是 user →
-补 user 中断标记。
-
-### 中断在 session log 里长什么样
-
-两条路径都留痕，都真跑出来了（下面两段是录制原文，节选）：
+补 user 中断标记。session log（和 01 同形状：掐在飞，`step_cancelled` + user 标记；
+半句文本在任何一条事件里都找不到——它没进过事实层）：
 
 ```json
-{"ts": 0.41, "type": "user_input", "session": "01-sent-stop", "payload": {"text": "你好，用一句话介绍你自己"}, "note": "turn start"}
-{"ts": 0.63, "type": "user_interrupt", "session": "01-sent-stop", "payload": {"intent": "stop"}, "note": "interrupt received"}
-{"ts": 0.64, "type": "step_cancelled", "session": "01-sent-stop", "payload": {"intent": "stop"}, "note": "interrupt"}
-{"ts": 0.64, "type": "user_input", "session": "01-sent-stop", "payload": {"text": "[本轮已被用户中断，不要回答上面那条问题]", "synthetic": true}, "note": "marker"}
-{"ts": 0.64, "type": "turn_end", "session": "01-sent-stop", "payload": {"reason": "interrupted"}, "note": "interrupted"}
+{"ts": 4.16, "type": "user_interrupt", "payload": {"intent": "stop"}, "note": "interrupt received"}
+{"ts": 4.16, "type": "step_cancelled", "payload": {"intent": "stop"}, "note": "interrupt"}
+{"ts": 4.16, "type": "user_input", "payload": {"text": "[本轮已被用户中断，不要回答上面那条问题]", "synthetic": true}, "note": "marker"}
+{"ts": 4.16, "type": "turn_end", "payload": {"reason": "interrupted"}, "note": "interrupted"}
 ```
-
-```json
-{"ts": 2.65, "type": "tool_result", "session": "09-tools-done-stop", "payload": {"tool_call_id": "call_wnn92g5u", "name": "search_rules", "result": "报销：月底 25 号前提交，超过 500 元要附发票原件。", "skipped": false}, "note": "tool result"}
-{"ts": 2.65, "type": "user_interrupt", "session": "09-tools-done-stop", "payload": {"intent": "stop"}, "note": "interrupt received"}
-{"ts": 2.65, "type": "agent_reply", "session": "09-tools-done-stop", "payload": {"message": {"role": "assistant", "content": "[本轮已被用户中断，不再基于上面的工具结果作答]"}, "synthetic": true}, "note": "marker"}
-{"ts": 2.65, "type": "turn_interrupted", "session": "09-tools-done-stop", "payload": {"intent": "stop"}, "note": "boundary"}
-{"ts": 2.65, "type": "turn_end", "session": "09-tools-done-stop", "payload": {"reason": "interrupted"}, "note": "interrupted"}
-```
-
-第一次是**掐掉了在飞的 step**（`step_cancelled`）；第二次是**边界命中**（`turn_interrupted`，
-此刻没有 step 可取消）。两次收尾形状不同（user 标记 / assistant 封口），但都落到 `turn_end`
-的同一个 `reason=interrupted` 上。注意补进去的那条消息也带 `synthetic: true`——**修复动作本身
-也是事实**，回放时能看出哪些消息是框架补的。
-
-中断请求本身（`user_interrupt`）无论命中与否都进 log——它是发生过的事实；是否命中由
-`step_cancelled` / `turn_interrupted` 有没有出现来判断。
 
 ## 从“停”到“转向”：本章后半的 redirect
 
