@@ -82,6 +82,7 @@ STAGE_MODULES: dict[str, str] = {
     "02": "baby_event_driven_agent.stages.stage02_inbox_steering",
     "03": "baby_event_driven_agent.stages.stage03_interrupt",
     "04": "baby_event_driven_agent.stages.stage04_message_bus",
+    "05": "baby_event_driven_agent.stages.stage05_session",
 }
 
 

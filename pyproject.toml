@@ -35,6 +35,8 @@ stage03-demo = "baby_event_driven_agent.stages.stage03_interrupt.main:cli"
 stage03-test = "baby_event_driven_agent.stages.stage03_interrupt.testing:main"
 stage04-demo = "baby_event_driven_agent.stages.stage04_message_bus.main:cli"
 stage04-test = "baby_event_driven_agent.stages.stage04_message_bus.testing:main"
+stage05-demo = "baby_event_driven_agent.stages.stage05_session.main:cli"
+stage05-test = "baby_event_driven_agent.stages.stage05_session.testing:main"
 
 # 用 asciinema 把某个 stage 的 demo case 逐个录成 .cast（见 recorder.py）。
 cookbook-rec = "baby_event_driven_agent.recorder:cli"
