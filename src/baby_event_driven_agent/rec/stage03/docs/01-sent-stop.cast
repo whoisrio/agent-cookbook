@@ -1,0 +1,11 @@
+{"version":3,"term":{"cols":120,"rows":40},"timestamp":1789974401,"idle_time_limit":1.0,"command":"/Users/rio/repos/myprjs/agent-cookbook/.venv/bin/python -m baby_event_driven_agent.stages.stage03_interrupt.main 01-sent-stop --sessions-dir /Users/rio/repos/myprjs/agent-cookbook/src/baby_event_driven_agent/sessions/stage03","title":"stage03/01-sent-stop · 场景 1 · 已发 LLM、未回复 —— stop｜还没有任何输出可留；尾部是没被回答的 user → 补 user 中断标记。","env":{"SHELL":"/bin/zsh"}}
+[0.496, "o", "\u001b[1mStage 3：打断在飞的一步 —— 按命中落点逐个看收尾\u001b[0m\r\n\u001b[90m       说明 │ 只跑：01-sent-stop\u001b[0m\r\n\r\n\u001b[1m── 场景 1 · 01-sent-stop：已发 LLM、未回复 —— stop ──\u001b[0m\r\n\u001b[90m       说明 │ 命中落点：请求刚发出、一个增量都还没回（已发 LLM、未回复）；意图：stop\u001b[0m\r\n\r\n\u001b[1m\u001b[33m[ 0.41s] 用户 │ \u001b[0m\u001b[33m[01-sent-stop] 你好，用一句话介绍你自己\u001b[0m\r\n"]
+[0.222, "o", "\r\n\u001b[1m\u001b[91m[ 0.63s] 用户 │ \u001b[0m\u001b[91m按下停止（intent=stop）\u001b[0m"]
+[0.002, "o", "\r\n"]
+[0.001, "o", "\r\n\u001b[1m\u001b[91m[ 0.64s] 系统 │ \u001b[0m\u001b[91m已掐掉在飞的那一步（intent=stop，step_cancelled）\u001b[0m\r\n"]
+[0.000, "o", "\r\n\u001b[1m\u001b[91m[ 0.64s] 系统 │ \u001b[0m\u001b[91mturn 结束（reason=interrupted）\u001b[0m\r\n"]
+[0.000, "o", "\r\n\u001b[1m\u001b[90m[ 0.64s] 收尾 │ \u001b[0m\u001b[90m[01-sent-stop] 完整 history（已略去 system）\u001b[0m\r\n"]
+[0.000, "o", "\u001b[90m  {\"role\": \"user\", \"content\": \"你好，用一句话介绍你自己\"}\u001b[0m\r\n\u001b[90m  {\"role\": \"user\", \"content\": \"[本轮已被用户中断，不要回答上面那条问题]\"}\u001b[0m\r\n"]
+[0.000, "o", "\u001b[90m       说明 │ 还没有任何输出可留；尾部是没被回答的 user → 补 user 中断标记。\u001b[0m\r\n"]
+[0.000, "o", "\r\n\u001b[1m── 收尾 ──\u001b[0m\r\n\u001b[90m       说明 │ 中断只动在飞的那一步：worker 没死、history 完好，不影响下一轮。\u001b[0m\r\n\r\n\u001b[1m\u001b[32m[ 0.64s] 系统 │ \u001b[0m\u001b[32mdemo 结束\u001b[0m\r\n\u001b[90m  session log: /Users/rio/repos/myprjs/agent-cookbook/src/baby_event_driven_agent/sessions/stage03/session.jsonl\u001b[0m\r\n"]
+[0.109, "x", "0"]

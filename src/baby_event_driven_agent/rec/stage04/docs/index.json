@@ -1,0 +1,86 @@
+{
+  "stage": "04",
+  "run_id": "docs",
+  "window_size": "120x40",
+  "idle_time_limit": 1.0,
+  "cases": [
+    {
+      "case": "01-sync-vs-async",
+      "title": "第 1 段：同步扇出 vs 异步分发（不打模型）",
+      "exit": 0,
+      "timeout": false,
+      "secs": 2.6,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/01-sync-vs-async.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/01-sync-vs-async.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/01-sync-vs-async.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "02-burst-load",
+      "title": "第 2 段：洪峰压测（不打模型）",
+      "exit": 0,
+      "timeout": false,
+      "secs": 4.0,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/02-burst-load.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/02-burst-load.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/02-burst-load.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "03-slow-subscriber",
+      "title": "第 3 段：真跑一轮：慢订阅者不拖 loop，UI 合并缓冲",
+      "exit": 0,
+      "timeout": false,
+      "secs": 10.6,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/03-slow-subscriber.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/03-slow-subscriber.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/03-slow-subscriber.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "04-permission-veto",
+      "title": "第 4 段：当场否决（permission_guard）",
+      "exit": 0,
+      "timeout": false,
+      "secs": 17.3,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/04-permission-veto.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/04-permission-veto.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/04-permission-veto.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "05-approval-flow",
+      "title": "第 5 段：人工确认（approval 回路）",
+      "exit": 0,
+      "timeout": false,
+      "secs": 36.1,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/05-approval-flow.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/05-approval-flow.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/05-approval-flow.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "06-log-and-offset",
+      "title": "第 6 段：落盘与位点",
+      "exit": 0,
+      "timeout": false,
+      "secs": 26.1,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/06-log-and-offset.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/06-log-and-offset.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/06-log-and-offset.mp4",
+      "render_error": ""
+    }
+  ]
+}

@@ -1,0 +1,86 @@
+{
+  "stage": "01",
+  "run_id": "docs",
+  "window_size": "120x40",
+  "idle_time_limit": 1.0,
+  "cases": [
+    {
+      "case": "all",
+      "title": "全部 5 问（读 → 写 → 读回 → 查规则 → 越界），一条线看完 stage01（不编号）",
+      "exit": 0,
+      "timeout": false,
+      "secs": 45.6,
+      "cast": "src/baby_event_driven_agent/rec/stage01/docs/all.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage01",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage01/docs/all.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage01/docs/all.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "01-read-stock",
+      "title": "纯读：模型自己选读工具，不写任何文件，看它会不会编库存",
+      "exit": 0,
+      "timeout": false,
+      "secs": 8.2,
+      "cast": "src/baby_event_driven_agent/rec/stage01/docs/01-read-stock.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage01",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage01/docs/01-read-stock.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage01/docs/01-read-stock.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "02-write-stock",
+      "title": "带副作用的写：真往 knowledge-base/inventory.txt 追加一行，跑前跑后 diff 可见",
+      "exit": 0,
+      "timeout": false,
+      "secs": 11.9,
+      "cast": "src/baby_event_driven_agent/rec/stage01/docs/02-write-stock.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage01",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage01/docs/02-write-stock.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage01/docs/02-write-stock.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "03-read-back",
+      "title": "读回刚刚写进去的那行，验证写真的落了库（依赖 write-stock）",
+      "exit": 0,
+      "timeout": false,
+      "secs": 7.3,
+      "cast": "src/baby_event_driven_agent/rec/stage01/docs/03-read-back.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage01",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage01/docs/03-read-back.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage01/docs/03-read-back.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "04-search-rules",
+      "title": "换个知识库查规则：同样要事实，看模型选不选得对工具",
+      "exit": 0,
+      "timeout": false,
+      "secs": 7.1,
+      "cast": "src/baby_event_driven_agent/rec/stage01/docs/04-search-rules.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage01",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage01/docs/04-search-rules.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage01/docs/04-search-rules.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "05-off-topic",
+      "title": "知识库答不了的问题：看它怎么收场（按 system prompt 该答不知道），和前面几问对照",
+      "exit": 0,
+      "timeout": false,
+      "secs": 8.6,
+      "cast": "src/baby_event_driven_agent/rec/stage01/docs/05-off-topic.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage01",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage01/docs/05-off-topic.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage01/docs/05-off-topic.mp4",
+      "render_error": ""
+    }
+  ]
+}

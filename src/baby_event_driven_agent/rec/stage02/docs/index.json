@@ -1,0 +1,47 @@
+{
+  "stage": "02",
+  "run_id": "docs",
+  "window_size": "120x40",
+  "idle_time_limit": 1.0,
+  "cases": [
+    {
+      "case": "01-idle-turn",
+      "title": "动作 1：worker 空闲时投递 → 立刻开新 turn，工具调用 + 流式回答走完",
+      "exit": 0,
+      "timeout": false,
+      "secs": 5.7,
+      "cast": "src/baby_event_driven_agent/rec/stage02/docs/01-idle-turn.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage02",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage02/docs/01-idle-turn.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage02/docs/01-idle-turn.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "02-followup",
+      "title": "动作 1-2：紧接着再问 → 排队成 followup，等当前 turn 结束再开新 turn",
+      "exit": 0,
+      "timeout": false,
+      "secs": 9.8,
+      "cast": "src/baby_event_driven_agent/rec/stage02/docs/02-followup.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage02",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage02/docs/02-followup.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage02/docs/02-followup.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "03-steering",
+      "title": "动作 1-3：等工具真的在飞时插话 → 被 drain 进当前 turn（steering）；错过窗口则降级为 followup（屏幕上可辨）",
+      "exit": 0,
+      "timeout": false,
+      "secs": 18.3,
+      "cast": "src/baby_event_driven_agent/rec/stage02/docs/03-steering.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage02",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage02/docs/03-steering.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage02/docs/03-steering.mp4",
+      "render_error": ""
+    }
+  ]
+}
