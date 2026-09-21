@@ -270,18 +270,46 @@ def test_tool_phase_stop_skips_unstarted_calls(
     assert hist[-2]["content"] == NO_EXEC
 
 
+def test_tools_done_stop_closes_with_assistant_closer(workdir: Path) -> None:
+    """⑤ stop：工具已经全跑完、turn 还没收尾时按 stop，收口按**尾部角色**来。
+
+    此刻 history 尾部停在 `tool`（工具结果没人接），缺的是 assistant 收尾 →
+    补 assistant 封口占位，**不是** user 中断标记（否则会漏出 `[..., tool, user]`
+    这种"工具结果没人接住"的形状）。
+    """
+    log_path = workdir / "session.jsonl"
+    h = Harness(log_path)
+
+    async def run() -> None:
+        h.send("报销有什么规定")
+        await h.wait("tool_result")   # 工具已经跑完，结果马上进 history
+        h.interrupt(intent="stop")
+        await h.wait("turn_end")
+        await h.stop()
+
+    asyncio.run(run())
+
+    hist = h.agent.history["A"]
+    assert tail(hist) == {"role": "assistant", "content": STOP_CLOSER}
+    assert hist[-2]["role"] == "tool", roles(hist)
+
+
 # ------------------------------------------------------------------ ④ / ⑧（redirect）
 
 
-def test_stream_redirect_keeps_partial_and_annotates(workdir: Path) -> None:
-    """④⑧ redirect：半成品按已观测事实补进 history，再补带标注的纠正 user。"""
+def test_stream_redirect_discards_incomplete_step(workdir: Path) -> None:
+    """①②③ redirect：没收到完整的 LLM 返回就当没收到——在飞 step 的产物一律丢。
+
+    可见文本 / 半截 tool_call 都不进 history：半截的 arguments 断在半路、不是
+    合法消息，也没执行过，补不了占位。只补一条折了 REDIRECT_NOTE 的纠正 user。
+    """
     log_path = workdir / "session.jsonl"
     h = Harness(log_path)
 
     async def run() -> None:
         h.send("报销有什么规定")
         try:
-            await h.wait("tool_call_started")     # ④：已见到工具意图
+            await h.wait("tool_call_started")     # ③：已见到工具意图（参数还没吐完）
         except asyncio.TimeoutError:
             pass
         h.interrupt(intent="redirect", text="先别查了，改成订会议室")
@@ -291,18 +319,15 @@ def test_stream_redirect_keeps_partial_and_annotates(workdir: Path) -> None:
     asyncio.run(run())
 
     hist = h.agent.history["A"]
-    corrections = [
-        m
-        for m in hist
+    idx = next(
+        i
+        for i, m in enumerate(hist)
         if m.get("role") == "user" and m["content"].startswith(REDIRECT_NOTE)
-    ]
-    assert corrections, roles(hist)
-    # 工具意图一旦出现，就必须成对：assistant(tool_calls) + 每个 call 一条 tool
-    assistants = [m for m in hist if m.get("tool_calls")]
-    for msg in assistants:
-        ids = [c["id"] for c in msg["tool_calls"]]
-        paired = [m for m in hist if m.get("role") == "tool"]
-        assert all(i for i in ids if any(m["tool_call_id"] == i for m in paired))
+    )
+    # 纠正之前的在飞产物全丢：不能出现半截 assistant(tool_calls)、也不能有它的占位
+    before = hist[:idx]
+    assert not [m for m in before if m.get("tool_calls")], roles(hist)
+    assert not [m for m in before if m.get("role") == "tool"], roles(hist)
 
 
 # ------------------------------------------------------------------ ⑤ / ⑦（redirect → steering）

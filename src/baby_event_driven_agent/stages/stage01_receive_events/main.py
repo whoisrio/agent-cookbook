@@ -1,4 +1,7 @@
-"""Stage 1 演示：真实 LLM 流式输出，四轮对话走完读、写、读回、查规则。
+"""Stage 1 演示：真实 LLM 流式输出。五问走完读 → 写 → 读回 → 查规则 → 越界。
+
+每一问是一个可单跑的 case，名字是 `两位编号-语义名`（编号让文件名字典序 = 演示顺序）：
+`01-read-stock` / `02-write-stock` / `03-read-back` / `04-search-rules` / `05-off-topic`。
 
 需要仓库根 .env 里的 OPENAI_API_KEY / OPENAI_API_BASE / OPENAI_MODEL
 （环境变量可覆盖，本地 ollama：OPENAI_API_BASE=http://localhost:11434/v1
@@ -19,7 +22,9 @@ OPENAI_API_KEY=ollama OPENAI_MODEL=qwen3.5:4b-32k stage01-demo）。
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 
 from .agent import Agent
@@ -53,11 +58,62 @@ def brief(text: str, limit: int = 140) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
-async def main() -> None:
+def banner(name: str, what: str) -> None:
+    """每个 case 开头一行：`── <case 名>：这个 case 在看什么 ──`。
+
+    名字就是录制产物名（`rec/stage01/<run>/<name>.gif`），看片时对得上。"""
+    print(f"\n{BOLD}── {name}：{what} ──{RESET}")
+
+
+@dataclass(frozen=True)
+class Case:
+    """一问就是一个 case：`id` 是 case 名（= 录制文件名），`title` 一句话说明它在看什么。
+
+    id 一律 `两位编号-语义名`：编号让**文件名字典序 = 演示顺序**，语义名说明在看什么。"""
+
+    id: str
+    question: str
+    title: str
+
+
+# 每一问是一个 case，可以单独跑（跑法：stage01-demo 02-write-stock）。
+# 注意有先后依赖：02-write-stock 会真写 inventory.txt，03-read-back 读它——单独跑 03 前先跑过 02。
+CASES: tuple[Case, ...] = (
+    Case(
+        "01-read-stock",
+        "保温杯还有库存吗",
+        "纯读：模型自己选读工具，不写任何文件，看它会不会编库存",
+    ),
+    Case(
+        "02-write-stock",
+        "帮我把马克杯加进库存：8 件，陶瓷，350ml",
+        "带副作用的写：真往 knowledge-base/inventory.txt 追加一行，跑前跑后 diff 可见",
+    ),
+    Case(
+        "03-read-back",
+        "马克杯还有货吗",
+        "读回刚刚写进去的那行，验证写真的落了库（依赖 write-stock）",
+    ),
+    Case(
+        "04-search-rules",
+        "报销有什么规定",
+        "换个知识库查规则：同样要事实，看模型选不选得对工具",
+    ),
+    Case(
+        "05-off-topic",
+        "迪丽热巴和杨幂谁更好看?",
+        "知识库答不了的问题：看它怎么收场（按 system prompt 该答不知道），和前面几问对照",
+    ),
+)
+ALL_TITLE = "全部 5 问（读 → 写 → 读回 → 查规则 → 越界），一条线看完 stage01（不编号）"
+CASE_IDS = ("all", *(c.id for c in CASES))
+
+
+async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = None) -> None:
     # session log 落在包级 sessions/ 目录，按 stage 分目录
-    sessions_dir = Path(__file__).resolve().parents[2] / "sessions" / "stage01"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    log_path = str(sessions_dir / "session.jsonl")
+    base_dir = sessions_dir or (Path(__file__).resolve().parents[2] / "sessions" / "stage01")
+    base_dir.mkdir(parents=True, exist_ok=True)
+    log_path = str(base_dir / "session.jsonl")
     bus = EventBus()
     log = SessionLog(log_path)
     agent = Agent(bus, log, RealLLM())
@@ -99,24 +155,45 @@ async def main() -> None:
     bus.subscribe("agent_reply", ui_reply)
     bus.subscribe("tool_result", ui_tool_result)
 
-    questions = [
-        "保温杯还有库存吗",
-        "帮我把马克杯加进库存：8 件，陶瓷，350ml",
-        "马克杯还有货吗",
-        "报销有什么规定",
-        "迪丽热巴和杨幂谁更好看?",
-    ]
-    for q in questions:
-        line("用户", YELLOW, q)
-        await bus.publish(Event("user_input", "A", {"text": q}))
+    picks = [c for c in CASES if not case_ids or "all" in case_ids or c.id in case_ids]
+    if not picks:
+        line("系统", GREEN, f"没有匹配的 case：{case_ids}；可选：{', '.join(CASE_IDS)}")
+        return
+    if case_ids:
+        line("系统", GREEN, f"只跑：{', '.join(c.id for c in picks)}")
+
+    for case in picks:
+        banner(case.id, case.title)
+        line("用户", YELLOW, case.question)
+        await bus.publish(Event("user_input", "A", {"text": case.question}))
+
     line("系统", GREEN, "demo 结束")
     print(f"{GREY}  session log: {log_path}{RESET}")
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
-
-
 def cli() -> None:
-    """[project.scripts] 入口：stage01-demo。"""
-    asyncio.run(main())
+    """[project.scripts] 入口：stage01-demo。
+
+        stage01-demo                    # 跑全部（默认）
+        stage01-demo 02-write-stock     # 只跑指定 case（名字见 --list）
+        stage01-demo --list             # 列 case 及其说明（不加载模型配置）
+    """
+    parser = argparse.ArgumentParser(
+        prog="stage01-demo", description="Stage 1 演示：真实 LLM 流式输出与工具调用。"
+    )
+    parser.add_argument("cases", nargs="*", metavar="CASE", help="只跑指定 case（默认全部）")
+    parser.add_argument("--list", action="store_true", help="列出所有 case 后退出")
+    parser.add_argument("--sessions-dir", default=None, help="session log 落点")
+    args = parser.parse_args()
+    if args.list:
+        print(f"all\t{ALL_TITLE}")
+        for case in CASES:
+            print(f"{case.id}\t{case.title}")
+        return
+    asyncio.run(
+        main(args.cases or None, Path(args.sessions_dir) if args.sessions_dir else None)
+    )
+
+
+if __name__ == "__main__":
+    cli()

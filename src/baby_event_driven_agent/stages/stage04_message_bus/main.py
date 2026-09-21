@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import shutil
@@ -87,7 +88,8 @@ def note(text: str) -> None:
 
 
 def banner(n: int, title: str, what: str) -> None:
-    print(f"\n{BOLD}── 第 {n} 段：{title} ──{RESET}")
+    """`── <case 名> · 第 n 段：<这段在看什么> ──`。名字就是录制产物名。"""
+    print(f"\n{BOLD}── {CASE_ORDER[n - 1]} · 第 {n} 段：{title} ──{RESET}")
     note(what)
 
 
@@ -96,15 +98,56 @@ def brief(text: str, limit: int = 140) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
-async def main() -> None:
-    sessions_dir = Path(__file__).resolve().parents[2] / "sessions" / "stage04"
+# 段 4/5 依赖段 3 建好的 turn_done / 合并缓冲 / 订阅者，所以 case 是**累积**的；
+# 名字是 `两位编号-语义名`：编号让文件名字典序 = 演示顺序，语义名说明这一段在验什么机制。
+CASE_ORDER = (
+    "01-sync-vs-async",
+    "02-burst-load",
+    "03-slow-subscriber",
+    "04-permission-veto",
+    "05-approval-flow",
+    "06-log-and-offset",
+)
+CASE_TITLES = {
+    "01-sync-vs-async": "第 1 段：同步扇出 vs 异步分发（不打模型）",
+    "02-burst-load": "第 2 段：洪峰压测（不打模型）",
+    "03-slow-subscriber": "第 3 段：真跑一轮：慢订阅者不拖 loop，UI 合并缓冲",
+    "04-permission-veto": "第 4 段：当场否决（permission_guard）",
+    "05-approval-flow": "第 5 段：人工确认（approval 回路）",
+    "06-log-and-offset": "第 6 段：落盘与位点",
+}
+ALL_TITLE = "六段全跑（等于 06-log-and-offset 那一档，不编号）"
+CASE_IDS = ("all", *CASE_ORDER)
+
+
+async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = None) -> None:
+    sessions_dir = sessions_dir or (Path(__file__).resolve().parents[2] / "sessions" / "stage04")
     shutil.rmtree(sessions_dir, ignore_errors=True)
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log = EventLog(str(sessions_dir), segment_bytes=32 * 1024, keep_segments=8)
     bus = EventBus(log, state_size=1024, stream_size=64)
     agent = Agent(bus, RealLLM())
 
+    picked = [c for c in CASE_ORDER if not case_ids or "all" in case_ids or c in case_ids]
+    if not picked:
+        print(f"{GREY}没有匹配的 case：{case_ids}；可选：{', '.join(CASE_IDS)}{RESET}")
+        return
+    upto = CASE_ORDER.index(picked[-1]) + 1
+    bufs: list = []  # 第 3 段才建缓冲；finish() 按需停
+
+    async def finish() -> None:
+        for buf in bufs:
+            await buf.stop()
+        await agent.stop()
+        print(f"\n{BOLD}── history 尾部（这一轮的真实消息形状）──{RESET}")
+        for msg in agent.history.get("A", [])[-3:]:
+            print(f"{GREY}  {json.dumps(msg, ensure_ascii=False)}{RESET}")
+        line("系统", GREEN, "demo 结束")
+        print(f"{GREY}  session log: {sessions_dir}{RESET}")
+
     print(f"{BOLD}Stage 4：消息机制 —— 事件离开 agent 之后要走多远{RESET}")
+    if case_ids:
+        print(f"{GREY}  （只跑：{', '.join(picked)}）{RESET}")
 
     # ------------------------------------------------------------- 第 1 段
     banner(
@@ -127,10 +170,14 @@ async def main() -> None:
     sync_cost = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    for _ in range(200):
+    for i in range(200):
         # tick 走 state 道（不可丢）：这一段要比的是“谁在等”，不能有丢弃掺进来
         await bus.emit(Event("tick", "S1", {"text": "字"}))
+        if i % 10 == 0:
+            await asyncio.sleep(0)  # 让出：lane worker 有机会边发边消费
     emit_cost = time.perf_counter() - t0
+    consumed_during = seen.get("total", 0)  # 发完时 worker 已经送掉多少
+    queued_after = bus.stats()["lanes"]["state"]["queued"]  # 还压在队列里的
     t0 = time.perf_counter()
     await bus.drain(timeout=30.0)
     drain_cost = time.perf_counter() - t0
@@ -139,13 +186,18 @@ async def main() -> None:
     line(
         "实测",
         GREEN,
-        f"异步分发：同样 200 个事件，emit 只花 {emit_cost:.3f}s"
-        f"（订阅者的 {drain_cost:.2f}s 由 lane worker 背，drain 时才等）",
+        f"异步分发：emit 只花 {emit_cost:.3f}s，发完时已顺带送掉 {consumed_during} 条"
+        f"（队列压着 {queued_after} 条，drain 再等 {drain_cost:.2f}s）",
     )
     note(
         f"两套发法订阅者都收到了 {seen.get('total', 0)} 条：异步分发没有少送，"
-        "只是把“等”这件事从 loop 挪到了 lane worker。"
+        "只是把“等”从 loop 挪到了 lane worker——而且消费和发送是并发的："
+        "生产者每让出一次，worker 就消化一批，不必等全部发完。"
     )
+
+    if upto <= 1:
+        await finish()
+        return
 
     # ------------------------------------------------------------- 第 2 段
     banner(
@@ -322,6 +374,10 @@ async def main() -> None:
         f"{g_seen.get('agent_delta', 0)} 次降到十来次，这才是“UI 刷不动”的解药。"
     )
 
+    if upto <= 2:
+        await finish()
+        return
+
     # ------------------------------------------------------------- 第 3 段
     banner(
         3,
@@ -350,6 +406,7 @@ async def main() -> None:
     await think_buf.start()
     await text_buf.start()
     await think_buf.start()
+    bufs.extend([think_buf, text_buf])  # 提前收尾时由 finish() 停
 
     async def ui_delta(event: Event) -> None:
         if event.session_id == "A":
@@ -410,6 +467,10 @@ async def main() -> None:
         f"{text_buf.flushes + think_buf.flushes} 帧（每帧 ≤96 字或 50ms 一次）",
     )
 
+    if upto <= 3:
+        await finish()
+        return
+
     # ------------------------------------------------------------- 第 4 段
     banner(
         4,
@@ -443,6 +504,10 @@ async def main() -> None:
         f"“{BLOCKED_PREFIX}”开头），模型知道这不是工具的真实输出；裁决本身也在 log 里，"
         "事后答得出“这个工具为什么没执行”。"
     )
+
+    if upto <= 4:
+        await finish()
+        return
 
     # ------------------------------------------------------------- 第 5 段
     banner(
@@ -551,6 +616,10 @@ async def main() -> None:
         "但留痕不等于伪造裁决：那次确认的回执仍然只有超时/批准那一条。"
     )
 
+    if upto <= 5:
+        await finish()
+        return
+
     # ------------------------------------------------------------- 第 6 段
     banner(
         6,
@@ -602,20 +671,32 @@ async def main() -> None:
     )
 
     # ------------------------------------------------------------- 收尾
-    await think_buf.stop()
-    await text_buf.stop()
-    await agent.stop()
-    print(f"\n{BOLD}── history 尾部（这一轮的真实消息形状）──{RESET}")
-    for msg in agent.history["A"][-3:]:
-        print(f"{GREY}  {json.dumps(msg, ensure_ascii=False)}{RESET}")
-    line("系统", GREEN, "demo 结束")
-    print(f"{GREY}  session log: {sessions_dir}{RESET}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    await finish()
 
 
 def cli() -> None:
-    """[project.scripts] 入口：stage04-demo。"""
-    asyncio.run(main())
+    """[project.scripts] 入口：stage04-demo。
+
+        stage04-demo                        # 跑全部（默认）
+        stage04-demo 03-slow-subscriber     # 只跑到第 3 段（累积；名字见 --list）
+        stage04-demo --list                 # 列 case 及其说明（不加载模型配置）
+    """
+    parser = argparse.ArgumentParser(
+        prog="stage04-demo", description="Stage 4 演示：事件离开 agent 之后要走多远。"
+    )
+    parser.add_argument("cases", nargs="*", metavar="CASE", help="跑到指定 case（累积，默认全部）")
+    parser.add_argument("--list", action="store_true", help="列出所有 case 后退出")
+    parser.add_argument("--sessions-dir", default=None, help="session log 落点")
+    args = parser.parse_args()
+    if args.list:
+        print(f"all\t{ALL_TITLE}")
+        for cid in CASE_ORDER:
+            print(f"{cid}\t{CASE_TITLES[cid]}")
+        return
+    asyncio.run(
+        main(args.cases or None, Path(args.sessions_dir) if args.sessions_dir else None)
+    )
+
+
+if __name__ == "__main__":
+    cli()

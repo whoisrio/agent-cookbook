@@ -41,6 +41,9 @@ stage02 里正在飞的 step 是一个普通的 await：模型请求一旦发出
 - **redirect 的上下文标注**：**折进纠正 user 的 content**，形如  `[上一轮回答被用户打断，以下是用户的纠正]\n\n<纠正文>`。作用是让模型知道前面那条 assistant 是残缺的、这段是纠正。
 下面逐个场景看一下，
 
+> **封口怎么选（一句话）**：stop 看**尾部角色**——尾部是 `tool` 就补 **assistant 封口占位**，否则补 **user 中断标记**；redirect 一律补**纠正 user**（折不折 `REDIRECT_NOTE` 只看 assistant 输出有没有被截断）。
+> 补封口 **≠** 有残缺：stop 是 turn 结束、尾部停在 `tool` 上就得有人收口，跟 tool 完不完整无关。
+
 #### 1.已发 LLM、未回复
 场景1,已发 LLM、未回复，
 收到stop：assistant 侧整个丢；但**不能把那条 user 就这么晾在尾部**——下一轮模型看到一个没回答的问题，会自己去答（demo 里"报销"被翻出来重答就是这个）。末尾补一条**中断标记**：
@@ -132,7 +135,7 @@ stop：真实结果照留，没开始的补占位，然后直接收尾（不再�
 ]
 ```
 redirect：和 stop **只差最后一条**——正在跑的 `call_2` 一样等它跑完，没开始的`call_3` 一样补占位（不新起调用），只是末尾不放中断标记，换成纠正 user，turn 不结束。注意这里**不加"被用户打断"那段标注**：assistant 自己的输出
-没有被切断（`tool_calls` 是完整的、工具也正常跑完了），语义上这就是steering。
+没有被切断（`tool_calls` 是完整的、正在跑的工具等它跑完），语义上这就是 steering。
 
 ```json
 [
@@ -161,7 +164,7 @@ redirect：和 stop **只差最后一条**——正在跑的 `call_2` 一样等�
 
 #### 5. tool 刚好跑完（取消没赶上）
 如果取消信号到的那一刻，这一批工具已经全部拿到真实结果。LLM还没有给出完整的最终的回答。
-**stop 在这里要生效**：直接补一条"封口"的 assistant 占位把 turn 收掉。
+**stop 在这里要生效**：直接补一条"封口"的 assistant 占位把 turn 收掉。这条封口**不是因为工具有残缺**（工具都完整跑完了），而是 turn 结束、尾部停在 `tool` 上缺一个 assistant 收口；redirect 那一格没这个问题，就是一条纯 user 纠正（见下）。
 
 ```json
 [
@@ -383,62 +386,123 @@ history 没坏，已完成的步骤全部保留。
 
 ## 跑一下（真实 LLM 实测输出）
 
-四个动作（见 `stage03_interrupt/main.py`）：
-1.问保温杯，走完一个完整 turn；
-2.紧接着问报销，等 `tool_call_started` 真的到了（step 正在飞）再按停止；
-3.问会议室，同样等到工具意图出现后发 redirect 中断（"先别查会议室了，改成查报销规定"）；
-4.最后问 VPN，验的是中断之后 agent 还活着、收件箱也没坏。
+终端实录（`.cast` → gif，同目录有 `.mp4` 和 `index.json`）。demo 共 11 个 case：1 个基准 +
+场景 1–6 的 stop（场景 1–4 另加一次 redirect）。case 名是 `两位编号-落点-意图`——编号让文件名
+字典序 = 演示顺序，名字本身说明在演示哪一格：
 
-```text
-[ 4.19s] (A) 用户输入：保温杯还有库存吗
-
-[ 7.55s] (A) → 工具调用：search({"query": "保温杯 库存"})
-保温杯还有库存，目前剩余 42 件。这款保温杯是 316L 不锈钢内胆，容量为 500ml，杯身颜色为磨砂黑。
-[ 8.23s] (A) —— 回答完毕
-
-[ 8.24s] (A) 用户接着问：报销有什么规定
-
-[ 9.00s] (A) 用户按下停止（工具调用正在飞）
-
-[ 9.02s] (A) 已停止：正在飞的那一步被取消，turn 结束
-
-[ 9.02s] (A) 用户再问：顺便说说VPN怎么申请
-
-[11.67s] (A) → 工具调用：search({"query": "报销 规定"}), search({"query": "VPN 申请"})
-关于您的两个问题，规定如下：
-
-**1. 报销规定：**
-*   **提交时间：** 需在每个月 **25号前** 提交。
-*   **发票要求：** 金额超过 **500元** 的报销需要附上 **发票原件**。
-
-**2. VPN 申请流程：**
-*   **入口：** 请前往内网 Portal（门户），依次点击 **自助服务** -> **远程接入**。
-*   **审批：** 提交后需要等待 **部门经理审批**。
-[13.58s] (A) —— 回答完毕
+```
+stage03-demo --list                   # 11 个 case 及说明
+stage03-demo 07-tool-running-stop     # 只跑"工具执行中被 stop"那一格
 ```
 
-9.00s 的停止信号命中，9.02s 那一步作废、turn 收尾，
-9.02s 的下一条消息立刻开新 turn——中断到恢复，间隔不到 20ms。
+中断时机是确定性的，不靠 sleep 碰运气：demo 先投问题，等目标事件真的到了才发中断
+（`immediate` 等 50ms，`thinking` / `toolcall` / `tools-done` 分别等 `agent_thinking` /
+`tool_call_started` / `tool_result`）；场景 4 另把 `search_rules` 换成"进去就卡住"的慢工具
+（`gate_in` / `gate_open`），保证中断落在"工具正在执行"那一格。每个 case 末尾都把 history
+尾部原样打出来——收尾规则对不对，一眼可验。
 
-第三轮有一个值得注意的真实行为：模型并发发起了两次检索，一次查 VPN，另一次查的是报销——那个被中断的问题。
-原因是中断不作废历史：“报销有什么规定”这条 user 消息在 turn 开始时就写进了 history，
-被取消的只是那次的 assistant 回复，provider 对消息序列的要求是完整的 assistant 消息，user 消息悬着完全合法。
-模型看到 history 里有一个没回答的问题，自己把它补上了。
-如果产品上不想要这个行为（用户按停止就是不想听到报销的事），
-中断时把当前 turn 的 user 消息从 history 里撤掉即可，两条路都通，
-本 stage 选择保留，因为它让“history 是 log 的投影”这条线更清楚。
+### 00-baseline：基准 · 完整一轮
 
-session log 里中断的痕迹（节选）：
+![00-baseline：完整一轮](../../src/baby_event_driven_agent/rec/stage03/docs/00-baseline.gif)
+
+worker 空闲、投递即开新 turn：先确立 agent 可用，后面每一格都拿它当参照。
+
+### 01-sent-stop：场景 1 · 已发 LLM、未回复（stop）
+
+![01-sent-stop](../../src/baby_event_driven_agent/rec/stage03/docs/01-sent-stop.gif)
+
+请求刚发出、一个增量都没回就按了停止。这一格没有任何输出可留 → 尾部仍是没被回答的 user
+→ 补 **user 中断标记**，history 尾部：
 
 ```json
-{"ts": 8.24, "type": "user_input", "session": "A", "payload": {"text": "报销有什么规定"}, "note": "turn start"}
-{"ts": 9.0, "type": "user_interrupt", "session": "A", "payload": {"intent": "stop"}, "note": "interrupt received"}
-{"ts": 9.01, "type": "step_cancelled", "session": "A", "payload": {"intent": "stop"}, "note": "interrupt"}
-{"ts": 9.02, "type": "turn_end", "session": "A", "payload": {"reason": "interrupted"}, "note": "interrupted"}
+{"role": "user", "content": "你好，用一句话介绍你自己"}
+{"role": "user", "content": "[本轮已被用户中断，不要回答上面那条问题]"}
 ```
 
-中断请求本身（`user_interrupt`）无论命中与否都进 log——它是发生过的事实；
-是否命中由 `step_cancelled` 有没有出现来判断。
+### 02-sent-redirect：场景 1 · 同一个落点，只差 intent（redirect）
+
+![02-sent-redirect](../../src/baby_event_driven_agent/rec/stage03/docs/02-sent-redirect.gif)
+
+turn 不结束：补一条**折了 `REDIRECT_NOTE` 的纠正 user**，同一 turn 内重发。和 01 对照着看，
+"停"和"转向"只差最后一条消息。
+
+### 03-thinking-stop / 04-thinking-redirect：场景 2 · 只在吐 thinking
+
+![03-thinking-stop](../../src/baby_event_driven_agent/rec/stage03/docs/03-thinking-stop.gif)
+
+![04-thinking-redirect](../../src/baby_event_driven_agent/rec/stage03/docs/04-thinking-redirect.gif)
+
+thinking 不进 history，所以 stop 和场景 1 一样补 user 中断标记；redirect 则**先补一个 assistant
+空壳占位**（只声明被打断，不回灌思维链），再补折标注的纠正 user。
+
+### 05-toolcall-stop / 06-toolcall-redirect：场景 3 · 参数还没吐完
+
+![05-toolcall-stop](../../src/baby_event_driven_agent/rec/stage03/docs/05-toolcall-stop.gif)
+
+![06-toolcall-redirect](../../src/baby_event_driven_agent/rec/stage03/docs/06-toolcall-redirect.gif)
+
+流里已经有 `tool_call_delta`，但半截 tool_call 不是合法消息、也没执行过 → **整步丢**。
+stop 补 user 中断标记；redirect 只补折标注的纠正 user——没收到完整返回就当没收到。
+
+### 07-tool-running-stop / 08-tool-running-redirect：场景 4 · tool 执行中
+
+![07-tool-running-stop](../../src/baby_event_driven_agent/rec/stage03/docs/07-tool-running-stop.gif)
+
+![08-tool-running-redirect](../../src/baby_event_driven_agent/rec/stage03/docs/08-tool-running-redirect.gif)
+
+正在跑的那个等它跑完，没开始的补 `[被用户中断，未执行]` 占位。这次 stop 落在**边界**（中断
+到时 step 已经跑完、没在飞），尾部停在 tool → 补 **assistant 封口占位**，history 尾部：
+
+```json
+{"role": "tool", "tool_call_id": "call_5q93l9g7", "content": "VPN 申请：内网 portal → 自助服务 → 远程接入，需要部门经理审批。\n报销：月底 25 号前提交，超过 500 元要附发票原件。"}
+{"role": "assistant", "content": "[本轮已被用户中断，不再基于上面的工具结果作答]"}
+```
+
+上面还有一条真实的 assistant（带 `tool_calls`）和它前面的 user——那一步是跑完了的，所以保留。
+redirect 只差最后一条：不放封口，换成**纯纠正 user**（工具阶段语义就是 steering，不加标注）。
+
+### 09-tools-done-stop：场景 5 · tool 刚好跑完（stop）
+
+![09-tools-done-stop](../../src/baby_event_driven_agent/rec/stage03/docs/09-tools-done-stop.gif)
+
+工具结果都真拿到了、模型还没给最终回答就按了停止。尾部停在 tool，所以和场景 4 一样补
+assistant 封口占位——**不是因为残缺，是因为 turn 要收口**：这一格的工具是完整的，封口只是
+告诉下一次读 history 的人"别再基于这些结果作答"。
+
+### 10-half-answer-stop：场景 6 · 回答只说了一半（stop）
+
+![10-half-answer-stop](../../src/baby_event_driven_agent/rec/stage03/docs/10-half-answer-stop.gif)
+
+流里只有 `text_delta`，半句没写完的最终回答**丢弃**（不进 history），尾部仍是 user →
+补 user 中断标记。
+
+### 中断在 session log 里长什么样
+
+两条路径都留痕，都真跑出来了（下面两段是录制原文，节选）：
+
+```json
+{"ts": 0.41, "type": "user_input", "session": "01-sent-stop", "payload": {"text": "你好，用一句话介绍你自己"}, "note": "turn start"}
+{"ts": 0.63, "type": "user_interrupt", "session": "01-sent-stop", "payload": {"intent": "stop"}, "note": "interrupt received"}
+{"ts": 0.64, "type": "step_cancelled", "session": "01-sent-stop", "payload": {"intent": "stop"}, "note": "interrupt"}
+{"ts": 0.64, "type": "user_input", "session": "01-sent-stop", "payload": {"text": "[本轮已被用户中断，不要回答上面那条问题]", "synthetic": true}, "note": "marker"}
+{"ts": 0.64, "type": "turn_end", "session": "01-sent-stop", "payload": {"reason": "interrupted"}, "note": "interrupted"}
+```
+
+```json
+{"ts": 2.65, "type": "tool_result", "session": "09-tools-done-stop", "payload": {"tool_call_id": "call_wnn92g5u", "name": "search_rules", "result": "报销：月底 25 号前提交，超过 500 元要附发票原件。", "skipped": false}, "note": "tool result"}
+{"ts": 2.65, "type": "user_interrupt", "session": "09-tools-done-stop", "payload": {"intent": "stop"}, "note": "interrupt received"}
+{"ts": 2.65, "type": "agent_reply", "session": "09-tools-done-stop", "payload": {"message": {"role": "assistant", "content": "[本轮已被用户中断，不再基于上面的工具结果作答]"}, "synthetic": true}, "note": "marker"}
+{"ts": 2.65, "type": "turn_interrupted", "session": "09-tools-done-stop", "payload": {"intent": "stop"}, "note": "boundary"}
+{"ts": 2.65, "type": "turn_end", "session": "09-tools-done-stop", "payload": {"reason": "interrupted"}, "note": "interrupted"}
+```
+
+第一次是**掐掉了在飞的 step**（`step_cancelled`）；第二次是**边界命中**（`turn_interrupted`，
+此刻没有 step 可取消）。两次收尾形状不同（user 标记 / assistant 封口），但都落到 `turn_end`
+的同一个 `reason=interrupted` 上。注意补进去的那条消息也带 `synthetic: true`——**修复动作本身
+也是事实**，回放时能看出哪些消息是框架补的。
+
+中断请求本身（`user_interrupt`）无论命中与否都进 log——它是发生过的事实；是否命中由
+`step_cancelled` / `turn_interrupted` 有没有出现来判断。
 
 ## 从“停”到“转向”：本章后半的 redirect
 

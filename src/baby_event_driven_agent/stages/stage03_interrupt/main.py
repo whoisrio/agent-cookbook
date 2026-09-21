@@ -1,4 +1,4 @@
-"""Stage 3 演示：打断在飞的一步，以及掐完之后"结束"还是"原地转向"。
+"""Stage 3 演示：打断在飞的一步——按**命中落点**逐个看收尾形状。
 
 需要仓库根 .env 里的 OPENAI_API_KEY / OPENAI_API_BASE / OPENAI_MODEL
 （环境变量可覆盖，比如临时换模型：OPENAI_MODEL=qwen3.7-flash stage03-demo）。
@@ -8,15 +8,22 @@
 用户输入和中断信号都从 inbound 进来——中断只是另一种类型的命令，
 不额外订阅、也不经过 UI handler。
 
-四个动作，每个都在屏幕上说明"这一段在演示什么"：
-1. 完整一轮：worker 空闲 → 投递即开新 turn，走完"工具调用 → 流式回答"，
-   先确立 agent 正常可用。
-2. stop（停）：等它**真的发起工具调用**（tool_call_started，此刻 step 正在飞）
-   再按停止 → 在飞的那一步被掐掉，turn 以 interrupted 收尾，尾部补一条自描述的
-   中断标记；下一轮模型不会再翻出这条没答的问题重答。
-3. redirect（转向）：**和动作 2 同一个时机**，但意图是"原地转向" → turn 不结束，
-   已经观测到的半成品留在 history 里，纠正作为一条 user 消息，同一个 turn 里重发。
-4. 中断之后照常可用：worker 没死、history 完好，新问题开新 turn。
+先跑一轮完整问答确立 agent 可用，再按 books/event-driven-agent/03-interrupt.md
+的六个场景逐个演示（等中断信号落在目标那一格再按）：
+
+    场景 1  已发 LLM、未回复    —— 请求刚发出，一个增量都还没回
+    场景 2  只在吐 thinking    —— 还没吐可见文本
+    场景 3  要调工具、参数没吐完 —— 流里已有 tool_call_delta，工具没执行
+    场景 4  tool 执行中        —— 正在跑的等它跑完，没跑的补"未执行"占位
+    场景 5  tool 刚好跑完      —— 结果都拿到了，模型还没给最终回答
+    场景 6  回答只说了一半     —— 流里只有 text_delta
+
+每个场景演示一次 stop；场景 1–4 另演示一次 redirect（折标注 / 补空壳 /
+全丢+折标注 / 纯 steering）。case 名 = **编号 + 落点 + 意图**（`--list` 看全，名字即录制产物名，
+字典序就是演示顺序）。收尾只有一条规则：
+
+    stop     ：看**尾部角色**——尾部是 tool → 补 assistant 封口占位；否则 → 补 user 中断标记。
+    redirect ：一律补纠正 user；折不折 REDIRECT_NOTE，只看 assistant 输出有没有被截断。
 
 什么时候是 stop、什么时候是 redirect —— **由用户选，agent 不猜**：
 
@@ -26,10 +33,6 @@
     转向（改主意、接着干）{"intent": "redirect",          掐掉 + 补纠正 user，
                         "text": "…纠正内容…"}            turn 不结束，同 turn 重发
 
-"落在哪"只决定**收尾形状**（补中断标记 / 补 assistant 占位 / 补纠正 user），
-不决定意图。动作 2 和 3 故意用同一个时机、同一格（工具调用已在飞），唯一区别就是
-信封里的 intent —— 想说明"同一格，两个意图，两种收尾"。
-
 每一行都带**行首标签**，角色一眼分得开：
 
     用户 │ 用户说了什么
@@ -37,6 +40,7 @@
     LLM(回答) │ assistant 的可见输出（亮蓝流）
     LLM(要求执行工具) │ 模型要求调用的工具（绿色）
     执行工具 │ 工具真实执行与结果（绿色）
+    收尾 │ 这一段之后的 history 尾部（灰色 JSON）
     系统 │ 生命周期：掐掉 / 边界命中 / turn 结束（按 intent 上色）
     说明 │ 旁白，只解释这一段在演示什么（灰色缩进，不属于对话）
 
@@ -45,13 +49,15 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 from .agent import Agent
 from .events import Event, EventBus, SessionLog, t
-from .llm import RealLLM
+from .llm import TOOLS, RealLLM
 
 # ---------------------------------------------------------------- 屏幕上色
 # 与 stage01 / stage02 同一套底子：思考暗色、正文亮蓝、工具/生命周期绿色、
@@ -61,7 +67,7 @@ from .llm import RealLLM
 #   洋红 = 转向（intent=redirect，掐掉后原地重发）
 # 旁白单独用灰色，且只缩进不出现在对话流里——不再和"思考"共用一个暗色。
 DIM = "\033[2m"  # 思考内容
-GREY = "\033[90m"  # 旁白说明 / 收尾信息
+GREY = "\033[90m"  # 旁白说明 / 收尾信息 / history 尾部
 BLUE = "\033[94m"  # assistant 可见输出
 GREEN = "\033[32m"  # 工具调用与结果 / 正常 turn 收尾
 YELLOW = "\033[33m"  # 用户输入
@@ -71,6 +77,11 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 
 INTENT_COLOR = {"stop": RED, "redirect": MAGENTA}
+
+# 上限，防止 demo 无限等：worker 里模型一旦异常就发不出 turn_end；
+# 目标落点事件也可能这次压根没出现（比如模型不吐 thinking）。
+TURN_TIMEOUT = 90.0
+HIT_TIMEOUT = 30.0
 
 
 def line(label: str, color: str, text: str) -> None:
@@ -88,8 +99,8 @@ def note(text: str) -> None:
     print(f"{GREY}       说明 │ {text}{RESET}")
 
 
-def banner(n: int, title: str, what: str) -> None:
-    print(f"\n{BOLD}── 动作 {n}：{title} ──{RESET}")
+def banner(tag: str, title: str, what: str) -> None:
+    print(f"\n{BOLD}── {tag}：{title} ──{RESET}")
     note(what)
 
 
@@ -98,30 +109,102 @@ def brief(text: str, limit: int = 140) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
-async def _wait_any(*events: asyncio.Event) -> None:
-    """等其中任意一个先发生。"""
-    waiters = [asyncio.ensure_future(e.wait()) for e in events]
-    await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-    for waiter in waiters:
-        waiter.cancel()
+@dataclass(frozen=True)
+class Case:
+    """一段可单独执行的演示：等中断落在 landing 这一格，再发 intent。
+
+    landing / intent 为空表示基准（完整一轮，不发中断）。"""
+
+    id: str
+    tag: str
+    title: str
+    question: str
+    landing: str = ""
+    intent: str = ""
+    note: str = ""
+    redirect_text: str = ""
 
 
-async def main() -> None:
-    # session log 落在包级 sessions/ 目录，按 stage 分目录
-    sessions_dir = Path(__file__).resolve().parents[2] / "sessions" / "stage03"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    log_path = str(sessions_dir / "session.jsonl")
+# case 名是 `两位编号-落点-意图`（如 07-tool-running-stop = 工具执行中被 stop）：
+# 编号让**文件名字典序 = 演示顺序**，语义部分说明"在演示哪一格"；整串也是录制产物名。
+CASES: tuple[Case, ...] = (
+    Case(
+        "00-baseline", "基准", "完整一轮", "保温杯还有库存吗",
+        note="worker 空闲，投递即开新 turn：工具调用 + 流式回答走完，确立 agent 可用。",
+    ),
+    Case(
+        "01-sent-stop", "场景 1", "已发 LLM、未回复 —— stop", "你好，用一句话介绍你自己",
+        "immediate", "stop",
+        note="还没有任何输出可留；尾部是没被回答的 user → 补 user 中断标记。",
+    ),
+    Case(
+        "02-sent-redirect", "场景 1", "已发 LLM、未回复 —— redirect", "你好，用一句话介绍你自己",
+        "immediate", "redirect",
+        redirect_text="别自我介绍了，改成说说报销规定",
+        note="同一个落点、只差 intent：turn 不结束，补一条折了 REDIRECT_NOTE 的纠正 user。",
+    ),
+    Case(
+        "03-thinking-stop", "场景 2", "只在吐 thinking —— stop",
+        "报销和 VPN 分别怎么申请？先想清楚再决定查什么", "thinking", "stop",
+        note="thinking 不进 history，尾部仍是 user → 同场景 1，补 user 中断标记。",
+    ),
+    Case(
+        "04-thinking-redirect", "场景 2", "只在吐 thinking —— redirect",
+        "报销和 VPN 分别怎么申请？先想清楚再决定查什么", "thinking", "redirect",
+        redirect_text="先别查了，改成订会议室",
+        note="redirect 先补一个 assistant 空壳占位（只声明被打断，不回灌思维链），再补折标注的纠正 user。",
+    ),
+    Case(
+        "05-toolcall-stop", "场景 3", "要调工具、参数还没吐完 —— stop", "报销有什么规定",
+        "tool_start", "stop",
+        note="半截 tool_call 不是合法消息、也没执行过 → 整步丢，尾部补 user 中断标记。",
+    ),
+    Case(
+        "06-toolcall-redirect", "场景 3", "要调工具、参数还没吐完 —— redirect", "报销有什么规定",
+        "tool_start", "redirect", redirect_text="先别查了，改成订会议室",
+        note="没收到完整返回就当没收到：半截 tool_call 整步丢，只补折标注的纠正 user。",
+    ),
+    Case(
+        "07-tool-running-stop", "场景 4", "tool 执行中 —— stop", "报销和 VPN 分别有什么规定，都要查",
+        "tool_running", "stop",
+        note="在跑的等它跑完；没开始的补「未执行」占位；尾部停在 tool → 补 assistant 封口占位。",
+    ),
+    Case(
+        "08-tool-running-redirect", "场景 4", "tool 执行中 —— redirect", "报销和 VPN 分别有什么规定，都要查",
+        "tool_running", "redirect", redirect_text="先别查了，改成订会议室",
+        note="同上，只差最后一条：不放封口，换成纯纠正 user（工具阶段 = steering，不加标注）。",
+    ),
+    Case(
+        "09-tools-done-stop", "场景 5", "tool 刚好跑完 —— stop", "报销有什么规定",
+        "tool_done", "stop",
+        note="工具结果都真拿到了；尾部停在 tool → 补 assistant 封口占位（不是因为残缺，是 turn 要收口）。",
+    ),
+    Case(
+        "10-half-answer-stop", "场景 6", "回答只说了一半 —— stop", "你好，用一句话讲个关于程序的冷笑话",
+        "text", "stop",
+        note="半句没写完的最终回答丢弃；尾部仍是 user → 补 user 中断标记。",
+    ),
+)
+
+CASE_IDS = tuple(c.id for c in CASES)
+
+
+async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = None) -> None:
+    # session log 默认落在包级 sessions/stage03/；录制的 runner 会传自己的目录进来
+    base_dir = sessions_dir or (Path(__file__).resolve().parents[2] / "sessions" / "stage03")
+    base_dir.mkdir(parents=True, exist_ok=True)
+    log_path = str(base_dir / "session.jsonl")
     bus = EventBus()
     log = SessionLog(log_path)
     agent = Agent(bus, log, RealLLM())
 
     turn_done = asyncio.Event()
-    tool_started = asyncio.Event()
     # 最近一次用户动作的意图：命中行和 turn 收尾行都用它的颜色
     pressed = ["stop"]
     # 上一条流式增量属于哪路：思考/正文切换时换行重新起标签
     last_kind = [""]
 
+    # ------------------------------------------------------- 屏幕：订阅 outbound
     async def ui_thinking(e: Event) -> None:
         if last_kind[0] != "thinking":
             stream_head("思考", DIM)
@@ -153,9 +236,6 @@ async def main() -> None:
         else:
             line("执行工具", GREEN, f"← {p['name']} 结果：{brief(p['result'])}")
 
-    async def ui_tool_start(e: Event) -> None:
-        tool_started.set()
-
     async def ui_step_cancelled(e: Event) -> None:
         last_kind[0] = ""
         intent = e.payload.get("intent", "stop")
@@ -186,105 +266,193 @@ async def main() -> None:
     bus.subscribe("agent_delta", ui_delta)
     bus.subscribe("agent_reply", ui_reply)
     bus.subscribe("tool_result", ui_tool_result)
-    bus.subscribe("tool_call_started", ui_tool_start)
     bus.subscribe("step_cancelled", ui_step_cancelled)
     bus.subscribe("turn_interrupted", ui_turn_interrupted)
     bus.subscribe("turn_end", ui_turn_end)
 
-    print(f"{BOLD}Stage 3：打断在飞的一步 —— interrupt（停）与 redirect（转向）{RESET}")
+    # ------------------------------------------------------- 落点探测
+    # 把每个 session 关心的事件收进队列，demo 用它决定"什么时候发中断"。
+    seen: dict[tuple[str, str], asyncio.Queue] = {}
 
-    # ------------------------------------------------------------- 动作 1
-    banner(
-        1,
-        "完整一轮",
-        "worker 空闲，投递即开新 turn：工具调用 + 流式回答，先确立 agent 正常可用。",
-    )
-    line("用户", YELLOW, "保温杯还有库存吗")
-    bus.publish(
-        Event("user_input", "A", {"text": "保温杯还有库存吗"}), to=agent.agent_id
-    )
-    await turn_done.wait()
-    turn_done.clear()
+    async def record(e: Event) -> None:
+        q = seen.get((e.session_id, e.type))
+        if q is not None:
+            q.put_nowait(e)
 
-    # ------------------------------------------------------------- 动作 2
-    banner(
-        2,
-        "stop（intent=stop）：掐掉在飞的一步，turn 结束",
-        "等它真的发起工具调用（tool_call_started，step 正在飞）再按停止。"
-        "预期：一行「已掐掉在飞的那一步」+ turn 以 interrupted 收尾。"
-        "下一动手势完全一样，只有信封里的 intent 不同。",
-    )
-    line("用户", YELLOW, "报销有什么规定")
-    bus.publish(
-        Event("user_input", "A", {"text": "报销有什么规定"}), to=agent.agent_id
-    )
-    tool_started.clear()
-    await _wait_any(tool_started, turn_done)
-    if tool_started.is_set() and not turn_done.is_set():
-        line("用户", RED, "按下停止（intent=stop）")
-        pressed[0] = "stop"
-        bus.publish(Event("user_interrupt", "A", {"intent": "stop"}), to=agent.agent_id)
-        await turn_done.wait()
-    else:
-        note("模型没调工具就答完了，没赶上中断窗口")
-    turn_done.clear()
+    for name in ("agent_thinking", "agent_delta", "tool_call_started", "tool_result"):
+        bus.subscribe(name, record)
 
-    # ------------------------------------------------------------- 动作 3
-    banner(
-        3,
-        "redirect（intent=redirect）：掐掉后原地转向",
-        "和动作 2 同一时机、同一格，只差 intent。预期：turn 不结束，半成品留在"
-        "history，纠正作为一条 user 消息，同一个 turn 里重发。",
-    )
-    line("用户", YELLOW, "会议室怎么预订")
-    bus.publish(
-        Event("user_input", "A", {"text": "会议室怎么预订"}), to=agent.agent_id
-    )
-    tool_started.clear()
-    await _wait_any(tool_started, turn_done)
-    if tool_started.is_set() and not turn_done.is_set():
-        line("用户", MAGENTA, "改主意（intent=redirect）：先别查会议室了，改成查报销规定")
-        pressed[0] = "redirect"
-        # 中断也是 inbound 命令：和用户输入同一个收件地址，只是类型是
-        # user_interrupt，投递函数不会把它塞进收件箱排队。
-        bus.publish(
-            Event(
-                "user_interrupt",
-                "A",
-                {"intent": "redirect", "text": "先别查会议室了，改成查报销规定"},
-            ),
-            to=agent.agent_id,
+    def watch(sid: str, *types: str) -> None:
+        for typ in types:
+            seen[(sid, typ)] = asyncio.Queue()
+
+    async def until(sid: str, typ: str) -> None:
+        await asyncio.wait_for(seen[(sid, typ)].get(), timeout=HIT_TIMEOUT)
+
+    # 场景 4 要一个"进去后卡住"的慢工具：正在跑的才等得及，没开始的才有占位。
+    real_search = TOOLS["search_rules"]
+    gate_in, gate_open = asyncio.Event(), asyncio.Event()
+
+    async def gated_search(args: dict) -> str:
+        gate_in.set()
+        await gate_open.wait()
+        return await real_search(args)
+
+    LANDING_EVENT = {
+        "thinking": "agent_thinking",
+        "tool_start": "tool_call_started",
+        "tool_done": "tool_result",
+        "text": "agent_delta",
+    }
+    LANDING_WHAT = {
+        "immediate": "请求刚发出、一个增量都还没回（已发 LLM、未回复）",
+        "thinking": "只吐了 thinking，可见文本一个字都还没有",
+        "tool_start": "流里已出现 tool_call_delta（要调工具，参数没吐完、工具没执行）",
+        "tool_running": "工具正在执行（在跑的等它跑完）",
+        "tool_done": "工具已经拿到结果，模型还没给最终回答",
+        "text": "模型在写最终回答、只说了一半",
+    }
+
+    async def hit(sid: str, landing: str) -> None:
+        """等到目标落点——就是发中断的时机。没等到就按此刻发（尽力而为）。"""
+        try:
+            if landing == "immediate":
+                await asyncio.sleep(0.05)  # 请求已发出，首个增量还没回来
+            elif landing == "tool_running":
+                await asyncio.wait_for(gate_in.wait(), timeout=HIT_TIMEOUT)
+            else:
+                await until(sid, LANDING_EVENT[landing])
+        except asyncio.TimeoutError:
+            note("没等到目标落点，就在此刻发中断（尽力而为）")
+
+    def dump_tail(sid: str) -> None:
+        msgs = [m for m in agent.history.get(sid, []) if m.get("role") != "system"]
+        for msg in msgs:
+            print(f"{GREY}  {json.dumps(msg, ensure_ascii=False)}{RESET}")
+
+    async def scenario(case: Case) -> None:
+        """投一句问题 → 等落点 → 发中断 → 等收尾 → 打 history 尾部。"""
+        sid = case.id
+        watch(sid, "agent_thinking", "agent_delta", "tool_call_started", "tool_result")
+        banner(
+            f"{case.tag} · {case.id}",
+            case.title,
+            f"命中落点：{LANDING_WHAT[case.landing]}；意图：{case.intent}",
         )
-    else:
-        note("没赶上窗口，这一轮按普通问答结束")
-    await turn_done.wait()
-    turn_done.clear()
+        pressed[0] = case.intent
+        line("用户", YELLOW, f"[{sid}] {case.question}")
+        turn_done.clear()
+        bus.publish(Event("user_input", sid, {"text": case.question}), to=agent.agent_id)
 
-    # ------------------------------------------------------------- 动作 4
-    banner(
-        4,
-        "中断之后照常可用",
-        "worker 没死、history 完好：新问题开新 turn，正常答完。",
-    )
-    line("用户", YELLOW, "顺便说说VPN怎么申请")
-    bus.publish(
-        Event("user_input", "A", {"text": "顺便说说VPN怎么申请"}), to=agent.agent_id
-    )
-    await turn_done.wait()
+        await hit(sid, case.landing)
+        if case.intent == "stop":
+            line("用户", RED, "按下停止（intent=stop）")
+            bus.publish(Event("user_interrupt", sid, {"intent": "stop"}), to=agent.agent_id)
+        else:
+            line("用户", MAGENTA, f"改主意（intent=redirect）：{case.redirect_text}")
+            bus.publish(
+                Event(
+                    "user_interrupt",
+                    sid,
+                    {"intent": "redirect", "text": case.redirect_text},
+                ),
+                to=agent.agent_id,
+            )
+        if case.landing == "tool_running":
+            await asyncio.sleep(0)  # 让中断信号先落地：工具那一段不掐
+            gate_open.set()  # 放行正在跑的工具
+        try:
+            await asyncio.wait_for(turn_done.wait(), timeout=TURN_TIMEOUT)
+        except asyncio.TimeoutError:
+            note("等 turn_end 超时")
+
+        line("收尾", GREY, f"[{sid}] 完整 history（已略去 system）")
+        dump_tail(sid)
+
+    async def run_baseline(case: Case) -> None:
+        """基准：完整一轮，不发中断。"""
+        banner(
+            f"{case.tag} · {case.id}",
+            case.title,
+            "worker 空闲，投递即开新 turn：工具调用 + 流式回答。",
+        )
+        sid = case.id
+        watch(sid, "agent_thinking", "agent_delta", "tool_call_started", "tool_result")
+        line("用户", YELLOW, f"[{sid}] {case.question}")
+        turn_done.clear()
+        bus.publish(Event("user_input", sid, {"text": case.question}), to=agent.agent_id)
+        try:
+            await asyncio.wait_for(turn_done.wait(), timeout=TURN_TIMEOUT)
+        except asyncio.TimeoutError:
+            note("等 turn_end 超时")
+        line("收尾", GREY, f"[{sid}] 完整 history（已略去 system）")
+        dump_tail(sid)
+
+    print(f"{BOLD}Stage 3：打断在飞的一步 —— 按命中落点逐个看收尾{RESET}")
+
+    selected = [c for c in CASES if not case_ids or c.id in case_ids]
+    if not selected:
+        note(f"没有匹配的 case：{case_ids}；可选：{', '.join(CASE_IDS)}")
+        await agent.stop()
+        return
+    if case_ids:
+        note(f"只跑：{', '.join(c.id for c in selected)}")
+
+    for case in selected:
+        # 场景 4 要一个"进去后卡住"的慢工具，只在跑它时替换
+        if case.landing == "tool_running":
+            gate_in.clear()
+            gate_open.clear()
+            TOOLS["search_rules"] = gated_search
+        try:
+            if case.intent:
+                await scenario(case)
+            else:
+                await run_baseline(case)
+        finally:
+            if case.landing == "tool_running":
+                TOOLS["search_rules"] = real_search
+        if case.note:
+            note(case.note)
 
     await agent.stop()
-
-    print(f"\n{BOLD}── history 尾部（中断标记 / 纠正消息的实际长相）──{RESET}")
-    for msg in agent.history["A"][-4:]:
-        print(f"{GREY}  {json.dumps(msg, ensure_ascii=False)}{RESET}")
+    print(f"\n{BOLD}── 收尾 ──{RESET}")
+    note("中断只动在飞的那一步：worker 没死、history 完好，不影响下一轮。")
     line("系统", GREEN, "demo 结束")
     print(f"{GREY}  session log: {log_path}{RESET}")
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
-
-
 def cli() -> None:
-    """[project.scripts] 入口：stage03-demo。"""
-    asyncio.run(main())
+    """[project.scripts] 入口：stage03-demo。
+
+    用法：
+        stage03-demo                       # 跑全部 case
+        stage03-demo 07-tool-running-stop  # 只跑指定 case（名字见 --list）
+        stage03-demo --list                # 列出 case 及其说明（不加载模型配置）
+        stage03-demo 09-tools-done-stop --sessions-dir <目录>   # 换 session log 落点
+    """
+    parser = argparse.ArgumentParser(
+        prog="stage03-demo", description="Stage 3 中断演示：按命中落点逐个看收尾。"
+    )
+    parser.add_argument(
+        "cases", nargs="*", metavar="CASE", help="只跑指定 case（默认全部）；--list 看可选值"
+    )
+    parser.add_argument("--list", action="store_true", help="列出所有 case 后退出")
+    parser.add_argument(
+        "--sessions-dir", default=None, help="session log 落点（默认 sessions/stage03）"
+    )
+    args = parser.parse_args()
+    if args.list:
+        for case in CASES:
+            what = f"{case.tag} · {case.title}"
+            if case.note:  # 说明这个 case 看完该记住哪一条规则
+                what += f"｜{case.note}"
+            print(f"{case.id}\t{what}")
+        return
+    asyncio.run(
+        main(args.cases or None, Path(args.sessions_dir) if args.sessions_dir else None)
+    )
+
+
+if __name__ == "__main__":
+    cli()

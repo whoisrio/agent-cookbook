@@ -13,7 +13,8 @@ Stage 1 有个预设的边界：一次处理一个请求。真实用户不会遵
 
 市面上绝大多数 agent 都支持这两种能力，比如 workbuddy、claude code。
 
->差几张followup和steering的截图
+> 这两种能力在真实运行里长什么样，见本章末尾「跑一下」一节的三段录像
+> （`01-idle-turn` / `02-followup` / `03-steering`）。
 
 所以 Stage 2，咱们就给这个事件驱动的 agent，添加上 followup 和 steering 的能力。
 
@@ -149,74 +150,77 @@ turn_end 在这一章也升级成了真事件：stage 1时，用户消息的事�
 
 ## 跑一下（真实 LLM 实测输出）
 
-三个动作：问保温杯（完整一个 turn）；紧接着问报销（worker 已空闲 →
-followup，立刻开新 turn，且它的答案不在第一轮检索结果里，模型必然发起
-search）；趁报销这轮**工具调用正在飞**时插话 VPN。
+终端实录（`.cast` → gif，同目录有 `.mp4` 和 `index.json`）。三个动作是一条线上的叙事，
+所以 case 是**累积**的，名字是 `两位编号-语义名`（编号让文件名字典序 = 演示顺序，
+语义名说明跑到哪一步）：
 
-插话时机不是 sleep 碰运气，是事件驱动的：agent 在第一个工具调用增量到达时
-发 `tool_call_started` 事件，demo 等到它才插话——此刻 step 确定在飞，
-后面还有增量、工具执行、下一个 step 边界，drain 必然有机会捞到。
-但"发得早"不保证"被 steering 消化"：若插话落在最后一个 drain 点之后
-（临界降级），worker 会在 turn 结束后把它当 followup 取走。两种结局
+```
+stage02-demo 01-idle-turn     # 动作 1
+stage02-demo 02-followup      # 动作 1-2
+stage02-demo 03-steering      # 动作 1-3（= 全部，默认）
+```
+
+插话时机不是 sleep 碰运气，是事件驱动的：agent 在第一个工具调用增量到达时发
+`tool_call_started`，demo 等到它才插话——此刻 step 确定在飞，后面还有增量、工具执行、
+下一个 step 边界，drain 必然有机会捞到。但"发得早"不保证"被 steering 消化"：若插话落在
+最后一个 drain 点之后（临界降级），worker 会在 turn 结束后把它当 followup 取走。两种结局
 demo 都会在屏幕上如实打出来（★ steering 生效 / 降级行），肉眼可辨。
 
-本次实测（`OPENAI_MODEL=qwen3.7-flash stage02-demo`）：
+### 01-idle-turn：空闲时投递，走完完整一轮
 
-> 记录待更新：下面这段输出录于工具集还是 read/write/search 的早期版本（所以看到
-> `search`），当前代码暴露的是 `query_inventory` / `search_rules` 等。事件序列与
-> steering 行为不受影响，但工具名对不上——待用当前代码复跑后替换。
+![01-idle-turn：完整一轮](../../src/baby_event_driven_agent/rec/stage02/docs/01-idle-turn.gif)
+
+worker 空闲 → 投递即开新 turn：`query_inventory` + 流式回答，一轮有头有尾。
+
+### 02-followup：紧接着再问，排队成 followup
+
+![02-followup：排到当前 turn 之后](../../src/baby_event_driven_agent/rec/stage02/docs/02-followup.gif)
+
+第二问（报销）紧接着第一问发出。它的答案不在第一轮检索结果里，模型必然发起
+`search_rules`——这一条是给动作 3 铺的"工具一定会在飞"。
+
+### 03-steering：工具在飞时插话
+
+![03-steering：插话被 drain 进当前 turn](../../src/baby_event_driven_agent/rec/stage02/docs/03-steering.gif)
+
+屏幕上的 ★ 就是 steering 的可视化瞬间：
 
 ```text
-[ 0.32s] (A) 用户输入：保温杯还有库存吗
-
-[ 5.29s] (A) → 工具调用：search({"query": "保温杯 库存"})
-是的，保温杯还有库存。目前库存有 42 件。
-[ 8.00s] (A) —— 回答完毕
-
-[ 8.00s] (A) 用户接着问：报销有什么规定
-
-[10.68s] (A) 用户插话（此刻工具调用正在飞）：顺便说说VPN怎么申请
-
-[10.92s] (A) → 工具调用：search({"query": "报销 规定"})
-
-[10.92s] (A) ★ steering 生效：「顺便说说VPN怎么申请」拼进当前 turn 的上下文，不开新 turn
-
-[18.38s] (A) → 工具调用：search({"query": "VPN 申请"})
-关于报销和 VPN 申请的规定如下：……
-[20.60s] (A) —— 回答完毕
+[ 9.10s] 用户 │ 用户插话（此刻工具调用正在飞）：顺便说说VPN怎么申请
+[ 9.15s] LLM(要求执行工具) │ → search_rules({"query":"报销"})
+[ 9.15s] 系统 │ ★ steering 生效：「顺便说说VPN怎么申请」拼进当前 turn 的上下文，不开新 turn
+[11.32s] LLM(要求执行工具) │ → search_rules({"query":"VPN 申请"})
 ```
 
-★ 那一行就是 steering 的可视化瞬间：10.68s 发出的插话，在 10.92s 的
-step 边界被 drain 进当前上下文——模型随后**自己发起了一次
-`search("VPN 申请")`**，最后在同一轮里把两个问题一起答了。
-分类、排队、拼上下文，全程没有一行代码写死"这是插话"。
+插话在 step 边界被 drain 进当前上下文，模型随后**自己发起了一次
+`search_rules({"query":"VPN 申请"})`**，最后在同一轮里把两个问题一起答了。分类、排队、
+拼上下文，全程没有一行代码写死"这是插话"。
 
-真实运行里两种结局都出现过。另一次实测中，同样的插话晚了约 10 毫秒——
-worker 在 tool_call 回复后原子地跑完了"执行工具 + step 边界 drain"，
-插话落在了最后一个 drain 点之后：屏幕上没有 ★，turn 收尾也没带上它，
-它作为 followup 开了新 turn。这正是插话语义的边界：**steering 的意义
-只存在于"当前 turn 还活着且尚未越过最后一个 drain 点"的时候**，
-错过窗口就自然降级成普通用户消息——没有任何特殊代码处理"降级"，
-worker 的下一次 `inbox.get()` 天然接住。
-
-session log 把这个故事记得更清楚（节选，本次 ★ 命中的那轮）：
+session log 把这件事记得更清楚（这一轮的原文，节选）：
 
 ```json
-{"ts": 8.0, "type": "user_input", "session": "A", "payload": {"text": "报销有什么规定"}, "note": "turn start"}
-{"ts": 10.92, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": null, "tool_calls": [{"function": {"name": "search", "arguments": "{\"query\": \"报销 规定\"}"}}]}}, "note": "tool_call"}
-{"ts": 10.68, "type": "user_input", "session": "A", "payload": {"text": "顺便说说VPN怎么申请"}, "note": "steering"}
-{"ts": 18.38, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": null, "tool_calls": [{"function": {"name": "search", "arguments": "{\"query\": \"VPN 申请\"}"}}]}}, "note": "tool_call"}
+{"ts": 6.88, "type": "user_input", "session": "A", "payload": {"text": "报销有什么规定"}, "note": "turn start"}
+{"ts": 9.15, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": null, "tool_calls": [{"id": "call_qcgztvh1", "type": "function", "function": {"name": "search_rules", "arguments": "{\"query\":\"报销\"}"}}]}}, "note": "tool_call"}
+{"ts": 9.15, "type": "tool_result", "session": "A", "payload": {"tool_call_id": "call_qcgztvh1", "name": "search_rules", "result": "报销：月底 25 号前提交，超过 500 元要附发票原件。"}, "note": "tool result"}
+{"ts": 9.1, "type": "user_input", "session": "A", "payload": {"text": "顺便说说VPN怎么申请"}, "note": "steering"}
+{"ts": 11.32, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": null, "tool_calls": [{"id": "call_vwl61ffb", "type": "function", "function": {"name": "search_rules", "arguments": "{\"query\":\"VPN 申请\"}"}}]}}, "note": "tool_call"}
+{"ts": 18.08, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": "目前报销和VPN申请的规定如下：……"}}, "note": "final"}
 ```
 
-第三行值得盯 10 秒：它的 `ts` 是 10.68——消息**到达**的时刻——却排在
-10.92 的记录后面，因为 log 按消费顺序追加，它是在 step 边界被 drain 的
-那一刻写进去的。到达时间和消费时间是两个时刻，这一行就是"分类权在
-消费端"的字面证据。
+倒数第三行值得盯 10 秒：它的 `ts` 是 9.1——消息**到达**的时刻——却排在 9.15 的记录后面，
+因为 log 按消费顺序追加，它是在 step 边界被 drain 的那一刻写进去的。到达时间和消费时间是
+两个时刻，这一行就是"分类权在消费端"的字面证据。
 
-这轮的完整序列也值得看一眼——assistant → tool_result → （steering
-拼进来）→ assistant → tool_result → assistant，四步一个 turn：
-报销的检索结果刚回来，插话已经在上下文里，模型决定再检索一次 VPN，
-最后一条 assistant 把两件事一起答完。
+真实运行里两种结局都出现过。另一次实测中，同样的插话晚了约 10 毫秒——worker 在 tool_call
+回复后原子地跑完了"执行工具 + step 边界 drain"，插话落在了最后一个 drain 点之后：屏幕上
+没有 ★，turn 收尾也没带上它，它作为 followup 开了新 turn。这正是插话语义的边界：
+**steering 的意义只存在于"当前 turn 还活着且尚未越过最后一个 drain 点"的时候**，错过窗口
+就自然降级成普通用户消息——没有任何特殊代码处理"降级"，worker 的下一次 `inbox.get()`
+天然接住。
+
+这轮的完整序列也值得看一眼——assistant → tool_result →（steering 拼进来）→ assistant →
+tool_result → assistant，四步一个 turn：报销的检索结果刚回来，插话已经在上下文里，模型决定
+再检索一次 VPN，最后一条 assistant 把两件事一起答完。
 
 ## 设计边界，以及下一章的需求
 

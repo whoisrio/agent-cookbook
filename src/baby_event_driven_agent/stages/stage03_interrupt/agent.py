@@ -332,22 +332,7 @@ class Agent:
                     )
                     await self._mark_boundary(sid, "redirect")
                     continue
-                # stop 的封口：尾部是 tool 结果就补 assistant 占位，
-                # 否则补那条 user 中断标记。
-                if history and history[-1].get("role") == "tool":
-                    self._append_synth(
-                        sid,
-                        history,
-                        {"role": "assistant", "content": STOP_CLOSER},
-                        "marker",
-                    )
-                else:
-                    self._append_synth(
-                        sid,
-                        history,
-                        {"role": "user", "content": STOP_MARKER},
-                        "marker",
-                    )
+                self._close_stop(sid, history)
                 await self._mark_boundary(sid, "stop")
                 await self._end_turn(sid, "interrupted")
                 return
@@ -397,29 +382,11 @@ class Agent:
         """
         text = pending.get("text")
         if pending.get("intent") == "redirect" and text:
-            # 半成品按已观测事实补进 history，再补一条带标注的纠正 user。
-            calls = partial.get("tool_calls") or {}
-            parts = partial.get("text_parts") or []
-            if calls:
-                self._append_synth(
-                    sid, history, self._partial_assistant(partial), "interrupted"
-                )
-                for call in history[-1]["tool_calls"]:
-                    self._append_synth(
-                        sid,
-                        history,
-                        {"role": "tool", "tool_call_id": call["id"], "content": NO_EXEC},
-                        "tool skipped",
-                        tool_name=call["function"]["name"],
-                    )
-            elif parts:
-                self._append_synth(
-                    sid,
-                    history,
-                    {"role": "assistant", "content": "".join(parts)},
-                    "interrupted",
-                )
-            elif partial.get("thinking_seen"):
+            # ①②③ 一个处理：没收到完整的 LLM 返回，就当没收到——在飞 step 的产物
+            # 一律丢（可见文本、半截 tool_call 都不进 history）。半截 tool_call 的
+            # arguments 断在半路、不是合法消息，也没执行过，补不了占位。
+            # 唯一留痕：只吐过 thinking 时补个空壳 assistant，声明这里被打断过。
+            if partial.get("thinking_seen"):
                 self._append_synth(
                     sid,
                     history,
@@ -435,29 +402,26 @@ class Agent:
             return True
         # 掐在飞这一路不再发 turn_interrupted——那个事件的定义是"step 没被取消、
         # 只命中边界"；这里命中已经由上面的 step_cancelled 记过了。
-        self._append_synth(
-            sid, history, {"role": "user", "content": STOP_MARKER}, "marker"
-        )
+        self._close_stop(sid, history)
         await self._end_turn(sid, "interrupted")
         return False
 
-    @staticmethod
-    def _partial_assistant(partial: dict[str, Any]) -> dict[str, Any]:
-        """把取消那一刻累积到的 tool_calls 拼成一条 assistant 消息。"""
-        calls: dict[int, dict[str, str]] = partial.get("tool_calls") or {}
-        text = "".join(partial.get("text_parts") or [])
-        return {
-            "role": "assistant",
-            "content": text or None,
-            "tool_calls": [
-                {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {"name": tc["name"], "arguments": tc["args"]},
-                }
-                for _, tc in sorted(calls.items())
-            ],
-        }
+    def _close_stop(self, sid: str, history: list[dict[str, Any]]) -> None:
+        """stop 的收口形状，**只在这一处决定**——边界命中和掐在飞两条路共用。
+
+        按**尾部角色**选封口：尾部是 `tool`（工具结果没人接）就补 assistant
+        封口占位；否则补那条 user 中断标记（尾部是没被回答的 user，不补的话
+        下一轮模型会把它翻出来重答）。场景 4/5 尾部必然是 `tool`，所以都补
+        assistant 封口——这跟"tool 完不完整"无关，是 turn 结束要收口。
+        """
+        if history and history[-1].get("role") == "tool":
+            self._append_synth(
+                sid, history, {"role": "assistant", "content": STOP_CLOSER}, "marker"
+            )
+        else:
+            self._append_synth(
+                sid, history, {"role": "user", "content": STOP_MARKER}, "marker"
+            )
 
     async def _mark_boundary(self, sid: str, intent: str) -> None:
         """边界命中：step 没被取消，但 turn 在这里被收掉 / 转向。"""

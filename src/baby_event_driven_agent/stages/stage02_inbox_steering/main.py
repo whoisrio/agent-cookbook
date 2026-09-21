@@ -27,6 +27,7 @@ LLM(要求执行工具) │、执行工具 │、系统 │。本章多出两类
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 from pathlib import Path
 
@@ -65,11 +66,32 @@ def brief(text: str, limit: int = 140) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
-async def main() -> None:
+def banner(name: str, what: str) -> None:
+    """每个 case 开头一行：`── <case 名>：这个 case 在看什么 ──`。
+
+    名字就是录制产物名（`rec/stage02/<run>/<name>.gif`），看片时对得上。"""
+    print(f"\n{BOLD}── {name}：{what} ──{RESET}")
+
+
+# 三个动作是一条线上的叙事（动作 3 的逻辑在等动作 2 的 turn），所以 case 是**累积**的；
+# 名字是 `两位编号-语义名`：编号让文件名字典序 = 演示顺序，语义名说明跑到哪一步。
+#   01-idle-turn = 动作 1；02-followup = 动作 1-2；03-steering = 动作 1-3（= 全部，默认）
+CASE_ORDER = ("01-idle-turn", "02-followup", "03-steering")
+CASE_TITLES = {
+    "01-idle-turn": "动作 1：worker 空闲时投递 → 立刻开新 turn，工具调用 + 流式回答走完",
+    "02-followup": "动作 1-2：紧接着再问 → 排队成 followup，等当前 turn 结束再开新 turn",
+    "03-steering": "动作 1-3：等工具真的在飞时插话 → 被 drain 进当前 turn（steering）；"
+    "错过窗口则降级为 followup（屏幕上可辨）",
+}
+ALL_TITLE = "三个动作全跑（等于 03-steering 那一档：完整一轮 + followup + steering，不编号）"
+CASE_IDS = ("all", *CASE_ORDER)
+
+
+async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = None) -> None:
     # session log 落在包级 sessions/ 目录，按 stage 分目录
-    sessions_dir = Path(__file__).resolve().parents[2] / "sessions" / "stage02"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    log_path = str(sessions_dir / "session.jsonl")
+    base_dir = sessions_dir or (Path(__file__).resolve().parents[2] / "sessions" / "stage02")
+    base_dir.mkdir(parents=True, exist_ok=True)
+    log_path = str(base_dir / "session.jsonl")
     bus = EventBus()
     log = SessionLog(log_path)
     agent = Agent(bus, log, RealLLM())
@@ -133,24 +155,48 @@ async def main() -> None:
     bus.subscribe("steering_consumed", ui_steering)
     bus.subscribe("turn_end", ui_turn_end)
 
+    picked = [c for c in CASE_ORDER if not case_ids or "all" in case_ids or c in case_ids]
+    if not picked:
+        line("系统", GREEN, f"没有匹配的 case：{case_ids}；可选：{', '.join(CASE_IDS)}")
+        return
+    upto = CASE_ORDER.index(picked[-1]) + 1
+    if case_ids:
+        line("系统", GREEN, f"只跑：{', '.join(picked)}")
+
+    async def finish() -> None:
+        await agent.stop()
+        line("系统", GREEN, "demo 结束")
+        print(f"{GREY}  session log: {log_path}{RESET}")
+
     # 1. 第一问：worker 空闲，投递即开新 turn
+    banner("01-idle-turn", CASE_TITLES["01-idle-turn"])
     line("用户", YELLOW, "保温杯还有库存吗")
     bus.publish(Event("user_input", "A", {"text": "保温杯还有库存吗"}), to=agent.agent_id)
     await turn_done.wait()
     turn_done.clear()
     tool_started.clear()  # 第一轮的 search 也发过 tool_call_started，作废
+    if upto == 1:
+        await finish()
+        return
 
     # 2. 第二问：紧接着发，worker 已空闲 → followup，立刻开新 turn。
     #    故意选报销——它的答案不在第一轮检索结果里，模型必然发起 search。
+    banner("02-followup", CASE_TITLES["02-followup"])
     line("用户", CYAN, "用户接着问：报销有什么规定")
     bus.publish(
         Event("user_input", "A", {"text": "报销有什么规定"}), to=agent.agent_id
     )
+    if upto == 2:
+        await turn_done.wait()  # 等这一轮跑完
+        turn_done.clear()
+        await finish()
+        return
 
     # 3. 确定性插话：等报销这轮真的发起工具调用（step 正在飞）才发。
     #    但"发得早"不保证"被 steering 消化"——若它落在最后一个 drain 点
     #    之后（临界降级），worker 会在 turn 结束后把它当 followup 取走。
     #    两种结局屏幕上都可见：★ steering 生效 / 降级行。
+    banner("03-steering", CASE_TITLES["03-steering"])
     tool_wait = asyncio.ensure_future(tool_started.wait())
     turn_wait = asyncio.ensure_future(turn_done.wait())
     await asyncio.wait(
@@ -175,15 +221,32 @@ async def main() -> None:
         turn_done.clear()
         await turn_done.wait()
 
-    await agent.stop()
-    line("系统", GREEN, "demo 结束")
-    print(f"{GREY}  session log: {log_path}{RESET}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    await finish()
 
 
 def cli() -> None:
-    """[project.scripts] 入口：stage02-demo。"""
-    asyncio.run(main())
+    """[project.scripts] 入口：stage02-demo。
+
+        stage02-demo                # 跑全部（默认）
+        stage02-demo 02-followup    # 只跑到动作 2（累积；名字见 --list）
+        stage02-demo --list         # 列 case 及其说明（不加载模型配置）
+    """
+    parser = argparse.ArgumentParser(
+        prog="stage02-demo", description="Stage 2 演示：总线分方向、followup 与 steering。"
+    )
+    parser.add_argument("cases", nargs="*", metavar="CASE", help="跑到指定 case（累积，默认全部）")
+    parser.add_argument("--list", action="store_true", help="列出所有 case 后退出")
+    parser.add_argument("--sessions-dir", default=None, help="session log 落点")
+    args = parser.parse_args()
+    if args.list:
+        print(f"all\t{ALL_TITLE}")
+        for cid in CASE_ORDER:
+            print(f"{cid}\t{CASE_TITLES[cid]}")
+        return
+    asyncio.run(
+        main(args.cases or None, Path(args.sessions_dir) if args.sessions_dir else None)
+    )
+
+
+if __name__ == "__main__":
+    cli()

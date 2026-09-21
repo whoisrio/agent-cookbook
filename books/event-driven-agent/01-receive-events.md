@@ -382,80 +382,72 @@ asyncio.run(main())
 
 ## 跑一下（真实 LLM 实测输出）
 
-模型是本地 ollama 的 qwen3.5:4b-32k（OpenAI 兼容端点），零 API 成本。
-时间戳从进程启动算起（前 4 秒多是解释器、SDK 导入和模型冷启动）。
-五轮对话，把读、写、读回、查规则、闲聊拒绝各走一遍。
+终端实录：asciinema 录的 `.cast` 渲染成 gif，同目录还有 `.mp4`，`index.json` 里记着每个 case
+的说明。每个 case 都能单独复跑，case 名是 `两位编号-语义名`——**编号让文件名字典序 = 演示顺序**，
+语义名说明这个 case 在看什么：
 
-输出里 `⋯` 开头的段落是思考内容（终端里是暗色的 `agent_thinking`，
-此处去掉色码、用 `⋯` 标出），其余正文是 `agent_delta`：
-
-```text
-[ 4.21s] (A) 用户输入：保温杯还有库存吗
-
-⋯ 用户询问保温杯是否有库存，我需要使用 query_inventory 工具来查询保温杯的库存信息。参数 category 应该设置为"保温杯"。
-[ 7.10s] (A) → 工具调用：query_inventory({"category":"保温杯"})
-⋯ 用户询问保温杯是否有库存，我已经通过query_inventory工具获取到了相关数据：保温杯库存为42件，规格是316L不锈钢内胆、500ml、杯身磨砂黑。现在我可以直接回答用户的问题。
-有库存，保温杯目前还有42件，规格为316L不锈钢内胆、500ml、杯身磨砂黑。
-[ 9.89s] (A) —— 回答完毕
-
-[ 9.90s] (A) 用户输入：帮我把马克杯加进库存：8 件，陶瓷，350ml
-
-⋯ 用户要求将马克杯添加到库存中，我需要调用update_inventory工具来执行这个操作。参数需要包括：
-⋯ - category: "马克杯"
-⋯ - stock: 8
-⋯ - spec: "陶瓷, 350ml"
-
-⋯ 让我调用这个工具。
-[13.53s] (A) → 工具调用：update_inventory({"category":"马克杯","stock":8,"spec":"陶瓷，350ml"})
-⋯ 用户要求将马克杯加入库存：8件，陶瓷，350ml。我已经调用了update_inventory工具并得到了成功返回。现在我需要一句话确认改动了什么。
-已将马克杯更新为8件，规格为陶瓷、350ml。
-[15.57s] (A) —— 回答完毕
-
-[15.58s] (A) 用户输入：马克杯还有货吗
-
-⋯ 用户问马克杯还有没有货，我需要查询马克杯的当前库存情况。
-[17.37s] (A) → 工具调用：query_inventory({"category":"马克杯"})
-⋯ 用户问马克杯还有货吗，根据上一步查询结果，马克杯有库存8件，规格为陶瓷、350ml。可以直接回答。
-马克杯还有货，目前库存为8件，规格为陶瓷、350ml。
-[19.78s] (A) —— 回答完毕
-
-[19.80s] (A) 用户输入：报销有什么规定
-
-⋯ 用户询问报销有什么规定，我需要使用search_rules工具来检索关于报销的相关规则。
-[21.49s] (A) → 工具调用：search_rules({"query":"报销"})
-⋯ 用户问报销有什么规定，我刚才通过search_rules工具查到了"报销：月底 25 号前提交，超过 500 元要附发票原件。"这个信息，可以直接回复给用户。
-根据规定，报销需满足以下要求：月底25号前提交，超过500元需要附发票原件。
-[24.41s] (A) —— 回答完毕
-
-[24.43s] (A) 用户输入：迪丽热巴和杨幂谁更好看?
-
-⋯ 这是一个主观审美评价的问题，不是业务相关请求。我作为智能助手，应该回答不知道或者给出客观的中性回答，不涉及个人审美偏好。我需要避免对人物进行可能涉及外貌评判的主观描述。
-
-⋯ 不过这个提问与我的工具功能无关——既不需要查询库存、查询规则，也不需要修改数据或规则。根据指导原则中"必须基于事实来回答用户的提问，严禁编造"的要求，对于主观性问题我无法基于事实给出明确答案，应该回答不知道或直接说明无法评价。
-
-⋯ 考虑到这是一个可能涉及公众人物的评论问题，作为AI助手，我应该保持中立客观的态度。
-抱歉，我没法对人物进行外貌评价。作为一个AI助手，我的功能主要是处理工作相关的查询和任务，比如库存、规则等方面的问题。如果您有其他关于工作流程的事情需要帮忙，请随时告诉我。
-[29.76s] (A) —— 回答完毕
-
-[29.77s] demo 结束
+```
+stage01-demo 01-read-stock     # → rec/stage01/docs/01-read-stock.gif
+stage01-demo --list            # 五个 case 及说明
 ```
 
-值得看四个细节：
+模型是本地 ollama 的 qwen3.5:4b-32k（OpenAI 兼容端点），零 API 成本。时间戳从进程启动算起
+（开头半秒左右是解释器、SDK 导入和模型冷启动）。每个录像开头那行
+`── <case 名>：<在看什么> ──` 就是这个 case 的说明。
 
-- 前四轮各选对了工具：查库存、写库存、再查库存、查规则，模型是靠  工具描述和 system prompt 自己路由的，代码里没有任何 if-else 指路。
-- 第 5 轮闲聊，模型一个工具都没调，思考里明确"与我的工具功能无关"，并援引了 system prompt 里"必须基于事实、严禁编造"的要求——
-  `build_system_prompt` 生成的那句收尾，在真实模型上是真的起作用的。说明qwen3.5-4b虽然是个本地小模型，在处理简单的任务下，依然能够遵从用户的指令。
-当然，生产级别的Agent，杜绝模型胡编乱造，不能简单的只靠Systemprompt的约束，后续咱们再一步一步优化。
+五个 case：读 → 写 → 读回 → 查规则 → 越界，各录一段。
 
-再看看，session log 里五轮 turn 有头有尾。
+### 01-read-stock：纯读——模型自己挑读工具，不写任何文件
+
+![01-read-stock：纯读库存](../../src/baby_event_driven_agent/rec/stage01/docs/01-read-stock.gif)
+
+`query_inventory({"category":"保温杯"})` → 42 件。工具是模型自己选的：路由依据只有工具描述
+和 system prompt，代码里没有一个 if-else 指路。
+
+### 02-write-stock：带副作用的写——真往 inventory.txt 追加一行
+
+![02-write-stock：写库存](../../src/baby_event_driven_agent/rec/stage01/docs/02-write-stock.gif)
+
+`update_inventory({"category":"马克杯","stock":8,"spec":"陶瓷, 350ml"})` → 已更新。跑前跑后
+diff `knowledge-base/inventory.txt`，能看见多出来的那一行。
+
+### 03-read-back：读回刚写进去的那行
+
+![03-read-back：读回库存](../../src/baby_event_driven_agent/rec/stage01/docs/03-read-back.gif)
+
+`query_inventory({"category":"马克杯"})` → 8 件。这一问是 02 的对照：写是真的落了库，不是模型
+嘴上说写成功（单独跑它前先跑 02-write-stock）。
+
+### 04-search-rules：换个知识库查规则
+
+![04-search-rules：查规则](../../src/baby_event_driven_agent/rec/stage01/docs/04-search-rules.gif)
+
+`search_rules({"query":"报销"})` → 规则原文。同样要事实，换了个知识库（`rules.txt`），看模型
+选不选得对工具。
+
+### 05-off-topic：知识库答不了的问题
+
+![05-off-topic：越界问题](../../src/baby_event_driven_agent/rec/stage01/docs/05-off-topic.gif)
+
+一个工具都没调：思考里把四个工具逐个排除，援引 system prompt 里"获取不到准确信息就回答不知
+道，严禁编造"那条，最后明说这事没法基于事实下结论。
+
+这五段合起来说明一件事：**路由权在模型，边界由 prompt 兜底**——前四个 case 各选对了工具，
+代码里没有一个 if-else 指路；05 一问它一个工具都没调，援引的正是 `build_system_prompt` 生成
+的那句收尾。说明 qwen3.5-4b 虽然是个本地小模型，在处理简单任务时依然能够遵从用户指令。
+当然，生产级 agent 要杜绝模型胡编乱造，不能只靠 system prompt 约束，后续咱们再一步一步优化。
+
+五个 case 还连成一条线（同一进程、同一个 session，"读→写→读回"的依赖才成立），整段也有
+录像：`rec/stage01/docs/all.gif`。
+
+再看看，session log 里每一轮 turn 都有头有尾（下面是 01-read-stock 那一轮的原文）：
+
 ```json
-{"ts": 4.21, "type": "user_input", "session": "A", "payload": {"text": "保温杯还有库存吗"}, "note": "turn start"}
-{"ts": 7.1, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": null, "tool_calls": [{"id": "call_wocv9h3e", "type": "function", "function": {"name": "query_inventory", "arguments": "{\"category\":\"保温杯\"}"}}]}}, "note": "tool_call"}
-{"ts": 7.19, "type": "tool_result", "session": "A", "payload": {"tool_call_id": "call_wocv9h3e", "name": "query_inventory", "result": "保温杯：库存 42 件；316L 不锈钢内胆，500ml，杯身磨砂黑。"}, "note": "tool result"}
-...
-{"ts": 24.43, "type": "user_input", "session": "A", "payload": {"text": "迪丽热巴和杨幂谁更好看?"}, "note": "turn start"}
-{"ts": 29.76, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": "抱歉，我没法对人物进行外貌评价。作为一个AI助手，我的功能主要是处理工作相关的查询和任务，比如库存、规则等方面的问题。如果您有其他关于工作流程的事情需要帮忙，请随时告诉我。"}}, "note": "final"}
-{"ts": 29.77, "type": "turn_end", "session": "A", "payload": {}, "note": "turn end"}
+{"ts": 0.37, "type": "user_input", "session": "A", "payload": {"text": "保温杯还有库存吗"}, "note": "turn start"}
+{"ts": 5.03, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": null, "tool_calls": [{"id": "call_upz114wp", "type": "function", "function": {"name": "query_inventory", "arguments": "{\"category\":\"保温杯\"}"}}]}}, "note": "tool_call"}
+{"ts": 5.03, "type": "tool_result", "session": "A", "payload": {"tool_call_id": "call_upz114wp", "name": "query_inventory", "result": "保温杯：库存 42 件；316L 不锈钢内胆，500ml，杯身磨砂黑。"}, "note": "tool result"}
+{"ts": 7.97, "type": "agent_reply", "session": "A", "payload": {"message": {"role": "assistant", "content": "保温杯目前有库存，共42件，规格为316L不锈钢内胆，500ml容量，杯身磨砂黑色。"}}, "note": "final"}
+{"ts": 7.97, "type": "turn_end", "session": "A", "payload": {}, "note": "turn end"}
 ```
 
 v0.1 在它的能力范围内是个真实可用的 agent。

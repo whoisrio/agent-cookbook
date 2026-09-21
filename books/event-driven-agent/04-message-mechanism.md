@@ -480,75 +480,72 @@ agent 侧的改动只有三处，都很小——这正是把机制放在总线�
 
 ## 跑一下（真实 LLM 实测输出）
 
-```text
-── 第 1 段：同步扇出 vs 异步分发（同一个慢订阅者） ──
-       说明 │ 慢订阅者每个事件睡 5ms，同样发 200 个事件。左边是 stage02/03 的写法
-             （emit 里 await 每一个订阅者），右边是本章的写法（emit 只入队，lane worker 去送）。
-[实测] 同步扇出：200 个事件，loop 等订阅者等了 1.14s
-[实测] 异步分发：同样 200 个事件，emit 只花 0.009s（订阅者的 1.14s 由 lane worker 背，drain 时才等）
-       说明 │ 两套发法订阅者都收到了 200 条：异步分发没有少送，只是把"等"这件事从 loop 挪到了 lane worker。
+终端实录（`.cast` → gif，同目录有 `.mp4` 和 `index.json`）。六段是一条线上的叙事，所以 case
+是**累积**的，名字是 `两位编号-语义名`（编号让文件名字典序 = 演示顺序）：
 
-── 第 2 段：洪峰压测：token 流里夹一条 turn_end ──
-       说明 │ 直接往总线灌 2000 个 token 增量（stream 道，队列 64，满了丢最新），中间夹一条
-             turn_end（state 道，不可丢）。看两条道各自的账。
-[统计] stream 道：投递 101 / 丢弃 1899（0.18s）
-[统计] state 道：投递 202 / 丢弃 0；turn_end 收到 1 条、agent_reply 收到 1 条
-       说明 │ 两条道各有自己的 worker：token 流堵了只丢自己的，turn_end 排在洪峰之后也照样先到 ——
-             这就是 QoS 分道要买的东西。丢的是可丢的：屏幕上会少几个字，但完整答案走 state 道
-             （agent_reply）一条没丢，UI 拿它兜底就能补齐。
-[统计] 同样的洪峰换个快消费者：800 个增量一条没丢；逐条上屏是 800 帧，合并缓冲刷成了 9 帧
-       说明 │ "没丢"是让出点挣来的：worker 在每个让出点的一个调度片里清空积压的 10 条，队列
-             永远不满。把 yield 去掉，800 条一个调度片灌完，worker 一条捞不到，队列 64 条
-             之外全会丢——那时消费者快慢不起作用。缓冲买到的是另一半：上屏 IO 从 800 帧降到 9 帧。
-
-── 第 3 段：真跑一轮：慢订阅者不拖 loop，UI 用合并缓冲刷屏 ──
-[用户] 保温杯还有库存吗
-[思考] 用户想知道保温杯还有没有库存，我需要调用 query_inventory 工具来查询"保温杯"这个品类的库存信息。
-[工具] ← query_inventory 结果：保温杯：库存 42 件；316L 不锈钢内胆，500ml，杯身磨砂黑。
-[系统] turn 结束（reason=turn end）
-[实测] 这一轮上行 86 个事件（其中 30 个是 token 增量）；从投递到 turn_end = 8.40s
-       说明 │ 同步扇出的写法要在每个事件上等 5ms，光等待就 ≈ 0.43s（这一轮的实测总耗时是 8.40s，
-             里面主要是模型请求）
-[实测] 合并缓冲：79 个增量 → 50 帧（每帧 ≤96 字或 50ms 一次）
-
-── 第 4 段：当场否决：规则说了算 ──
-[用户] 加一条规则：会议室要提前一天预订
-[工具] ← update_rules 被治理拦下：[被规则拦截，未执行]：工具 update_rules 在黑名单里
-[系统] turn 结束（reason=turn end）
-[实测] rules.txt 未被改动（治理生效，工具没执行）
-       说明 │ 被否决的结果作为一条 tool 消息进了上下文（1 条，占位以"[被规则拦截，未执行]"开头），
-             模型知道这不是工具的真实输出；裁决本身也在 log 里。
-
-── 第 5 段：人工确认：人说了算（等答复的那一半） ──
-[用户] 把保温杯库存改成 45 件
-[人工] ？ update_inventory 要执行：{"category":"保温杯","stock":45,"spec":"316L不锈钢内胆，500ml，杯身磨砂黑"}
-       说明 │ approval_required（seq=3354，request_id=ap-35e97dd1，超时 30s）：agent 正挂在这
-             次等待上，等的人不在队列那头
-[人工] → 批准
-[系统] 确认结果：allow by user（seq=3355）
-[工具] ← update_inventory 结果：已更新：保温杯：库存 45 件；316L不锈钢内胆，500ml，杯身磨砂黑。
-[系统] turn 结束（reason=turn end）
-[人工] （手抖又点了一下同一条确认）
-[系统] 又一条答复到了（request_id=ap-35e97dd1）：没人在等它了 → 不认领，只留痕（seq=3398）
-[实测] 工具真执行了，副本上现在是：保温杯：库存 45 件；316L不锈钢内胆，500ml，杯身磨砂黑。
-       说明 │ 确认的请求和结果都是事件，seq 排得出来：什么时候问的、谁批的、批完工具返回了什么。
-
-── 第 6 段：落盘与位点 ──
-[统计] 落盘：8 段 / 257156 字节 / seq 1..3398（最老可用 1758）
-[统计] 位点：ui 已消费到 seq 5，从下一条续读 → 1641 条（1758..3398）
-[统计] 残尾：完好时这一段读到 153 条；砍掉最后 11 字节后读到 152 条（停在坏记录之前，没炸）
-
-── history 尾部（这一轮的真实消息形状）──
-  {"role": "assistant", "content": null, "tool_calls": [{"id": "call_xov5nao9", "type": "function", "function": {"name": "update_inventory", "arguments": "{\"category\":\"保温杯\",\"stock\":45,\"spec\":\"316L不锈钢内胆，500ml，杯身磨砂黑\"}"}}]}
-  {"role": "tool", "tool_call_id": "call_xov5nao9", "content": "已更新：保温杯：库存 45 件；316L不锈钢内胆，500ml，杯身磨砂黑。"}
-  {"role": "assistant", "content": "已将保温杯库存改为45件，规格为316L不锈钢内胆、500ml容量、磨砂黑杯身。"}
-
-[系统] demo 结束
-  session log: .../src/baby_event_driven_agent/sessions/stage04
+```
+stage04-demo --list                # 六段及说明
+stage04-demo 02-burst-load         # 只跑到第 2 段（累积）
 ```
 
-`_step` 里可见文本是边到边发 `agent_delta`、边累积的，所以 `[回答]` 是逐帧
-出来的；模型先调 `query_inventory`，真结果回填后才给最终答复。
+### 01-sync-vs-async：同步扇出 vs 异步分发（不打模型）
+
+![01-sync-vs-async](../../src/baby_event_driven_agent/rec/stage04/docs/01-sync-vs-async.gif)
+
+同一个慢订阅者（每事件睡 5ms），两边各发 200 个事件。同步扇出的写法：loop 等订阅者等了
+1.1s 左右，`emit` 的耗时就是订阅者的耗时。本章的写法：`emit` 只花 0.007s 就返回（队列压着
+198 条，drain 时再等），而且**消费和发送是并发的**——生产者每让出一次，worker 就消化一批，
+不必等全部发完。两套发法订阅者都收到了 200 条：异步分发没有少送，只是把"等"从 loop 挪到了
+lane worker。
+
+### 02-burst-load：洪峰压测（不打模型）
+
+![02-burst-load](../../src/baby_event_driven_agent/rec/stage04/docs/02-burst-load.gif)
+
+直接往总线灌 2000 个 token 增量（stream 道，队列 64，满了丢最新），中间夹一条 `turn_end`
+（state 道，不可丢）。看两条道各自的账，以及洪峰过程中每 200 条采样一次的 `[道]` 行：
+stream 道顶到 64 满、丢弃数往上爬，state 道**始终为 0**——这就是 QoS 分道要买的东西。
+后半段还有一组对照：换成一个快的消费者，增量一条没丢、上屏帧数被合并缓冲砍掉一个数量级；
+把让出点去掉，生产者一个调度片就灌完，队列 64 条之外全会丢——**"不丢"的前提是生产者让出，
+不是消费者快**。
+
+### 03-slow-subscriber：真跑一轮（慢订阅者不拖 loop，UI 合并缓冲）
+
+![03-slow-subscriber](../../src/baby_event_driven_agent/rec/stage04/docs/03-slow-subscriber.gif)
+
+同一个慢订阅者挂在这一轮上，loop 不等它。UI 侧把 token 攒成帧再刷：满 96 字或到 50ms 帧界，
+先到先刷（只等满会一顿一顿）。屏幕上的 `[实测]` 两行就是证据：这一轮从投递到 `turn_end`
+的总耗时，以及"上行多少个增量被刷成了几帧"。
+
+### 04-permission-veto：当场否决
+
+![04-permission-veto](../../src/baby_event_driven_agent/rec/stage04/docs/04-permission-veto.gif)
+
+挂上 `permission_guard` 把 `update_rules`（改规则库）拉黑，让 agent 去加一条规则：预期
+`before_tool_call` 被否决、工具一条没执行、`rules.txt` 字节未变。被否决的结果作为一条 tool
+消息进了上下文（占位以 `[被规则拦截，未执行]` 开头），模型知道这不是工具的真实输出；
+裁决本身也在 log 里。
+
+### 05-approval-flow：人工确认（等答复的那一半）
+
+![05-approval-flow](../../src/baby_event_driven_agent/rec/stage04/docs/05-approval-flow.gif)
+
+规则只判"这个要不要问人"（当场，微秒级），答案由人来给（之后，可能要几十秒）——这一段的
+"人"就是 demo 里那个订阅者。屏幕上一串都在：`approval_required`（带 seq 和 request_id，
+agent 正挂在这次等待上）→ `→ 批准` → `确认结果：allow by user` → 工具真执行（为了让 demo
+能反复跑，写工具落在 `sessions/stage04/` 的副本上）→ 最后是"手抖又点了一次同一条确认"：
+没人在等它了 → **不认领、只留痕**。请求和结果都是事件，seq 排得出来：什么时候问的、谁批的、
+批完工具返回了什么。
+
+### 06-log-and-offset：落盘与位点
+
+![06-log-and-offset](../../src/baby_event_driven_agent/rec/stage04/docs/06-log-and-offset.gif)
+
+段 + 稀疏索引 + 长度前缀 + CRC；位点记在 `offsets.json`，重启从下一条续读；崩进程留下的
+残尾读到这里为止，前面一条不少。屏幕上的 `[统计]` 三行分别是：落盘的段数/字节/seq 范围、
+位点续读回来的条数，以及砍掉最后 11 字节（模拟崩在写一半）之后的读回结果——停在坏记录之前，
+没炸。最后 demo 把这一轮的 history 尾部直接打出来：assistant(tool_calls) → tool →
+assistant(final)。
 
 ## 验证
 
@@ -562,11 +559,10 @@ agent 侧的改动只有三处，都很小——这正是把机制放在总线�
   - 洪峰：stream 道丢自己的（`dropped > 0`）、state 道一条不丢、`turn_end` 收到；
   - （09-20 增补两条离线用例）合并缓冲的对照：800 个增量一条不丢、上屏 ≪800 帧；
     无让出点的洪峰：快消费者也救不了，队列 64 条之外全丢（736）——"不丢"的前提
-    是生产者让出，不是消费者快。demo 2b 段同步加了直刷对照输出；上面引用的
-    实测输出是 09-18 版本（无对照行），数字本身两版一致。demo 2a/2b 两段
-    09-20 起还在洪峰过程中每 200 条采样一次两条道的队列深度与丢弃数
-    （`[道]` 行）：stream 道顶到 64 满、丢弃数往上爬，state 道始终为 0——
-    旧版输出无此行，下次重跑 demo 后补进引用。
+    是生产者让出，不是消费者快。这两条对照在 demo 2b 段里也有一份直刷对照输出；
+    洪峰过程中每 200 条还会采样一次两条道的队列深度与丢弃数（`[道]` 行）：
+    stream 道顶到 64 满、丢弃数往上爬，state 道始终为 0——见上面 `02-burst-load`
+    那段录像（09-21 重录，已含 `[道]` 行）。
   - 信封：seq 单调（1,2,3）、重新打开目录（模拟重启）接着编号、位点续读正确；
   - correlation_id：一轮对话的所有事件同簇；
   - 治理（当场判）：否决 → 工具一次没执行（用探针替掉 `update_inventory`，不碰

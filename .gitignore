@@ -4,6 +4,9 @@
 # agent demo 的 session log（运行时产物）
 src/baby_event_driven_agent/sessions/
 
+# 录制产物里的 mp4（文档引用的是同目录的 .gif；.cast 是重渲染的原料，保留）
+src/baby_event_driven_agent/rec/**/*.mp4
+
 # Python
 __pycache__/
 *.pyc
