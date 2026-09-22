@@ -85,17 +85,21 @@ f 内部三步（细节在机制二）：
 
 ### 有压缩的轨迹怎么组织、怎么读
 
-先说组织。压缩不能删任何东西——append-only 之下，它只能是一个**追加的
-视图标记**：往树上多加一个 `compaction` entry，payload 装两样东西——
-`summary`（被压掉那段的摘要）和 `keep_from_id`（边界指针：从那条 entry
-起原样保留，之前的由摘要代替）。压缩发生时对话已经走到 e5，所以这个节点
-**永远追加在路径的末尾**：
+压缩不删任何东西——append-only 之下，它只能是一个**追加的视图标记**：往树上多加一个 `compaction` entry，payload 装两样东西——`summary`（被压掉那段的摘要）和 `keep_from_id`（边界指针：从那条 entry
+起原样保留，之前的由摘要代替）。
+压缩发生时对话已经走到 e5，compA **追加在那一刻路径的末尾**（e6、e7 是
+之后才出现的，画在一起反而看不清这两个时刻）：
 
 ```text
-路径：  e1 e2 e3 e4 e5 compA(keep_from=e3) e6 e7 ...
-        └┬─ 被摘要 ─┬┘            ↑节点在末尾      └─ 压缩后的新对话
-        e1 e2（摘要管到这）      e3 起原样保留
+压缩发生时：  e1 e2 | e3 e4 e5 [compA(keep_from=e3)]
+              摘要   原样保留    ↑ 追加在末尾（刀口在 e2|e3 之间）
+
+之后继续对话：e1 e2 | e3 e4 e5 compA e6 e7 ...
+                                    ↑ 新对话接在 compA 之后
 ```
+
+两个时刻的信息都在 entry 里：`keep_from_id=e3` 画出"e1 e2 由摘要代替、
+e3 起原样保留"的刀口；节点本身挂在压缩那一刻的 leaf 上。
 
 再说说读取。投影走到 compaction 节点时，按四条规则处理：
 
@@ -104,18 +108,16 @@ f 内部三步（细节在机制二）：
    回退就是天然的撤销。
 2. **`keep_from_id` 之前跳过、从它起原样保留**。跳过不是删除，e1、e2
    还在文件里，只是这一刀的视图里不出现。
-3. **摘要插在视图最前**，不是它树上所在的位置。节点在路径末尾，但它代表
-   的是最前面那段被压掉的历史——树上位置和视图位置相反。最终顺序是
-   `[system, summary, e3, e4, e5, e6 ...]`：摘要开头，其后全是原文。
+3. **摘要插在视图最前**，不是它树上所在的位置。节点追加在压缩那一刻的
+   路径末尾，但它代表的是最前面那段被压掉的历史——树上位置和视图位置
+   相反。最终顺序是 `[system, summary, e3, e4, e5, e6 ...]`：摘要开头，
+   其后全是原文。
 4. **`keep_from_id` 有两条约束**：必须在当前路径上（不在则整个节点按
    元数据跳过）；且要选在序列合法的边界（一轮的开头）——选在 turn 中间，
    保留段会以孤儿 tool 结果开头，被 sanitize 丢弃。
 
-当前实现只认路径上**第一条** compaction，其后 compaction 的摘要被跳过
-（保留段原文都在，不丢信息，只是该压的没压掉）。多次压缩的折叠语义——
-新摘要必须吞掉旧摘要、投影取最后一刀——归 5b 定义。
 
-## 机制三：rewind 与 fork——切换不修改历史，只创造新的"当前"
+## rewind 与 fork——切换不修改历史，只创造新的"当前"
 
 **rewind**（`branch(to_id)`）的实现核心就一行：`self.leaf_id = to_id`。
 没有任何 entry 被删除——它们还在 byId 里、还在文件里，只是不在当前路径上。
@@ -126,33 +128,51 @@ f 内部三步（细节在机制二）：
         └→ 5           branch(3) 后追加：3 有两个孩子（4 和 5）
 ```
 
-可选的**带摘要 rewind**（`branch_with_summary`）比裸 rewind 多一个动作：
-先把摘要节点挂在回退点之下，再把 leaf 挪过去。分叉点上是"两兄弟共父"——
-被抛弃分支和摘要节点都认 keep_from 做父：
+可选的**带摘要 rewind**（`branch_with_summary(keep_from_id, summary)`）比
+裸 rewind 多一个动作：摘要节点挂在 keep_from 之下，leaf 挪到摘要节点上。
+接上面的例子，调用 `branch_with_summary(3, "4、5 里试过 X，结论是 Y")`：
 
 ```text
-1 → 2 → 3 → 4 → 5      原分支（被抛弃，还在文件里）
-            └→ summary  ← 摘要节点，与 4 同父
-                └→ 6    新分支从摘要继续
+1 → 2 → 3 ─┬→ 4 → 5      被抛弃段（还在文件里）：被摘要的就是这段
+           └→ summary    摘要节点，挂在 3 下（与 4 同父）
+               └→ 6      新分支从 summary 继续
+
+当前路径（leaf = 6）：1 → 2 → 3 → summary → 6 —— summary 就在这条路径上，
+位置正是"1、2、3 之后、代表被压缩的 4、5"；不在路径上的是 4 → 5。
 ```
 
-新分支的投影里因此多一条 `<summary>` user 消息——"之前试过 X，结论是 Y"。
-知道历史，不被细节淹没；它是视图，不是对话。
+谁被谁摘要：**4 → 5 那段被摘要**（keep_from 之后到原 leaf），摘要文本由
+调用方写进 payload；keep_from（3）本身不被摘要——它是新路径的锚点。摘要
+节点与 4 同父，新分支的投影因此多一条 `<summary>` user 消息——知道历史，
+不被细节淹没。
 
-分叉值得单独说一句边界：**树内分叉是"回退"的影子，不是独立功能**。本章
-只有这两个 rewind 入口会造出它——其余操作在树上都长在同一条线上：
-steering / interrupt / redirect 顺序追加（被掐的 step 不留半截消息），
-compaction / model_change / prompt_change 是当前 leaf 上的标记节点，
-fork 则根本不在树内分叉。还有一条结构性存在但被纪律禁止的来源：两个节点
-认了同一个父就是分叉——绕过"同 session 单写者"直接并发写，会撞出事故性
-分叉，`_index` 的父节点校验（父不存在直接 raise）只是最后一道保险。
+
 
 **fork**（`SessionStore.fork`）把当前路径克隆进一份新会话文件（id 与
 parentId 原样保留，补一条 `session_resumed` 说明 forked_from）。新文件是
-完整合法的轨迹，可以独立继续生长；旧文件原封不动。注意 fork 和 rewind
-虽然都叫"分叉"，但不在一个层上：rewind 是**树内分叉**（同一份文件里两条
-路径共存），fork 是**会话级分叉**（新文件，与旧文件从此无关）——用户说
-"开个新会话接着聊"用 fork，说"回到刚才那步重来"用 rewind。
+完整合法的轨迹，可以独立继续生长；旧文件原封不动。
+
+"从哪里开始 fork"没有专门参数——fork 克隆的就是**当前路径**，想从更早的
+地方开，先 rewind 再 fork，两个原语组合即可。克隆出来的新文件
+长这样：
+
+```text
+原文件（A，原封不动）：  e1 e2 e3 e4 e5      ← leaf 不动，继续用就是原会话
+
+新文件（B）：
+header {type: session, id: B, note: "forked from A"}
+e1 e2 e3 e4 e5                          ← 原样克隆：id / parentId 不改
+session_resumed {forked_from: A}        ← 生命周期标记，也是新的 leaf
+```
+
+id 原样保留（不重新编号）——per-session 文件隔离，两份文件里的同名 id
+互不冲突。和原始路径的关系只有一条线索：`session_resumed` 里的
+`forked_from`（审计留痕，不是引用）；之后两条轨迹各自生长，一边 rewind /
+压缩 / 追加都影响不到另一边。
+
+fork 和 rewind 虽然都叫"分叉"，但不在一个层上：rewind 是**树内分叉**
+（同一份文件里两条路径共存），fork 是**会话级分叉**（新文件，与旧文件
+从此无关）——"回到刚才那步重来"用 rewind，"两条时间线都要活着"用 fork。
 
 ### 实测（demo 第 3 段）
 
@@ -182,30 +202,34 @@ parentId 原样保留，补一条 `session_resumed` 说明 forked_from）。新�
 
 ## 机制四：异常恢复——三级收口
 
-恢复的前提有两个：log 本身**可判定**（写一半能认出来，Stage 4 的 CRC）+
-事实**自描述**（读得懂"那次没走完"，本章的定义）。三级收口：
+假如agent在运行时出现了异常导致进程挂掉，trajectory可能就会不完整，按残迹分三种。resume（store 的第二个入口：从盘上读回轨迹重建树，然后追加一条 `session_resumed`，标记"第二次运行从这里开始"）逐个处理：
 
-**1. 字节级残尾**：长度/CRC 对不上就是残尾，读到它为止，前面一条不少。
-resume 时撞上残尾：`TrajectoryLog` 记下最后一条完好记录的字节边界，第一次
-追加前把残尾裁掉——残尾不构成事实（没写完的不算已发生），裁它不是改历史；
-不裁的话它赖在文件中间，后续追加的记录永远读不到。裁完在 `session_resumed`
-事件里留 `torn_tail: true` 的痕。
+**1. 格式不完整**——死在一条记录中间，长度/CRC 对不上：
 
-**2. 语义残尾·悬挂的工具调用**：崩在工具执行前，轨迹尾部可能是
-"assistant 带着 tool_calls，结果永远没来"。第二次复用 Stage 3 的消息形状
-表，在投影层补一条自描述占位（`[UNKNOWN: 会话在工具执行前中断，结果缺失]`）
-——序列合法了，模型也知道结果缺失，能自己决定重调。修复**只改投影**，
-原文件字节不变（测试钉死）。参考实现里还有另一档：连那条 assistant 一起撤
-（pi 的 transformMessages 就是这么做的）——干净，但抹掉了"调用发生过"这个
-事实，模型只能靠猜；本项目没有需要它的场景，就不外露成旋钮。
-顺带处理孤儿 tool 结果（配不上任何调用的）：直接跳过——发出去 provider
-直接拒。这也解释了 compaction 的 `keep_from_id` 为什么必须选在序列合法的
-边界（一轮的开头）：选在 turn 中间，保留段以孤儿 tool 开头，会被 sanitize 丢掉。
+```text
+崩溃时：    e1 e2 e3 [半条记录，CRC 对不上]        ← 残尾，不是事实
+resume 后： e1 e2 e3 session_resumed{torn_tail: true}
+            ↑ 残尾字节裁掉（没写完的不算事实），痕迹记在 resumed 里
+```
 
-**3. 悬挂审批**：进程被硬杀留下孤立的 `approval_required`（在 EventLog 里，
-没有配对的 `approval_decided`）。resume 时扫一遍，每个悬空的请求补一条
-`approval_decided {action: abandoned, by: session_resume}`，走 bus.record
-留痕——"一问必有一答"在崩溃路径上也成立，且幂等（闭合过的不碰）。
+**2. 工具调用悬挂**——死在 assistant 落盘后、工具结果落盘前：
+
+```text
+崩溃时：    ... user → assistant(tool_calls c1)          ← 结果永远没来
+resume 后： ... user → assistant(tool_calls c1)
+                     → session_resumed → user("继续")     ← 文件里永远悬挂
+投影时才补：assistant → tool[UNKNOWN: 会话在工具执行前中断，结果缺失]
+            ↑ 修复只发生在投影，模型知道缺了什么、能自己重调
+```
+
+**3. 审批悬挂**——死在 `approval_required` 落盘后、decided 前。审批住在
+EventLog 那本账上（Stage 4 的审批流），Trajectory 不涉及：
+
+```text
+崩溃时（EventLog）：   ... approval_required{request_id: ap-x}    ← 没有配对的 decided
+resume 后（EventLog）：... approval_required
+                       → approval_decided{action: abandoned}      ← bus.record 补，幂等
+```
 
 ### 实测（demo 第 4 段）
 
