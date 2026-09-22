@@ -25,8 +25,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .bus import EventBus
-from .events import Event
+from ..transport.bus import EventBus
+from ..transport.events import Event
 from .trajectory import MODEL_CHANGE, SESSION_END, SESSION_RESUMED, SESSION_STARTED, Trajectory, TrajectoryLog
 
 
@@ -39,10 +39,15 @@ class SessionStore:
 
     # ------------------------------------------------------------ 三个入口
 
-    def start(self, *, cwd: str = "", model: str | None = None, note: str = "") -> Trajectory:
-        """开一个新会话：分配 sid，落 header + session_started（+ 初始 model_change）。"""
+    def start(
+        self, *, cwd: str = "", model: str | None = None, note: str = "", system_prompt: str = ""
+    ) -> Trajectory:
+        """开一个新会话：分配 sid，落 header（含 system_prompt 原文，审计用）
+        + session_started（+ 初始 model_change）。"""
         sid = uuid.uuid4().hex
-        traj = Trajectory.create(TrajectoryLog(self.root / f"{sid}.jsonl"), sid=sid, cwd=cwd, note=note)
+        traj = Trajectory.create(
+            TrajectoryLog(self.root / f"{sid}.jsonl"), sid=sid, cwd=cwd, note=note, system_prompt=system_prompt
+        )
         traj.append(SESSION_STARTED, {"by": "store"})
         if model:
             # 树根的状态节点：会话还没说第一句话，轨迹已经记下用哪个模型

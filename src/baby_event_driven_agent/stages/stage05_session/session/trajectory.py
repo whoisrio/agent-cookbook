@@ -9,22 +9,47 @@
 - EventLog（总线侧，本包 persistence.py）：全局事件流，多 session，含 token 流
   与治理审计，坐标是 seq——**传输层**的账。
 - Trajectory（agent 侧，本模块）：单 session 的对话结构，坐标是 entry id——
-  **会话**的账。可 rewind、可 fork、可投影成 messages。
+  **会话**的账。可 rewind、可 fork。怎么从树 build 上下文不是这里的事——
+  那是 agent 的活（agent.py 的 build_context），本模块只提供 path()。
 
-9 种 entry，按"对 LLM 调用的影响"分三组（分类轴就是消费方式）：
+10 种 entry，按"对 LLM 调用的影响"分三组（分类轴就是消费方式）：
 
 - 进上下文：message / branch_summary / compaction
-- 改状态：model_change（覆盖式提取，回退天然正确）
+- 改状态：model_change / prompt_change（覆盖式提取，回退天然正确）
 - 纯元数据：session_started / session_resumed / session_end / label / custom
+
+prompt_change 是本项目对 pi 的偏离（pi 的 system prompt 在 harness，变了
+不落盘）：prompt 变更要审计，就得是事实。初始值在 header，变更以本类型
+追加，覆盖式提取——和 model_change 同一个模式，路径上最后一次生效。
 
 树的三条铁律（与 pi 同构）：
 
 1. **认父不认子**：节点只带 parentId，父节点不知道孩子——追加永远是新增，
    从不修改。
 2. **append-only**：文件只追加。rewind 不删任何东西，只是移动 leaf 指针。
-3. **投影是从树算出来的视图**：messages = f(轨迹, policy)，可以有损（压缩、
-   修复），但每次有损变换都要在事实层留痕；修复只作用于喂给模型的副本，
-   **绝不写回文件**。
+3. **投影是 agent 侧从树算出来的视图**：messages = f(轨迹, 参数)，可以有损
+   （压缩、修复），但每次有损变换都要在事实层留痕；修复只作用于喂给模型的
+   副本，**绝不写回文件**。轨迹层不关心上下文怎么 build。
+
+压缩视图（compaction entry）——触发逻辑归 5b，这里把语义钉死：
+
+压缩不能删任何东西（append-only），它只能是一个**视图标记**：
+
+- payload：`summary`（被压缩段的摘要）+ `keep_from_id`（边界指针——
+  从那条 entry 起原样保留，之前的跳过、用 summary 代替）；
+- 投影规则（实现在 agent.py 的 build_context）：
+  1. **只认当前路径上的 compaction**。rewind 到它之前 = 它不在路径上 =
+     压缩没发生过，旧消息逐字回来——压缩是视图，不是对数据的手术；
+  2. **摘要插在视图最前**。compaction 节点永远在路径末尾（压完才追加），
+     但它代表的是最前面那段被压掉的历史——树上位置和视图位置相反，
+     `insert(0)` 修正这一点，最终顺序是 [summary, 保留段...]；
+  3. **keep_from_id 必须在当前路径上**，不在（比如被 rewind 掉）则压缩
+     节点按元数据跳过；且切割点要选在**序列合法的边界**（一轮的开头）——
+     选在 turn 中间，保留段以孤儿 tool 结果开头，会被 sanitize 丢弃；
+  4. **多次压缩：当前只认路径上第一条**，其后 compaction 的摘要被跳过
+     （保留段原文都在，不丢信息，只是该压的没压掉）。折叠语义——新摘要
+     必须吞掉旧摘要、投影取最后一刀——归 5b 定义，在此之前不要触发
+     第二次压缩。
 """
 
 from __future__ import annotations
@@ -46,6 +71,7 @@ COMPACTION = "compaction"  # 压缩摘要 + 切割点（触发逻辑归 5b，这
 
 # 第二组：改状态（不产生消息，覆盖式提取）
 MODEL_CHANGE = "model_change"
+PROMPT_CHANGE = "prompt_change"  # system prompt 变更（不进消息，进审计）
 
 # 第三组：纯元数据（不进上下文、不改参数，给 UI / 扩展 / 回放的人看）
 SESSION_STARTED = "session_started"
@@ -55,9 +81,6 @@ LABEL = "label"
 CUSTOM = "custom"
 
 METADATA_TYPES = frozenset({SESSION_STARTED, SESSION_RESUMED, SESSION_END, LABEL, CUSTOM})
-
-# 悬挂工具调用的占位：自描述是硬要求——模型得知道这不是工具的真实输出
-UNKNOWN_TOOL_RESULT = "[UNKNOWN: 会话在工具执行前中断，结果缺失]"
 
 
 def _now() -> str:
@@ -191,26 +214,8 @@ class TrajectoryLog:
 # ---------------------------------------------------------------- 树
 
 
-@dataclass(frozen=True)
-class Projection:
-    """build_context 的产出：喂给模型的 messages + 覆盖式提取出的状态 + 投影统计。"""
-
-    messages: list[dict[str, Any]]
-    model: str | None
-    stats: dict[str, int]
-
-
-@dataclass(frozen=True)
-class ProjectionPolicy:
-    """投影策略：f(轨迹, policy) 的后一项。换 policy 换视图，轨迹一字不动。"""
-
-    system_prompt: str = ""  # system 不进轨迹（它是参数不是事实），投影时统一前置
-    default_model: str | None = None  # 路径上没有 model_change 时的兜底
-    repair: str = "placeholder"  # 悬挂工具调用的修复档位：placeholder | drop
-
-
 class Trajectory:
-    """一棵已加载的 entry 树。追加 O(1)；rewind 是移动指针；投影是路径遍历。"""
+    """一棵已加载的 entry 树。追加 O(1)；rewind 是移动指针；path() 供投影取当前路径。"""
 
     def __init__(
         self,
@@ -238,6 +243,7 @@ class Trajectory:
         sid: str,
         cwd: str = "",
         note: str = "",
+        system_prompt: str = "",
     ) -> "Trajectory":
         header = {
             "type": "session",
@@ -246,6 +252,9 @@ class Trajectory:
             "cwd": cwd,
             "created": _now(),
             "note": note,
+            # 开-session 时的 system prompt 原文：审计用。prompt 是参数不进消息树，
+            # 但盘上得查得到"这个会话当时用的是哪个 prompt"，否则重放核对不了。
+            "system_prompt": system_prompt,
         }
         log.append(header)
         return cls(log, header, [])
@@ -386,121 +395,6 @@ class Trajectory:
     def last_message_role(self) -> str | None:
         msg = self.last_message()
         return str(msg.get("role")) if msg else None
-
-    def build_context(self, policy: ProjectionPolicy) -> Projection:
-        """轨迹 → messages。三步：路径遍历 → 按类型分派 → sanitize 收口。
-
-        这就是"history 是 log 的投影"的完整形状。纯函数：同一份文件 +
-        同一个 policy，两次投影逐字节相同（测试钉死）。
-        """
-        entries = self.path()
-        stats = {"path": len(entries), "skipped": 0, "repaired": 0}
-
-        # 压缩口子：路径上的 compaction 决定"摘要 + 跳过区间"。
-        # 切割点不在路径上（比如被 rewind 掉）时，压缩节点当没发生过——
-        # 压缩是当前路径上的视图，不是对数据的手术。
-        comp = next((e for e in entries if e.type == COMPACTION), None)
-        summary_msg: dict[str, Any] | None = None
-        kept_ids: set[str] | None = None
-        if comp is not None:
-            first_kept = str(comp.payload.get("first_kept_id", ""))
-            ids = [e.id for e in entries]
-            ci = ids.index(comp.id)
-            if first_kept in ids[:ci]:
-                ki = ids.index(first_kept)
-                kept_ids = {e.id for e in entries[ki:]}
-                summary_msg = {
-                    "role": "user",
-                    "content": f"<summary>{comp.payload.get('summary', '')}</summary>",
-                }
-            # first_kept 不在路径上：comp 什么都不做（按元数据跳过）
-
-        model = policy.default_model
-        raw: list[dict[str, Any]] = []
-        for e in entries:
-            if kept_ids is not None:
-                if e.id == comp.id:  # type: ignore[union-attr]
-                    # 摘要插在最前面（pi 语义：CompactionSummaryMessage 开头），
-                    # 其后才是切割点之后保留的消息
-                    raw.insert(0, summary_msg)  # type: ignore[arg-type]
-                    continue
-                if e.id not in kept_ids:
-                    stats["skipped"] += 1
-                    continue
-            if e.type == MESSAGE:
-                msg = dict(e.payload.get("message", {}))
-                if e.payload.get("synthetic") or e.payload.get("note"):
-                    msg["synthetic"] = bool(e.payload.get("synthetic"))
-                    msg["note"] = str(e.payload.get("note", ""))
-                raw.append(msg)
-            elif e.type == MODEL_CHANGE:
-                mid = str(e.payload.get("model_id", ""))
-                if mid:
-                    model = mid  # 覆盖式提取：路径上最后一次生效
-            elif e.type == BRANCH_SUMMARY:
-                raw.append(
-                    {"role": "user", "content": f"<summary>{e.payload.get('summary', '')}</summary>"}
-                )
-            elif e.type == COMPACTION:
-                stats["skipped"] += 1  # 没有切割点的 compaction：跳过
-            elif e.type in METADATA_TYPES:
-                stats["skipped"] += 1
-
-        messages = self._sanitize(raw, policy, stats)
-        return Projection(messages=messages, model=model, stats=stats)
-
-    @staticmethod
-    def _sanitize(
-        raw: list[dict[str, Any]], policy: ProjectionPolicy, stats: dict[str, int]
-    ) -> list[dict[str, Any]]:
-        """发给 provider 前的收口：保证消息序列约束永远满足。
-
-        纪律：**只改投影，不改事实层**。修复分两档（policy.repair）：
-        placeholder——悬挂的工具调用补一条自描述占位；drop——连那条要结果的
-        assistant 一起撤掉。两档都不写回文件（测试钉死原文件字节不变）。
-        """
-        out: list[dict[str, Any]] = []
-        if policy.system_prompt:
-            out.append({"role": "system", "content": policy.system_prompt})
-        i = 0
-        while i < len(raw):
-            m = raw[i]
-            role = m.get("role")
-            if role == "system":  # system 不该在轨迹里（它是参数），投影层丢掉
-                i += 1
-                continue
-            if role == "tool":
-                i += 1
-                continue  # tool 结果只在下面的配对循环里收，落单的=孤儿，跳过
-            # 合成标记只是轨迹注脚，任何角色上都要 strip 掉再发
-            m.pop("synthetic", None)
-            m.pop("note", None)
-            calls = m.get("tool_calls") or []
-            if calls:
-                mark = len(out)
-                out.append(dict(m))
-                answered: set[str] = set()
-                j = i + 1
-                while j < len(raw) and raw[j].get("role") == "tool":
-                    if str(raw[j].get("tool_call_id")) in {c["id"] for c in calls}:
-                        answered.add(str(raw[j].get("tool_call_id")))
-                        out.append(dict(raw[j]))
-                    j += 1  # 配不上的 tool：孤儿，跳过
-                missing = [c for c in calls if c["id"] not in answered]
-                if missing:
-                    stats["repaired"] += len(missing)
-                    if policy.repair == "placeholder":
-                        for c in missing:
-                            out.append(
-                                {"role": "tool", "tool_call_id": c["id"], "content": UNKNOWN_TOOL_RESULT}
-                            )
-                    else:  # drop：assistant 和已配对的结果一起撤
-                        del out[mark:]
-                i = j
-                continue
-            out.append(dict(m))
-            i += 1
-        return out
 
     # ------------------------------------------------------------ 观测
 

@@ -15,15 +15,15 @@ from pathlib import Path
 
 import pytest
 
-from baby_event_driven_agent.stages.stage05_session.bus import EventBus
-from baby_event_driven_agent.stages.stage05_session.events import Event
-from baby_event_driven_agent.stages.stage05_session.persistence import EventLog
-from baby_event_driven_agent.stages.stage05_session.session import (
+from baby_event_driven_agent.stages.stage05_session.transport.bus import EventBus
+from baby_event_driven_agent.stages.stage05_session.transport.events import Event
+from baby_event_driven_agent.stages.stage05_session.transport.persistence import EventLog
+from baby_event_driven_agent.stages.stage05_session.session.store import (
     SessionStore,
     session_facts,
     sweep_hanging_approvals,
 )
-from baby_event_driven_agent.stages.stage05_session.trajectory import (
+from baby_event_driven_agent.stages.stage05_session.session.trajectory import (
     MESSAGE,
     Trajectory,
     message_payload,
@@ -52,6 +52,31 @@ def test_start_without_model_has_no_model_change(workdir: Path) -> None:
     store = SessionStore(workdir / "sessions")
     traj = store.start()
     assert [f["type"] for f in session_facts(traj)] == ["session_started"]
+
+
+def test_header_records_system_prompt_verbatim(workdir: Path) -> None:
+    """header 记 system prompt 原文（审计）：prompt 是参数不进消息树，
+    但盘上要查得到"这个会话当时用的是哪个 prompt"，重放才核对得了。"""
+    store = SessionStore(workdir / "sessions")
+    traj = store.start(system_prompt="你是一个通过工具干活的通用 agent。")
+    assert traj.header["system_prompt"] == "你是一个通过工具干活的通用 agent。"
+    # 从盘上重建（模拟重启）后仍在——header 是文件第一行，不是内存里的东西
+    resumed = store.resume(traj.sid)
+    assert resumed.header["system_prompt"] == "你是一个通过工具干活的通用 agent。"
+
+
+def test_projection_defaults_to_header_prompt(workdir: Path) -> None:
+    """build_context 不传 system_prompt 时默认读 header——从盘上重放一段
+    历史，用什么 prompt 记账上写着；显式传参（换 prompt 重放）才覆盖。"""
+    import json
+
+    from baby_event_driven_agent.stages.stage05_session.agent import build_context
+
+    store = SessionStore(workdir / "sessions")
+    traj = store.start(system_prompt="SYS-header")
+    traj.append(MESSAGE, message_payload({"role": "user", "content": "问"}))
+    msgs = build_context(traj).messages
+    assert msgs[0] == {"role": "system", "content": "SYS-header"}
 
 
 def test_resume_rebuilds_tree_and_continues(workdir: Path) -> None:
@@ -87,7 +112,7 @@ def test_resume_marks_torn_tail(workdir: Path) -> None:
     # 实例上的 torn 标志在第一次追加（session_resumed）时消费掉：残尾已裁
     assert resumed.torn is False
     assert session_facts(resumed)[-1]["payload"]["torn_tail"] is True
-    from baby_event_driven_agent.stages.stage05_session.trajectory import TrajectoryLog
+    from baby_event_driven_agent.stages.stage05_session.session.trajectory import TrajectoryLog
 
     assert TrajectoryLog(path).read()[2] is False  # 文件回到完好状态
 
@@ -152,11 +177,11 @@ def test_sweep_without_log_is_noop(workdir: Path) -> None:
 
 
 def test_twin_trajectories_same_file_projection(workdir: Path) -> None:
-    """同一份文件的两个实例：投影一致（f(文件, policy) 是纯函数）。"""
+    """同一份文件的两个实例：投影一致（f(文件, 参数) 是纯函数）。"""
     import json
 
-    from baby_event_driven_agent.stages.stage05_session.trajectory import (
-        ProjectionPolicy,
+    from baby_event_driven_agent.stages.stage05_session.agent import build_context
+    from baby_event_driven_agent.stages.stage05_session.session.trajectory import (
         Trajectory,
         TrajectoryLog,
     )
@@ -165,7 +190,6 @@ def test_twin_trajectories_same_file_projection(workdir: Path) -> None:
     traj = store.start()
     traj.append(MESSAGE, message_payload({"role": "user", "content": "u1"}))
     twin = Trajectory.load(TrajectoryLog(store.path_of(traj.sid)))
-    policy = ProjectionPolicy(system_prompt="S")
-    a = json.dumps(traj.build_context(policy).messages, ensure_ascii=False)
-    b = json.dumps(twin.build_context(policy).messages, ensure_ascii=False)
+    a = json.dumps(build_context(traj).messages, ensure_ascii=False)
+    b = json.dumps(build_context(twin).messages, ensure_ascii=False)
     assert a == b

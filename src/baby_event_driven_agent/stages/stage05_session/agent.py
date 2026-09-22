@@ -6,9 +6,9 @@ history 换成轨迹层。
 1. `self.history: dict[sid, list]` → `self.trajectories: dict[sid, Trajectory]`。
    所有 `history.append(...)` 换成 `traj.append(MESSAGE, message_payload(...))`：
    消息进 append-only 的 entry 树（认父不认子），而不是内存 list。
-2. `_step` 的上下文从内存 list 换成 `traj.build_context(policy).messages`——
-   history 降格为投影，每次 LLM 调用前从轨迹算出来。同文件 + 同 policy
-   逐字节可复现（eval 的地基）。
+2. `_step` 的上下文从内存 list 换成 `build_context(traj)`——
+   history 降格为投影，每次 LLM 调用前从轨迹算出来。同一份轨迹文件
+   逐字节可复现（eval 的地基）。build 是 agent 的活：轨迹层只管事实和树。
 3. 合成消息（中断标记、assistant 占位、纠正 user）照旧进事实层
    （`synthetic: true` + note），只是落点从 history 变成轨迹——否则
    "history 是 log 的投影"在合成消息这条路上断掉。
@@ -26,13 +26,23 @@ import json
 import logging
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any, Protocol
 
-from .bus import EventBus
-from .events import ALLOW, ASK, DENY, MODIFY, Decision, Event
+from .transport.bus import EventBus
+from .transport.events import ALLOW, ASK, DENY, MODIFY, Decision, Event
 from .llm import TOOLS, build_system_prompt
-from .session import SessionStore
-from .trajectory import MESSAGE, ProjectionPolicy, Trajectory, message_payload
+from .session.store import SessionStore
+from .session.trajectory import (
+    BRANCH_SUMMARY,
+    COMPACTION,
+    MESSAGE,
+    METADATA_TYPES,
+    MODEL_CHANGE,
+    PROMPT_CHANGE,
+    Trajectory,
+    message_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +65,147 @@ APPROVAL_TIMEOUT_BY = "approval_timeout"
 
 SYSTEM_PROMPT = build_system_prompt()
 
+# 悬挂工具调用的占位：自描述是硬要求——模型得知道这不是工具的真实输出
+UNKNOWN_TOOL_RESULT = "[UNKNOWN: 会话在工具执行前中断，结果缺失]"
+
+
+@dataclass(frozen=True)
+class Projection:
+    """build_context 的产出：喂给模型的 messages + 覆盖式提取出的状态 + 投影统计。"""
+
+    messages: list[dict[str, Any]]
+    model: str | None
+    stats: dict[str, int]
+
+
+def build_context(traj: Trajectory) -> Projection:
+    """轨迹 → messages。三步：路径遍历 → 按类型分派 → sanitize 收口。
+
+    这是 agent 侧的活：轨迹层只管事实和树操作，怎么 build 上下文由 agent 决定。
+    system prompt 全从轨迹来：初始值在 header，变更以 prompt_change entry
+    追加（attach 时发现不一致就落盘），覆盖式提取、路径上最后一次生效、
+    没有变更回落 header——和 model_change 同一个模式。不进消息序列，
+    只决定前置的那条 system。
+    纯函数：同一份轨迹文件，两次投影逐字节相同（测试钉死）。
+    """
+    entries = traj.path()
+    stats = {"path": len(entries), "skipped": 0, "repaired": 0}
+
+    # 压缩口子：路径上的 compaction 决定"摘要 + 跳过区间"。
+    # 切割点不在路径上（比如被 rewind 掉）时，压缩节点当没发生过——
+    # 压缩是当前路径上的视图，不是对数据的手术。
+    # 只认第一条：多条的折叠语义归 5b（新摘要吞旧摘要、投影取最后一刀），
+    # 在那之前不要触发第二次压缩——后序 compaction 的摘要会被跳过。
+    # 完整语义见 session/trajectory.py 模块 docstring 的"压缩视图"一节。
+    comp = next((e for e in entries if e.type == COMPACTION), None)
+    summary_msg: dict[str, Any] | None = None
+    kept_ids: set[str] | None = None
+    if comp is not None:
+        keep_from = str(comp.payload.get("keep_from_id", ""))
+        ids = [e.id for e in entries]
+        ci = ids.index(comp.id)
+        if keep_from in ids[:ci]:
+            ki = ids.index(keep_from)
+            kept_ids = {e.id for e in entries[ki:]}
+            summary_msg = {
+                "role": "user",
+                "content": f"<summary>{comp.payload.get('summary', '')}</summary>",
+            }
+        # keep_from 不在路径上：comp 什么都不做（按元数据跳过）
+
+    model: str | None = None
+    prompt: str | None = None
+    raw: list[dict[str, Any]] = []
+    for e in entries:
+        if kept_ids is not None:
+            if e.id == comp.id:  # type: ignore[union-attr]
+                # 摘要插在最前面（pi 语义：CompactionSummaryMessage 开头），
+                # 其后才是切割点之后保留的消息
+                raw.insert(0, summary_msg)  # type: ignore[arg-type]
+                continue
+            if e.id not in kept_ids:
+                stats["skipped"] += 1
+                continue
+        if e.type == MESSAGE:
+            msg = dict(e.payload.get("message", {}))
+            if e.payload.get("synthetic") or e.payload.get("note"):
+                msg["synthetic"] = bool(e.payload.get("synthetic"))
+                msg["note"] = str(e.payload.get("note", ""))
+            raw.append(msg)
+        elif e.type == MODEL_CHANGE:
+            mid = str(e.payload.get("model_id", ""))
+            if mid:
+                model = mid  # 覆盖式提取：路径上最后一次生效
+        elif e.type == PROMPT_CHANGE:
+            p_ = str(e.payload.get("system_prompt", ""))
+            if p_:
+                prompt = p_  # 同上：prompt 变更是改状态事实
+        elif e.type == BRANCH_SUMMARY:
+            raw.append(
+                {"role": "user", "content": f"<summary>{e.payload.get('summary', '')}</summary>"}
+            )
+        elif e.type == COMPACTION:
+            stats["skipped"] += 1  # 没有切割点的 compaction：跳过
+        elif e.type in METADATA_TYPES:
+            stats["skipped"] += 1
+
+    if prompt is None:
+        prompt = str(traj.header.get("system_prompt", ""))  # 没变更过：回落 header
+    messages = _sanitize(raw, prompt, stats)
+    return Projection(messages=messages, model=model, stats=stats)
+
+
+def _sanitize(
+    raw: list[dict[str, Any]], system_prompt: str, stats: dict[str, int]
+) -> list[dict[str, Any]]:
+    """发给 provider 前的收口：保证消息序列约束永远满足。
+
+    纪律：**只改投影，不改事实层**（测试钉死原文件字节不变）。
+    悬挂的工具调用（assistant 要了结果、结果没来）补一条自描述占位——
+    这是投影的内置默认行为，不是旋钮：诚实档让模型知道缺了什么、能自己
+    决定重调。另一种做法是连 assistant 一起撤（pi 的 drop），在本项目
+    没有真实需求前不外露成参数。
+    """
+    out: list[dict[str, Any]] = []
+    if system_prompt:
+        out.append({"role": "system", "content": system_prompt})
+    i = 0
+    while i < len(raw):
+        m = raw[i]
+        role = m.get("role")
+        if role == "system":  # system 不该在轨迹里（它是参数），投影层丢掉
+            i += 1
+            continue
+        if role == "tool":
+            i += 1
+            continue  # tool 结果只在下面的配对循环里收，落单的=孤儿，跳过
+        # 合成标记只是轨迹注脚，任何角色上都要 strip 掉再发
+        m.pop("synthetic", None)
+        m.pop("note", None)
+        calls = m.get("tool_calls") or []
+        if calls:
+            mark = len(out)
+            out.append(dict(m))
+            answered: set[str] = set()
+            j = i + 1
+            while j < len(raw) and raw[j].get("role") == "tool":
+                if str(raw[j].get("tool_call_id")) in {c["id"] for c in calls}:
+                    answered.add(str(raw[j].get("tool_call_id")))
+                    out.append(dict(raw[j]))
+                j += 1  # 配不上的 tool：孤儿，跳过
+            missing = [c for c in calls if c["id"] not in answered]
+            if missing:
+                stats["repaired"] += len(missing)
+                for c in missing:
+                    out.append(
+                        {"role": "tool", "tool_call_id": c["id"], "content": UNKNOWN_TOOL_RESULT}
+                    )
+            i = j
+            continue
+        out.append(dict(m))
+        i += 1
+    return out
+
 
 class LLMClient(Protocol):
     def stream_chat(
@@ -71,13 +222,13 @@ class Agent:
         *,
         store: SessionStore,
         approval_timeout: float = 30.0,
-        policy: ProjectionPolicy | None = None,
+        system_prompt: str | None = None,
     ) -> None:
         self.bus = bus
         self.llm = llm
         self.agent_id = agent_id
         self.store = store
-        self.policy = policy or ProjectionPolicy(system_prompt=SYSTEM_PROMPT)
+        self.system_prompt = system_prompt or SYSTEM_PROMPT
         self.trajectories: dict[str, Trajectory] = {}
         self.inboxes: dict[str, asyncio.Queue[Event]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
@@ -96,8 +247,22 @@ class Agent:
     # -------------------------------------------------- 轨迹层：sid 的唯一入口
 
     def attach(self, traj: Trajectory) -> str:
-        """登记一个会话（store.start/resume 的产物）。sid 从这里进 agent。"""
+        """登记一个会话（store.start/resume 的产物）。sid 从这里进 agent。
+
+        本次运行的 system prompt 和轨迹记录（header / 已有 prompt_change）
+        不一致——首次没记、或 resume 时换了模板——就追加一条 prompt_change
+        留痕：prompt 变更是事实，不落盘审计就有洞。
+        """
         self.trajectories[traj.sid] = traj
+        recorded = str(traj.header.get("system_prompt", ""))
+        for e in traj.path():
+            if e.type == PROMPT_CHANGE and e.payload.get("system_prompt"):
+                recorded = str(e.payload["system_prompt"])
+        if recorded != self.system_prompt:
+            traj.append(
+                PROMPT_CHANGE,
+                {"system_prompt": self.system_prompt, "by": "agent_attach"},
+            )
         return traj.sid
 
     def _traj(self, sid: str) -> Trajectory:
@@ -109,9 +274,17 @@ class Agent:
             )
         return traj
 
+    def build_context(self, traj: Trajectory) -> Projection:
+        """从轨迹现算上下文：system 与修复档位是 agent 自己的决定。
+
+        build 是 agent 的活——轨迹层只管事实和树操作，怎么拼上下文、
+        修不修、用什么 system，都由这里决定。每次现算，不缓存。
+        """
+        return build_context(traj)
+
     def messages(self, sid: str) -> list[dict[str, Any]]:
         """当前上下文（投影）：demo / 测试观测用，agent 自己在 step 前现算。"""
-        return self._traj(sid).build_context(self.policy).messages
+        return self.build_context(self._traj(sid)).messages
 
     # -------------------------------------------------- outbound：只有一条路
 
@@ -300,14 +473,14 @@ class Agent:
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """一个可中断的完整单元：投影出上下文 → 消费流 → 执行工具（若有）。
 
-        上下文是**当场从轨迹投影出来的**（f(轨迹, policy)），不是攒在内存里的
+        上下文是**当场从轨迹投影出来的**（当场从轨迹算出），不是攒在内存里的
         list——rewind / 压缩之后，下一次调用自动就是新视图。
         """
         partial["text_parts"] = []
         partial["tool_calls"] = {}
         partial["thinking_seen"] = False
         self._phase[sid] = "stream"
-        context = traj.build_context(self.policy).messages
+        context = self.build_context(traj).messages
         msg = await self._step(sid, context, partial)
         # assistant 消息一成形就先发总线——必须在工具执行之前：否则轨迹里会先
         # 出现 tool_result、后出现发起它的 tool_call。

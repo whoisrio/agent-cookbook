@@ -24,15 +24,15 @@ from baby_event_driven_agent.stages.stage05_session.agent import (
     STOP_MARKER,
     Agent,
 )
-from baby_event_driven_agent.stages.stage05_session.bus import EventBus
-from baby_event_driven_agent.stages.stage05_session.events import (
+from baby_event_driven_agent.stages.stage05_session.transport.bus import EventBus
+from baby_event_driven_agent.stages.stage05_session.transport.events import (
     OBSERVE,
     Event,
     Subscription,
 )
 from baby_event_driven_agent.stages.stage05_session.llm import RealLLM
-from baby_event_driven_agent.stages.stage05_session.persistence import EventLog
-from baby_event_driven_agent.stages.stage05_session.session import SessionStore
+from baby_event_driven_agent.stages.stage05_session.transport.persistence import EventLog
+from baby_event_driven_agent.stages.stage05_session.session.store import SessionStore
 
 TIMEOUT = 120.0
 
@@ -100,15 +100,16 @@ def test_turn_lands_on_disk_and_projects_legally(workdir: Path) -> None:
     types = [e.type for e in entries]
     assert types[0] == "session_started"
 
-    projection = h.traj.build_context(h.agent.policy)
+    projection = build_context(h.traj)
     assert projection.messages[0]["role"] == "system"
     assert projection.messages[1]["content"] == "保温杯还有库存吗"
     assert projection.messages[-1]["role"] == "assistant"
     # 重启重放：从盘上重建的轨迹投影出同样的 messages
-    from baby_event_driven_agent.stages.stage05_session.trajectory import Trajectory, TrajectoryLog
+    from baby_event_driven_agent.stages.stage05_session.agent import build_context
+    from baby_event_driven_agent.stages.stage05_session.session.trajectory import Trajectory, TrajectoryLog
 
     reloaded = Trajectory.load(TrajectoryLog(h.store.path_of(h.sid)))
-    assert [m["content"] for m in reloaded.build_context(h.agent.policy).messages if m.get("content")] == [
+    assert [m["content"] for m in build_context(reloaded).messages if m.get("content")] == [
         m["content"] for m in projection.messages if m.get("content")
     ]
 

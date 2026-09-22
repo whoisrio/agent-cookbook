@@ -27,17 +27,17 @@ from baby_event_driven_agent.stages.stage05_session.agent import (
     STOP_MARKER,
     Agent,
 )
-from baby_event_driven_agent.stages.stage05_session.bus import EventBus
-from baby_event_driven_agent.stages.stage05_session.events import (
+from baby_event_driven_agent.stages.stage05_session.transport.bus import EventBus
+from baby_event_driven_agent.stages.stage05_session.transport.events import (
     OBSERVE,
     Event,
     Subscription,
 )
 from baby_event_driven_agent.stages.stage05_session.llm import TOOLS
-from baby_event_driven_agent.stages.stage05_session.persistence import EventLog
-from baby_event_driven_agent.stages.stage05_session.session import SessionStore
-from baby_event_driven_agent.stages.stage05_session.subscribers import permission_guard
-from baby_event_driven_agent.stages.stage05_session.trajectory import ProjectionPolicy
+from baby_event_driven_agent.stages.stage05_session.transport.persistence import EventLog
+from baby_event_driven_agent.stages.stage05_session.session.store import SessionStore
+from baby_event_driven_agent.stages.stage05_session.transport.subscribers import permission_guard
+from baby_event_driven_agent.stages.stage05_session.agent import build_context
 
 TIMEOUT = 10.0
 
@@ -117,18 +117,18 @@ class Harness:
         script: list[list[dict[str, Any]]],
         *,
         subs: tuple = (),
-        policy: ProjectionPolicy | None = None,
+        system_prompt: str = "SYS",
         hang_after: int | None = None,
     ) -> None:
         self.log = EventLog(str(workdir / "events"))
         self.bus = EventBus(self.log)
         self.store = SessionStore(workdir / "sessions")
-        self.policy = policy or ProjectionPolicy(system_prompt="SYS")
+        self.system_prompt = system_prompt
         self.agent = Agent(
             self.bus,
             ScriptedLLM(script, hang_after=hang_after),
             store=self.store,
-            policy=self.policy,
+            system_prompt=self.system_prompt,
         )
         self.traj = self.store.start()
         self.sid = self.agent.attach(self.traj)
@@ -365,12 +365,12 @@ def test_resume_with_new_agent_continues_conversation(
 
     run(go())
     sid = h.sid
-    first_projection = h.traj.build_context(h.policy).messages
+    first_projection = build_context(h.traj).messages
 
     # 重启：全新的 bus / agent / 实例，只从 store 恢复
     log2 = EventLog(str(workdir / "events"))
     bus2 = EventBus(log2)
-    agent2 = Agent(bus2, ScriptedLLM([SECOND_TEXT]), store=h.store, policy=h.policy)
+    agent2 = Agent(bus2, ScriptedLLM([SECOND_TEXT]), store=h.store, system_prompt=h.system_prompt)
     traj2 = h.store.resume(sid)
     agent2.attach(traj2)
 
@@ -404,3 +404,25 @@ def test_unknown_sid_raises_loudly(workdir: Path) -> None:
     h = Harness(workdir, [FINAL_TEXT])
     with pytest.raises(KeyError, match="SessionStore"):
         h.agent._traj("ghost-session")
+
+
+def test_attach_records_prompt_change(workdir: Path) -> None:
+    """resume 后换了模板：attach 发现轨迹记录的 prompt 和本次运行不一致，
+    追加 prompt_change 留痕（不落盘审计就有洞）；投影随即用新 prompt；
+    再 attach 一次（幂等）：不再重复追加。"""
+    from baby_event_driven_agent.stages.stage05_session.agent import build_context
+    from baby_event_driven_agent.stages.stage05_session.transport.events import Event as Ev
+
+    store = SessionStore(workdir / "s-att")
+    traj = store.start(system_prompt="旧模板")
+    bus = EventBus(EventLog(str(workdir / "ev-att")))
+    agent = Agent(bus, ScriptedLLM([FINAL_TEXT]), store=store, system_prompt="新模板")
+    agent.attach(traj)
+
+    changes = [e for e in traj.entries() if e.type == "prompt_change"]
+    assert len(changes) == 1
+    assert changes[0].payload["system_prompt"] == "新模板"
+    assert build_context(traj).messages[0]["content"] == "新模板"
+
+    agent.attach(traj)  # 幂等：记录已一致，不再追加
+    assert len([e for e in traj.entries() if e.type == "prompt_change"]) == 1

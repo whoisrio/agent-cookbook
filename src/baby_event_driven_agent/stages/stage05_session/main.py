@@ -7,8 +7,8 @@
 
 1. **轨迹长什么样**（离线）：脚本化 LLM 跑一轮，把 entry 树打印出来——
    header 不是节点、认父不认子、一条 assistant 是一个节点、toolCallId 配对。
-2. **投影**（离线）：messages = f(轨迹, policy)。路径遍历 + 按类型分派 +
-   sanitize 收口；同一份文件同一个 policy 两次投影逐字节相同；model_change
+2. **投影**（离线）：messages = f(轨迹, 参数)。路径遍历 + 按类型分派 +
+   sanitize 收口；同一份文件同一组参数两次投影逐字节相同；model_change
    覆盖式提取，元数据跳过。
 3. **rewind**（离线）：回退是移动指针，被抛弃分支留在文件里；回退后追加 =
    分支（grep parentId 可见）；带摘要的 rewind（遗言不是对话）。
@@ -41,16 +41,16 @@ from pathlib import Path
 from typing import Any
 
 from .agent import Agent
-from .bus import EventBus
-from .events import Event, Subscription, OBSERVE
+from .transport.bus import EventBus
+from .agent import build_context
+from .transport.events import Event, Subscription, OBSERVE
 from .llm import RealLLM
-from .persistence import EventLog
-from .session import SessionStore, session_facts, sweep_hanging_approvals
-from .trajectory import (
+from .transport.persistence import EventLog
+from .session.store import SessionStore, session_facts, sweep_hanging_approvals
+from .session.trajectory import (
     LABEL,
     MESSAGE,
     MODEL_CHANGE,
-    ProjectionPolicy,
     Trajectory,
     TrajectoryLog,
     message_payload,
@@ -78,7 +78,7 @@ CASE_ORDER = (
 )
 CASE_TITLES = {
     "01-trajectory-shape": "第 1 段：轨迹长什么样（离线）",
-    "02-projection": "第 2 段：投影 messages = f(轨迹, policy)（离线）",
+    "02-projection": "第 2 段：投影 messages = f(轨迹, 参数)（离线）",
     "03-rewind": "第 3 段：rewind——回退是移动指针（离线）",
     "04-recovery": "第 4 段：异常恢复——残尾、悬挂调用、悬挂审批（离线）",
     "05-fork": "第 5 段：session 切换——fork（离线）",
@@ -141,11 +141,11 @@ class Harness:
         self.log = EventLog(str(workdir / "events"))
         self.bus = EventBus(self.log)
         self.store = SessionStore(workdir / "sessions")
-        self.policy = ProjectionPolicy(
-            system_prompt="你是一个通过工具干活的通用 agent。"
+        self.system_prompt = "你是一个通过工具干活的通用 agent。"
+        self.agent = Agent(self.bus, ScriptedLLM(script), store=self.store, system_prompt=self.system_prompt)
+        self.traj = self.store.start(
+            cwd=str(workdir), model="fake-model", system_prompt=self.system_prompt
         )
-        self.agent = Agent(self.bus, ScriptedLLM(script), store=self.store, policy=self.policy)
-        self.traj = self.store.start(cwd=str(workdir), model="fake-model")
         self.agent.attach(self.traj)
         self.sid = self.traj.sid
         self.ended = asyncio.Event()
@@ -251,10 +251,10 @@ async def case_trajectory_shape(workdir: Path) -> None:
 async def case_projection(workdir: Path) -> None:
     banner(
         "02-projection",
-        "投影 messages = f(轨迹, policy)",
+        "投影 messages = f(轨迹, 参数)",
         "路径遍历（leafId 沿 parentId 回根）→ 按类型分派（消息进 messages、"
         "model_change 覆盖变量、元数据跳过）→ sanitize 收口。"
-        "同一份文件同一个 policy，两次投影逐字节相同——这是 eval 的地基。",
+        "同一份文件同一组参数，两次投影逐字节相同——这是 eval 的地基。",
     )
     h = Harness(workdir, [CALL_QUERY, FINAL_TEXT])
     h.send("保温杯还有库存吗")
@@ -265,10 +265,10 @@ async def case_projection(workdir: Path) -> None:
     traj.append(LABEL, {"text": "关键节点：首轮问答"})
     traj.append(MODEL_CHANGE, {"model_id": "qwen3.5:4b-32k", "by": "user"})
 
-    p1 = traj.build_context(h.policy)
-    p2 = traj.build_context(h.policy)
+    p1 = build_context(traj)
+    p2 = build_context(traj)
     line("实测", GREEN, f"两次投影逐字节相同：{json.dumps(p1.messages, ensure_ascii=False) == json.dumps(p2.messages, ensure_ascii=False)}")
-    line("实测", GREEN, f"覆盖式提取的 model：{p1.model}（default 是 fake-model，路径上最后的 model_change 生效）")
+    line("实测", GREEN, f"覆盖式提取的 model：{p1.model}（store.start 落的 model_change，路径上最后一次生效）")
     line("实测", GREEN, f"投影统计：{p1.stats}")
     line("系统", GREEN, "投影出的 messages：")
     for m in p1.messages:
@@ -277,7 +277,8 @@ async def case_projection(workdir: Path) -> None:
         line("  ", GREY, f"{m['role']:<9} {brief(body) if body else ''}{extra}")
 
     note(
-        "system 不在轨迹里——它是参数不是事实，由 policy 在投影时统一前置；"
+        "system 不在轨迹里——它是参数不是事实，由 agent 在投影时统一前置，"
+        "原文记在 header（审计用）；"
         "label 是纯元数据，进了轨迹但进不了上下文（stats.skipped 里能数出来）。"
     )
 
@@ -307,7 +308,7 @@ async def case_rewind(workdir: Path) -> None:
     traj.branch(user1.id)  # 核心就这一行
     after_branch = len(traj.entries())
     line("实测", GREEN, f"branch({user1.id})：文件里还是 {after_branch} 条 entry（{before} → {after_branch}，一条没删），字节未变：{traj.log.raw_bytes() == before_bytes}")
-    line("实测", GREEN, f"回退后投影只剩 {len(traj.build_context(h.policy).messages)} 条消息（system + 那条 user）")
+    line("实测", GREEN, f"回退后投影只剩 {len(build_context(traj).messages)} 条消息（system + 那条 user）")
 
     traj.append(MESSAGE, message_payload({"role": "user", "content": "换个思路：查一下玻璃杯"}))
     dup = traj.branch_points()
@@ -319,7 +320,7 @@ async def case_rewind(workdir: Path) -> None:
     )
     line("实测", GREEN, f"branch_with_summary：摘要节点 {summary.id} 挂在 {user1.id} 下（{summary.payload['note']}）")
     line("系统", GREEN, "现在的投影（新分支的 agent 看到的）：")
-    for m in traj.build_context(h.policy).messages:
+    for m in build_context(traj).messages:
         line("  ", GREY, f"{m['role']:<9} {brief(m.get('content') or '')}")
 
     note(
@@ -381,25 +382,14 @@ async def case_recovery(workdir: Path) -> None:
     )
     # 进程到这里被硬杀：assistant 要了工具结果，结果永远没来
     before_bytes = traj.log.raw_bytes()
-    fixed = traj.build_context(h2.policy)  # placeholder 档：补自描述占位
+    fixed = build_context(traj, system_prompt=h2.system_prompt)  # 补自描述占位
     tail = [m for m in fixed.messages if m.get("role") == "tool"]
     line(
         "实测",
         GREEN,
-        f"悬挂调用·placeholder 档：投影补了 {len(tail)} 条占位 → {tail[0]['content'] if tail else '-'}；"
+        f"悬挂调用·补占位：投影补了 {len(tail)} 条占位 → {tail[0]['content'] if tail else '-'}；"
         f"原文件字节未变：{traj.log.raw_bytes() == before_bytes}",
     )
-    dropped = traj.build_context(
-        ProjectionPolicy(system_prompt=h2.policy.system_prompt, repair="drop")
-    )
-    has_calls = any(m.get("tool_calls") for m in dropped.messages)
-    line(
-        "实测",
-        GREEN,
-        f"悬挂调用·drop 档：投影里还有要工具的 assistant 吗：{has_calls}"
-        f"（连那条 assistant 一起撤了，repaired={dropped.stats['repaired']}）",
-    )
-
     # —— 现场三：孤立的审批请求 ——
     h3 = Harness(workdir / "approval", [FINAL_TEXT])
     h3.bus.record(
@@ -448,7 +438,7 @@ async def case_fork(workdir: Path) -> None:
 
     line("系统", GREEN, f"store 里的会话：{h.store.list_sessions()}")
     for name, t in (("原会话", h.traj), ("分叉", forked)):
-        p = t.build_context(h.policy)
+        p = build_context(t)
         last_user = [m for m in p.messages if m.get("role") == "user"][-1]["content"]
         line("实测", GREEN, f"{name} {t.sid[:8]}…：{len(t.entries())} 条 entry，最后一条 user = {brief(last_user)}")
     line("实测", GREEN, f"分叉的生命周期事实：{json.dumps(session_facts(forked)[-1], ensure_ascii=False)}")
@@ -501,7 +491,7 @@ async def case_live_turn(workdir: Path) -> None:
     await agent.stop()
     store.close(traj, reason="demo 结束")
 
-    projection = traj.build_context(agent.policy)
+    projection = build_context(traj)
     line("系统", GREEN, "轨迹（尾部 6 条）：")
     show_trajectory(traj, tail=6)
     line(
