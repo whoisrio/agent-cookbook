@@ -19,30 +19,23 @@
 ## Trajectory 和 messages 的关系
 在进入改造之前，我们先搞清楚trajectory和messages的关系；
 trajectory是agent操作过程中的事实记录，每一步用户和模型的动作都被原封不动的记录下来，也就是咱们一直在说的append-only；
+这些操作不光是和LLM相关的交互，也包括agent本身的一些设置，比如切换模型，切换thinking level等等；
 messages是当前会话中发给LLM的消息列表，让LLM理解当前对话的上下文，但是由于LLM上下文窗口是有限的，所以，messages实际上是当前session trajectory的子集，LLM的上下文压缩，或者用户对话进行rewind操作等等，都会导致messages和和trajectory的不一致。
-trajectory是agent 运行期间的唯一事实标准，messages是可以从trajectory还原出来的，所以当下的agent都设计从trajectory到messages的投影转换。
-
+trajectory是agent 运行期间的唯一事实标准，messages是可以从trajectory还原出来的，所以当下主流的agent都设计了从trajectory到messages的投影转换。
 
 ### trajectory的重设计
-初始的设计里，我们的trajectory(session log)设计成了list，并且没有记录每行记录之间的关系，这样的设计仅仅只能当做日志记录，没法支撑上述咱们提到的操作。因此，我们首先要给trajectory加上其引用的parent标识，那么每一行trajectory直接的关系如下。
+初始的设计里，我们的trajectory(session log)设计成了list，并且没有记录每行记录之间的关系，这样的设计仅仅只能当做日志记录，没法支撑上述咱们提到的操作。因此，我们首先要给trajectory加上其引用的parent标识，那么每一行trajectory直接的关系如下。(参考pi agent的设计，只在新增轨迹条目的记录其父节点，不做子节点记录，避免改动已有轨迹)
 
   ```text
   1 → 2 → 3 → 4          原路径，当前节点是 4
           └→ 5 → 6       rewind 到 3 再继续追加：3 现在有两个孩子
   ```
-记录到trajectory的信息，要根据是否呈现给LLM做分类，
 
-| 组 | 装什么 | 谁消费它 |
-|---|---|---|
-| 进上下文 | message / branch_summary / compaction | 模型（经投影） |
-| 改状态 | model_change / prompt_change | 投影函数（不产生消息，覆盖式提取） |
-| 纯元数据 | session_started / session_resumed / session_end / label / custom | 回放的人和 UI |
-
-具体的trajectory定义如下，
+具体的trajectory条目(entry)定义如下，
 ```python
 class Entry:
     id: str
-    parent_id: str | None
+    parent_id: str | None 
     type: str
     ts: str
     payload: dict[str, Any]
@@ -50,45 +43,49 @@ class Entry:
 各字段说明：
 
 - **id**：8 位短 UUID（`uuid4().hex[:8]`），会话内唯一，rewind / fork 的寻址坐标。
-- **parent_id**：父 entry 的 id，根节点为 `None`。认父不认子：追加只新增节点，对已有节点零写入。
+- **parent_id**：父 entry 的 id，根节点为 `None`。
 - **type**：即如上类型分组，投影函数按它分派。
 - **ts**：trajectory记录的时间戳。
 - **payload**：内容按 `type` 来区分, 比如`message`，存的是喂给模型的和模型吐出的原始数据。
 
+entry的type可选的类型大致如下，要根据type来决定是否在投影生成 message context使用该entry，
+
+| 组 | 装什么 | 谁消费它 |
+|---|---|---|
+| 进上下文 | message / branch_summary / compaction | 模型（经投影） |
+| 改状态 | model_change / prompt_change | 投影函数（不产生消息，覆盖式提取） |
+| 纯元数据 | session_started / session_resumed / session_end / label / custom | 回放的人和 UI |
+
 
 ### messages--trajectory的投影
 
-trajectory 定下来之后，messages 的来源就是一句话：**messages =
-f(trajectory)**。f 是一个纯函数，落在 agent 侧,轨迹层只管事实和树操作（对投影只暴露 `path()`），怎么 build 上下文是 agent 的活。
-agent 每次 LLM 调用前现算一遍，不缓存：算的输入是内存里的 entry 树，
-resume 时从文件加载，append 时落盘和更新索引同时做，树始终是文件的镜像。
+trajectory 定下来之后，来看看如何通过轨迹来生成messages。
+**messages =f(trajectory)**。f函数落在 agent 侧，
+agent 每次 LLM 调用前根据内存中的trajectory现算一遍，不缓存：
+resume 时从文件加载，append 时落盘和更新索引同时做，trajectory终是文件的镜像。
 
-f 内部三步（细节在机制二）：
+f 内部三步：
 1. **路径遍历**：从 leafId 沿 parentId 走回根，再 reverse 成根→叶顺序。被
    rewind 抛弃的分支根本不在这条路上，自然进不了上下文。
 2. **按 type 分派**：message 转成消息，model_change 更新当前模型，
    prompt_change 更新当前 system prompt（都是覆盖式提取），元数据跳过，
-   branch_summary 转成一条摘要 user 消息，compaction 把 `keep_from_id`
-   之前的内容换成摘要。
-3. **sanitize**：保证发给模型的消息序列合法——孤儿 tool 结果丢弃，悬挂的
-   工具调用补自描述占位。
+   如果message经过压缩，那么就从压缩点记录的位置开始取entry。
+3. **sanitize**：保证发给模型的消息序列合法，处理agent异常退出时可能写入的不完整trajectory。
 
 > 从轨迹加载回上下文，有一个小设计：system prompt 总是取最新的，而不是
 > 直接采用轨迹 header 里记的那份。落地是：初始 prompt 记在 header；之后
 > 每次运行发现 agent 的 prompt 和轨迹记录不一致（比如 resume 时换了模板），
 > attach 就追加一条 `prompt_change` entry（改状态，不进消息序列）；投影
-> 覆盖式提取、路径上最后一次生效，没有变更就回落 header。"用最新的"不是
-> 拍脑袋，而是轨迹上可审计的事实——什么时候变的、变成了什么都在文件里；
-> rewind 到变更之前，视图也诚实地回到旧 prompt。到这里，事实层是只进不出的 entry 树，视图层是从它现算出来的投影。剩下的
-工程问题是：怎么把现在的内存 list 换成这个形状，下一节讲。
+> 覆盖式提取、路径上最后一次生效，没有变更就回落 header。
 
 
 ### 有压缩的轨迹怎么组织、怎么读
+我们看看如果messages经过压缩，应该如何添加压缩entry以及如何从trajectory中恢复messages；
 
-压缩不删任何东西——append-only 之下，它只能是一个**追加的视图标记**：往树上多加一个 `compaction` entry，payload 装两样东西——`summary`（被压掉那段的摘要）和 `keep_from_id`（边界指针：从那条 entry
-起原样保留，之前的由摘要代替）。
-压缩发生时对话已经走到 e5，compA **追加在那一刻路径的末尾**（e6、e7 是
-之后才出现的，画在一起反而看不清这两个时刻）：
+现在看添加压缩节点，
+压缩不删任何东西，append-only 之下，它只能是一个**追加的视图标记**：往树上多加一个 `compaction` entry，payload 装两样东西——`summary`（被压掉那段的摘要）和 `keep_from_id`（边界指针：从那条entry起原样保留，之前的由摘要代替）。
+
+在如下轨迹样例中，压缩发生时对话已经走到 e5，compA **追加在那一刻路径的末尾**(压缩e1+e2，保留最近滑窗 e3+e4)
 
 ```text
 压缩发生时：  e1 e2 | e3 e4 e5 [compA(keep_from=e3)]
@@ -97,56 +94,75 @@ f 内部三步（细节在机制二）：
 之后继续对话：e1 e2 | e3 e4 e5 compA e6 e7 ...
                                     ↑ 新对话接在 compA 之后
 ```
-
 两个时刻的信息都在 entry 里：`keep_from_id=e3` 画出"e1 e2 由摘要代替、
 e3 起原样保留"的刀口；节点本身挂在压缩那一刻的 leaf 上。
 
-再说说读取。投影走到 compaction 节点时，按四条规则处理：
-
-1. **只认当前路径上的 compaction**。rewind 到它之前，它就不在路径上，
-   压缩当没发生过，e1、e2 逐字回来——压缩是视图，不是对数据的手术，
-   回退就是天然的撤销。
-2. **`keep_from_id` 之前跳过、从它起原样保留**。跳过不是删除，e1、e2
+再说说读取。投影走到 compaction 节点时，按如下规则处理：
+1. **`keep_from_id` 之前跳过、从它起原样保留**。跳过不是删除，e1、e2
    还在文件里，只是这一刀的视图里不出现。
-3. **摘要插在视图最前**，不是它树上所在的位置。节点追加在压缩那一刻的
+2. **摘要插在视图最前**，不是它树上所在的位置。节点追加在压缩那一刻的
    路径末尾，但它代表的是最前面那段被压掉的历史——树上位置和视图位置
    相反。最终顺序是 `[system, summary, e3, e4, e5, e6 ...]`：摘要开头，
    其后全是原文。
-4. **`keep_from_id` 有两条约束**：必须在当前路径上（不在则整个节点按
-   元数据跳过）；且要选在序列合法的边界（一轮的开头）——选在 turn 中间，
-   保留段会以孤儿 tool 结果开头，被 sanitize 丢弃。
 
-
-## rewind 与 fork——切换不修改历史，只创造新的"当前"
+### rewind 与 fork——切换不修改历史，只创造新的"当前"
 
 **rewind**（`branch(to_id)`）的实现核心就一行：`self.leaf_id = to_id`。
-没有任何 entry 被删除——它们还在 byId 里、还在文件里，只是不在当前路径上。
-回退后继续追加，**分支**就出现了：两个节点共享同一个 parent。
+rewind后，从rewind点拉出session分支，如下所示，从4rewind到3后，新的5的parent是3.
 
 ```text
 1 → 2 → 3 → 4          branch(3) 前的原路径
         └→ 5           branch(3) 后追加：3 有两个孩子（4 和 5）
 ```
 
-可选的**带摘要 rewind**（`branch_with_summary(keep_from_id, summary)`）比
-裸 rewind 多一个动作：摘要节点挂在 keep_from 之下，leaf 挪到摘要节点上。
-接上面的例子，调用 `branch_with_summary(3, "4、5 里试过 X，结论是 Y")`：
+**rewind 落点与压缩视图**
+rewind 就是移指针，对 compaction 节点没有任何特殊处理，差别全在投影怎么读它。
+拿压缩后的轨迹看两个落点（压缩发生时对话走到 e5，compA 压掉 e1、e2，之后
+又聊了 e6、e7、e8）：
 
 ```text
-1 → 2 → 3 ─┬→ 4 → 5      被抛弃段（还在文件里）：被摘要的就是这段
-           └→ summary    摘要节点，挂在 3 下（与 4 同父）
-               └→ 6      新分支从 summary 继续
-
-当前路径（leaf = 6）：1 → 2 → 3 → summary → 6 —— summary 就在这条路径上，
-位置正是"1、2、3 之后、代表被压缩的 4、5"；不在路径上的是 4 → 5。
+e1 e2 | e3 e4 e5 compA(keep_from=e3) e6 e7 e8        leaf = e8
 ```
 
-谁被谁摘要：**4 → 5 那段被摘要**（keep_from 之后到原 leaf），摘要文本由
-调用方写进 payload；keep_from（3）本身不被摘要——它是新路径的锚点。摘要
-节点与 4 同父，新分支的投影因此多一条 `<summary>` user 消息——知道历史，
-不被细节淹没。
+**落点一：rewind 到 压缩发生前的 e5 或更早的entry，就当压缩没发生过：
 
+```text
+e1 → e2 → e3 → e4 → e5 ─┬→ compA(keep_from=e3) → e6 → e7 → e8
+                        └→ 9     branch(e5) 后继续对话：9 与 compA 同父
 
+新的路径（leaf = 9）：e1 → e2 → e3 → e4 → e5 → 9
+                     —— compA 连同 e6 e7 e8 都不在路径上
+投影：[system, e1, e2, e3, e4, e5, 9]    旧消息逐字回来——压缩是视图，不是
+                                        对数据的手术
+```
+
+**落点二：rewind 到 压缩点compA**（`branch(compA)`）。路径到 e1 e2 e3 e4 e5 compA
+为止：
+
+```text
+e1 → e2 → e3 → e4 → e5 → compA ─┬→ e6 → e7 → e8
+                                └→ 9     branch(compA) 后继续对话：9 与 e6 同父
+
+新的路径（leaf = 9）：e1 → e2 → e3 → e4 → e5 → compA → 9
+投影：[system, <摘要>, e3, e4, e5, 9]    e1、e2 跳过、摘要插最前——回到压缩
+                                        刚做完那一刻的样子
+```
+
+两个落点文件都一个字节没动，e6、e7、e8 原样躺着；差别只在路径走到哪、投影因此算出什么。
+
+**branch_with_summary——rewind 时给被抛弃段留摘要**
+还有一种带分支整理能力的summary，比如用户在session a中要求agent执行任务，进行了多轮对话，但是效果不尽如任意，希望切回某个初始点，尝试别的方式，
+rewind回到过去时，希望一并把当前session已经做的尝试进行summary以避免agent重复相同的路径，那么rewind+summary之后的路径就会变成如下，
+
+```text
+1 → 2 → 3 ─┬→ 4 → 5      被抛弃段，原样躺在文件里
+           └→ S           新增的摘要节点，挂在 3 下（与 4 同父）
+               └→ 6      之后的新对话从 S 继续
+
+当前路径（leaf = 6）：1 → 2 → 3 → S → 6
+投影：[system, 1, 2, 3, <summary>4、5 里试过 X，结论是 Y</summary>, 6…]
+```
+这个summary是rewind操作的一种可选项，比如pi agent通过`tree`切换对话分支时，就提供了这样的能力
 
 **fork**（`SessionStore.fork`）把当前路径克隆进一份新会话文件（id 与
 parentId 原样保留，补一条 `session_resumed` 说明 forked_from）。新文件是
@@ -165,43 +181,11 @@ e1 e2 e3 e4 e5                          ← 原样克隆：id / parentId 不改
 session_resumed {forked_from: A}        ← 生命周期标记，也是新的 leaf
 ```
 
-id 原样保留（不重新编号）——per-session 文件隔离，两份文件里的同名 id
-互不冲突。和原始路径的关系只有一条线索：`session_resumed` 里的
-`forked_from`（审计留痕，不是引用）；之后两条轨迹各自生长，一边 rewind /
-压缩 / 追加都影响不到另一边。
+id 原样保留（不重新编号）——per-session 文件隔离，两份文件里的同名 id互不冲突。和原始路径的关系只有一条线索：`session_resumed` 里的
+`forked_from`（审计留痕，不是引用）；之后两条轨迹各自生长，一边 rewind /压缩 / 追加都影响不到另一边。
 
-fork 和 rewind 虽然都叫"分叉"，但不在一个层上：rewind 是**树内分叉**
-（同一份文件里两条路径共存），fork 是**会话级分叉**（新文件，与旧文件
-从此无关）——"回到刚才那步重来"用 rewind，"两条时间线都要活着"用 fork。
-
-### 实测（demo 第 3 段）
-
-```text
-[实测] branch(07df5b83)：文件里还是 6 条 entry（6 → 6，一条没删），字节未变：True
-[实测] 回退后投影只剩 2 条消息（system + 那条 user）
-[实测] 回退后追加 = 分支：07df5b83 现在有两个孩子 ['e2e7b5b7', '3a546b41']
-       （grep parentId 的程序版）
-[实测] branch_with_summary：摘要节点 4ab442a6 挂在 07df5b83 下（抛弃了 1 个 entry）
-[系统] 现在的投影（新分支的 agent 看到的）：
-  system    你是一个通过工具干活的通用 agent。
-  user      保温杯还有库存吗
-  user      <summary>试过查保温杯库存（42 件），结论：库存充足，无需补货。</summary>
-       说明 │ 被抛弃的分支原样躺在文件里——想回头随时能回（branch 回去即可）。
-```
-
-### session 切换（demo 第 5 段实测）
-
-```text
-[系统] store 里的会话：['5a7b8f59…', 'a6c8b997…']
-[实测] 原会话 5a7b8f59…：7 条 entry，最后一条 user = 旧会话的下一句
-[实测] 分叉 a6c8b997…：8 条 entry，最后一条 user = 新会话的下一句
-[实测] 分叉的生命周期事实：{"type": "session_resumed", "forked_from": "5a7b8f59…"}
-       说明 │ session 切换不修改历史，只创造新的"当前"：模型切换是树上的
-             新节点，会话切换是新文件——都是追加，都不是改写。
-```
-
-## 机制四：异常恢复——三级收口
-
+### 异常恢复——三级收口
+下面，再来看看从trajectory恢复session时的异常保护；
 假如agent在运行时出现了异常导致进程挂掉，trajectory可能就会不完整，按残迹分三种。resume（store 的第二个入口：从盘上读回轨迹重建树，然后追加一条 `session_resumed`，标记"第二次运行从这里开始"）逐个处理：
 
 **1. 格式不完整**——死在一条记录中间，长度/CRC 对不上：
@@ -230,6 +214,38 @@ EventLog 那本账上（Stage 4 的审批流），Trajectory 不涉及：
 resume 后（EventLog）：... approval_required
                        → approval_decided{action: abandoned}      ← bus.record 补，幂等
 ```
+
+## 代码改动
+
+
+## demo
+### 实测（demo 第 3 段）
+
+```text
+[实测] branch(07df5b83)：文件里还是 6 条 entry（6 → 6，一条没删），字节未变：True
+[实测] 回退后投影只剩 2 条消息（system + 那条 user）
+[实测] 回退后追加 = 分支：07df5b83 现在有两个孩子 ['e2e7b5b7', '3a546b41']
+       （grep parentId 的程序版）
+[实测] branch_with_summary：摘要节点 4ab442a6 挂在 07df5b83 下（抛弃了 1 个 entry）
+[系统] 现在的投影（新分支的 agent 看到的）：
+  system    你是一个通过工具干活的通用 agent。
+  user      保温杯还有库存吗
+  user      <summary>试过查保温杯库存（42 件），结论：库存充足，无需补货。</summary>
+       说明 │ 被抛弃的分支原样躺在文件里——想回头随时能回（branch 回去即可）。
+```
+
+### session 切换（demo 第 5 段实测）
+
+```text
+[系统] store 里的会话：['5a7b8f59…', 'a6c8b997…']
+[实测] 原会话 5a7b8f59…：7 条 entry，最后一条 user = 旧会话的下一句
+[实测] 分叉 a6c8b997…：8 条 entry，最后一条 user = 新会话的下一句
+[实测] 分叉的生命周期事实：{"type": "session_resumed", "forked_from": "5a7b8f59…"}
+       说明 │ session 切换不修改历史，只创造新的"当前"：模型切换是树上的
+             新节点，会话切换是新文件——都是追加，都不是改写。
+```
+
+
 
 ### 实测（demo 第 4 段）
 
@@ -285,7 +301,7 @@ bus / events / persistence / llm / outbound / subscribers 与 stage04 一字
 | 事实层 | entry 树，裸 jsonl 行 | entry 树，长度前缀 + CRC（残尾可判定） |
 | entry 类型 | 9 种，按对 LLM 调用的影响分三组 | 10 种：9 种同构（lifecycle 换成 session_* 三个）+ `prompt_change`（pi 的 prompt 在 harness 不落盘） |
 | 追加 | appendEntry：认父 + 移 leafId | 同 |
-| rewind | `branch()`：leafId = to_id | 同；另有 `branch_with_summary` |
+| rewind | `branch()`：leafId = to_id；`branchWithSummary`（切分支时总结被弃分支，摘要由模型生成） | 同；摘要是收的文本，模型生成与否归宿主 |
 | 上下文 | buildSessionContext：路径遍历 + 分派 | build_context：同构 + sanitize 补占位收口 |
 | 压缩 | CompactionEntry + firstKeptEntryId | 同语义，本书叫 `keep_from_id`（"从它开始保留"），触发归 5b |
 | 恢复 | transformMessages 收口（drop） | sanitize 补占位 + CRC 残尾 + 悬挂审批闭合 |
