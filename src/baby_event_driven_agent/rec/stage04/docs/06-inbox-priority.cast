@@ -1,0 +1,13 @@
+{"version":3,"term":{"cols":120,"rows":40},"timestamp":1790219627,"idle_time_limit":1.0,"command":"/Users/rio/repos/myprjs/agent-cookbook/.venv/bin/python3 -m baby_event_driven_agent.stages.stage04_message_bus.main 06-inbox-priority --sessions-dir /Users/rio/repos/myprjs/agent-cookbook/src/baby_event_driven_agent/sessions/stage04","title":"stage04/06-inbox-priority · 第 6 段：下行的优先级：插队有先后（不打模型，独立跑）","env":{"SHELL":"/bin/zsh"}}
+[0.366, "o", "\r\n\u001b[1m── 06-inbox-priority · 第 6 段：下行的意图与优先级：插队有先后 ──\u001b[0m\r\n\u001b[90m       说明 │ 收件箱按用户意图分成两条优先队列：followup（默认，排队等下一轮）和steering（点名插话，step 边界按 priority 拼进当前轮）。打断（stop / redirect）和审批答复走旁路，先于一切队列——redirect 的纠正排在插话之前。\u001b[0m\r\n"]
+[0.000, "o", "\r\n\u001b[1m\u001b[33m[用户] \u001b[0m\u001b[33m先改库存\u001b[0m\r\n"]
+[0.001, "o", "\r\n\u001b[1m\u001b[2m[用户] \u001b[0m\u001b[2m排队的话（followup，默认——不插话）\u001b[0m\r\n"]
+[0.000, "o", "\r\n\u001b[1m\u001b[33m[用户] \u001b[0m\u001b[33m常规插话（intent=steering，priority=100）\u001b[0m\r\n\r\n\u001b[1m\u001b[33m[用户] \u001b[0m\u001b[33m加急插话（intent=steering，priority=10）\u001b[0m\r\n\r\n\u001b[1m\u001b[33m[系统] \u001b[0m\u001b[33m用户改主意了：把排队的那条升级为插话（promote）\u001b[0m"]
+[0.000, "o", "\r\n"]
+[0.000, "o", "\u001b[90m       说明 │ promote 精确移动那一条消息（followup → steering），别的排队消息不动；同步操作，与 worker 的取件天然互斥。升级成功。\u001b[0m\r\n\r\n\u001b[1m\u001b[33m[系统] \u001b[0m\u001b[33m转向：先别改库存了，去订会议室（redirect 旁路）\u001b[0m\r\n"]
+[0.502, "o", "\r\n\u001b[1m\u001b[32m[工具] \u001b[0m\u001b[32m← update_inventory 结果：已更新（demo 副本）\u001b[0m\r\n"]
+[0.000, "o", "\r\n\u001b[1m\u001b[32m[系统] \u001b[0m\u001b[32m插话按优先级拼进本轮：加急插话 → 排队的话（followup） → 常规插话\u001b[0m\r\n"]
+[0.001, "o", "\r\n\u001b[1m\u001b[32m[系统] \u001b[0m\u001b[32mturn 结束（reason=turn end）\u001b[0m\r\n"]
+[0.000, "o", "\r\n\u001b[1m\u001b[32m[实测] \u001b[0m\u001b[32m本轮上下文里的次序：转向纠正 → 加急插话(10) → 排队的话(100) → 常规插话(100)——升级的那条按自己的 priority 参与本轮 drain，没有丢、没有抢占别人的位置\u001b[0m\r\n"]
+[0.000, "o", "\u001b[90m       说明 │ 三类消息各归各位：followup 是用户说‘等下一轮’；steering 是用户说‘下个 step 前插进来’，按 priority 出队；redirect 不排队，纠正文本第一时刻落进上下文。promote 让排队消息可以中途升级，精确移动、不乱序。控制权在发布端（Stage 2 的消费时机分类到本章演进为用户显式指定意图）。\u001b[0m\r\n"]
+[0.077, "x", "0"]

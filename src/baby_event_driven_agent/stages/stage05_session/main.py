@@ -382,7 +382,7 @@ async def case_recovery(workdir: Path) -> None:
     )
     # 进程到这里被硬杀：assistant 要了工具结果，结果永远没来
     before_bytes = traj.log.raw_bytes()
-    fixed = build_context(traj, system_prompt=h2.system_prompt)  # 补自描述占位
+    fixed = build_context(traj)  # 补自描述占位；system prompt 从 header 提取
     tail = [m for m in fixed.messages if m.get("role") == "tool"]
     line(
         "实测",

@@ -78,3 +78,26 @@ class CoalescingBuffer:
 def install_delta_sink(buffer: CoalescingBuffer, kind: str = "") -> Callable[[Event], object]:
     """把 buffer 接到 agent_delta / agent_thinking 上（demo 用）。"""
     return lambda event: buffer.add(str(event.payload.get("text", "")))
+
+
+class StreamConsumer(CoalescingBuffer):
+    """stream 事件消费者基类：热路径 offer 只做缓冲追加（微秒级），
+    满格 / 帧界触发 on_flush——子类只实现慢侧钩子（刷新 UI）。
+
+    事件订阅约束：agent_delta / agent_thinking 只允许邮箱型消费者订阅
+    （事件类型自己声明，events.require_consumable，订阅构造时问它）——
+    逐条 await handler 会把每次调用的耗时放大进 emit，热路径必须留在基类里。
+    """
+
+    def __init__(self, *, max_chars: int = 96, frame: float = 0.05) -> None:
+        super().__init__(self._emit_flush, max_chars=max_chars, frame=frame)
+
+    def _emit_flush(self, text: str) -> None:
+        self.on_flush(text)
+
+    def offer(self, event: Event) -> None:
+        self.add(str(event.payload.get("text", "")))
+
+    def on_flush(self, text: str) -> None:
+        """帧界回调：子类在这里刷新 UI。基类不提供默认实现。"""
+        raise NotImplementedError

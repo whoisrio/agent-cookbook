@@ -1,7 +1,7 @@
-"""LLM 客户端与工具（与 stage01~03 相同，四件套读写成对）。
+"""LLM 客户端（工具定义在 tools.py——工具的事归工具）。
 
 RealLLM：OpenAI 兼容的流式客户端，配置读仓库根 .env，环境变量优先。
-本章的传输层测试大多不需要模型（总线 / 落盘 / 治理都可以离线验），
+本章的传输层测试大多不需要模型（总线 / 治理都可以离线验），
 只有“真跑一轮”的用例打真模型。
 
 增量协议（归一化 chunk）：
@@ -22,8 +22,7 @@ from typing import Any
 from dotenv import dotenv_values
 from openai import AsyncOpenAI
 
-Args = dict[str, Any]
-ToolFn = Any  # async (Args) -> str
+from .tools import TOOL_SCHEMAS
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _CONFIG = dotenv_values(_REPO_ROOT / ".env")
@@ -32,186 +31,6 @@ _CONFIG = dotenv_values(_REPO_ROOT / ".env")
 def _cfg(key: str) -> str:
     """环境变量优先于 .env 文件——临时换模型不用改文件。"""
     return os.environ.get(key) or _CONFIG.get(key) or ""
-
-
-# ---------------------------------------------------------------- 工具
-
-# 知识库各 stage 共享：inventory.txt 模拟业务库，rules.txt 模拟规则库
-_KB = Path(__file__).resolve().parents[2] / "knowledge-base"
-_INVENTORY = _KB / "inventory.txt"
-_RULES = _KB / "rules.txt"
-
-
-def _read_lines(path: Path) -> list[str]:
-    return [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-
-
-async def query_inventory(args: Args) -> str:
-    """品类库存查询：命中返回该品类一行；没命中返回现有品类清单。"""
-    category = str(args.get("category", "")).strip()
-    lines = _read_lines(_INVENTORY)
-    hits = [ln for ln in lines if category in ln]
-    if hits:
-        return "\n".join(hits)
-    names = "、".join(ln.split("：", 1)[0] for ln in lines)
-    return f"未收录该品类。现有品类：{names}"
-
-
-async def update_inventory(args: Args) -> str:
-    """添加新品类或更新已有品类的库存与规格，真写 inventory.txt。"""
-    category = str(args.get("category", "")).strip()
-    stock = args.get("stock", 0)
-    spec = str(args.get("spec", "")).strip().rstrip("。")
-    if not category:
-        return "缺少 category，未执行"
-    new_line = (
-        f"{category}：库存 {stock} 件；{spec}。" if spec else f"{category}：库存 {stock} 件。"
-    )
-    lines = _read_lines(_INVENTORY)
-    out: list[str] = []
-    replaced = False
-    for ln in lines:
-        if ln.split("：", 1)[0] == category:
-            out.append(new_line)
-            replaced = True
-        else:
-            out.append(ln)
-    if not replaced:
-        out.append(new_line)
-    _INVENTORY.write_text("\n".join(out) + "\n", encoding="utf-8")
-    return f"{'已更新' if replaced else '已添加'}：{new_line}"
-
-
-async def search_rules(args: Args) -> str:
-    """规则库检索：逐行匹配，返回命中的规则条目。
-
-    先按空格分词匹配；整句分不出词（没有空格）就退化成 2 字滑窗，
-    命中两个以上片段才算。
-    """
-    query = str(args.get("query", "")).strip()
-    lines = _read_lines(_RULES)
-    terms = [t for t in query.split() if t] or ([query] if query else [])
-    hits = [ln for ln in lines if any(t in ln for t in terms)]
-    if not hits and len(query) > 2:
-        grams = [query[i : i + 2] for i in range(len(query) - 1)]
-        hits = [ln for ln in lines if sum(g in ln for g in grams) >= 2]
-    return "\n".join(hits) if hits else "（无命中）"
-
-
-async def update_rules(args: Args) -> str:
-    """按标题添加或更新一条规则（存在则整行替换），真写 rules.txt。"""
-    title = str(args.get("title", "")).strip()
-    content = str(args.get("content", "")).strip()
-    if not title or not content:
-        return "需要 title 和 content，未执行"
-    new_line = f"{title}：{content.rstrip('。')}。"
-    lines = _read_lines(_RULES)
-    out: list[str] = []
-    replaced = False
-    for ln in lines:
-        if ln.split("：", 1)[0] == title:
-            out.append(new_line)
-            replaced = True
-        else:
-            out.append(ln)
-    if not replaced:
-        out.append(new_line)
-    _RULES.write_text("\n".join(out) + "\n", encoding="utf-8")
-    return f"{'已更新' if replaced else '已添加'}：{new_line}"
-
-
-# 工具描述就是给模型的路由依据：查什么数据、查什么规则、什么时候写，
-# 写得越清楚，模型选错工具的概率越低。
-TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "query_inventory",
-            "description": "查询品类库存与规格（业务数据）。品类名如：保温杯、玻璃杯",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "category": {"type": "string", "description": "品类名"}
-                },
-                "required": ["category"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_inventory",
-            "description": "添加新品类，或更新某品类的库存数量与规格",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "category": {"type": "string", "description": "品类名"},
-                    "stock": {"type": "integer", "description": "库存件数"},
-                    "spec": {"type": "string", "description": "规格描述，可省略"},
-                },
-                "required": ["category", "stock"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_rules",
-            "description": "检索团队规则、流程、制度（如会议室预订、VPN 申请、报销）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "检索词，多个关键词用空格分隔",
-                    }
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_rules",
-            "description": "添加一条新规则，或按标题更新已有规则的内容",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string", "description": "规则标题，如：报销"},
-                    "content": {"type": "string", "description": "规则内容"},
-                },
-                "required": ["title", "content"],
-            },
-        },
-    },
-]
-
-TOOLS: dict[str, ToolFn] = {
-    "query_inventory": query_inventory,
-    "update_inventory": update_inventory,
-    "search_rules": search_rules,
-    "update_rules": update_rules,
-}
-
-
-def build_system_prompt(schemas: list[dict[str, Any]] | None = None) -> str:
-    """system prompt 从 tool schemas 生成：工具的分工只写在 description 一处。"""
-    schemas = schemas if schemas is not None else TOOL_SCHEMAS
-    lines = ["你是一个通过工具干活的通用 agent。可用工具："]
-    for s in schemas:
-        fn = s["function"]
-        params = "、".join(fn["parameters"].get("properties", {}))
-        lines.append(f"- {fn['name']}：{fn['description']}" + (f"（参数：{params}）" if params else ""))
-    lines.append(
-        "必须基于事实回答用户问题。用户的问题或请求涉及上面某个工具时，"
-        "选对工具、先拿到真实结果再回答；获取不到准确信息就回答不知道，严禁编造。"
-        "用户要求记录或修改时，用对应的写工具落库，然后一句话确认改了什么。"
-    )
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------- 客户端
 
 
 class RealLLM:

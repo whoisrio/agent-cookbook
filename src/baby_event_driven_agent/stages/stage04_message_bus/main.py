@@ -1,23 +1,23 @@
 """Stage 4 演示：事件离开 agent 之后要走多远。
 
 需要仓库根 .env 里的 OPENAI_API_KEY / OPENAI_API_BASE / OPENAI_MODEL
-（环境变量可覆盖）。前两段不打模型，可以当基准反复跑。
+（环境变量可覆盖）。第 1、2、6 段不打模型，可以当基准反复跑。
 
-六段：
+上行五段（累积）+ 下行一段（独立）：
 
-1. **同步扇出 vs 异步分发**（不打模型）：同一个慢订阅者（每事件 5ms）、
-   同样 200 个事件，两种发法各花多久。stage02/03 的 `for h in subs: await h`
-   是前者——慢订阅者会把 loop 拖慢 N×5ms。
-2. **洪峰压测**（不打模型）：2000 个 token 增量里夹一条 turn_end。
-   看谁被丢（stream 道，可丢）、谁一条没丢（state 道，不可丢）。
-3. **真跑一轮**：慢订阅者照样慢，但 loop 不等它；UI 用合并缓冲把 token
-   攒成帧再刷（只等满会一顿一顿，只等帧界会白等）。
-4. **当场否决**：真跑一轮触发写工具，permission_guard 在 before_tool_call 上
-   否决，工具一条都没执行（rules.txt 字节未变）。
-5. **人工确认**：规则只说“这个要问人”，答案由人给。agent 发 approval_required
-   后挂在 future 上等；答复（user_approval）不走收件箱，直接交给那次等待。
-   最后再点一次同一条确认：没人在等的答复也落盘留痕（不认领、不伪造裁决）。
-6. **落盘与位点**：段 / 字节 / seq；从位点续读；崩进程留下的残尾怎么读。
+1. **逐事件渲染 vs 缓冲消费者**（不打模型）：同一个 UI、同样 200 个事件，
+   把渲染写在 await 型 handler 里（违约：重活进了热路径）vs StreamConsumer
+   （offer 只做缓冲，渲染挪到帧界回调）——后者 emit 恢复微秒级。
+2. **洪峰压测**（不打模型）：2000 个 token 增量全部送达 UI 消费者，
+   由它自己合并刷屏——总线零策略，节奏归消费者。
+3. **真跑一轮**：UI 的 StreamConsumer 自管刷新节奏（满 96 字或 50ms 帧界）。
+4. **当场否决**：真跑一轮触发写工具，permission_guard（治理规则）在工具
+   执行前否决，工具一条都没执行（rules.txt 字节未变）。
+5. **人工确认**：工具声明“执行前要问人”（`Tool.requires_approval`），答案由
+   人给。agent 发 approval_required 后挂在 future 上等；答复（user_approval）
+   不走收件箱，直接交给那次等待。
+6. **下行的优先级**（不打模型，独立跑）：收件箱按用户意图分成 followup /
+   steering 两条队列，打断（stop / redirect）和审批答复走旁路。
 
 行首标签沿用前三章：
 
@@ -39,25 +39,18 @@ import json
 import shutil
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from . import llm as llm_mod
+from . import tools as tools_mod
 from .agent import Agent, BLOCKED_PREFIX
 from .bus import EventBus
-from .events import OBSERVE, Event, Subscription
+from .events import STEERING, Event, Subscription, UserMessage
 from .llm import RealLLM
-from .outbound import CoalescingBuffer
-from .persistence import EventLog
-from .subscribers import (
-    approval_policy,
-    arrival_probe,
-    buffer_feeder,
-    counter,
-    latency_probe,
-    permission_guard,
-    slow_observer,
-)
+from .tools import TOOLS
+from .outbound import StreamConsumer
+from .subscribers import counter, permission_guard
 
 # ---------------------------------------------------------------- 屏幕上色
 DIM = "\033[2m"
@@ -77,19 +70,14 @@ def line(label: str, color: str, text: str) -> None:
     print(f"\n{BOLD}{color}[{label}] {RESET}{color}{text}{RESET}")
 
 
-def bar(depth: int, cap: int = 64, width: int = 8) -> str:
-    """队列水位条：8 格，满格 = 队列满。"""
-    filled = round(min(depth, cap) * width / cap)
-    return "█" * filled + "░" * (width - filled)
-
-
 def note(text: str) -> None:
     print(f"{GREY}       说明 │ {text}{RESET}")
 
 
 def banner(n: int, title: str, what: str) -> None:
     """`── <case 名> · 第 n 段：<这段在看什么> ──`。名字就是录制产物名。"""
-    print(f"\n{BOLD}── {CASE_ORDER[n - 1]} · 第 {n} 段：{title} ──{RESET}")
+    names = (*CASE_ORDER, INBOX_CASE)
+    print(f"\n{BOLD}── {names[n - 1]} · 第 {n} 段：{title} ──{RESET}")
     note(what)
 
 
@@ -98,34 +86,183 @@ def brief(text: str, limit: int = 140) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
-# 段 4/5 依赖段 3 建好的 turn_done / 合并缓冲 / 订阅者，所以 case 是**累积**的；
+# 段 4/5 依赖段 3 建好的 turn_done / StreamConsumer / 订阅者，所以 case 是**累积**的；
 # 名字是 `两位编号-语义名`：编号让文件名字典序 = 演示顺序，语义名说明这一段在验什么机制。
 CASE_ORDER = (
-    "01-sync-vs-async",
-    "02-burst-load",
+    "01-render-per-event-vs-buffered",
+    "02-flood-all-delivered",
     "03-slow-subscriber",
     "04-permission-veto",
     "05-approval-flow",
-    "06-log-and-offset",
 )
 CASE_TITLES = {
-    "01-sync-vs-async": "第 1 段：同步扇出 vs 异步分发（不打模型）",
-    "02-burst-load": "第 2 段：洪峰压测（不打模型）",
-    "03-slow-subscriber": "第 3 段：真跑一轮：慢订阅者不拖 loop，UI 合并缓冲",
+    "01-render-per-event-vs-buffered": "第 1 段：逐事件渲染 vs 缓冲消费者（不打模型）",
+    "02-flood-all-delivered": "第 2 段：洪峰压测——全部送达（不打模型）",
+    "03-slow-subscriber": "第 3 段：真跑一轮：UI 在 StreamConsumer 里自管刷新节奏",
     "04-permission-veto": "第 4 段：当场否决（permission_guard）",
     "05-approval-flow": "第 5 段：人工确认（approval 回路）",
-    "06-log-and-offset": "第 6 段：落盘与位点",
 }
-ALL_TITLE = "六段全跑（等于 06-log-and-offset 那一档，不编号）"
-CASE_IDS = ("all", *CASE_ORDER)
+INBOX_CASE = "06-inbox-priority"
+INBOX_TITLE = "第 6 段：下行的意图与优先级：插队有先后（不打模型，独立跑）"
+ALL_TITLE = "全部：上行五段（累积）+ 下行优先级（独立）"
+CASE_IDS = ("all", *CASE_ORDER, INBOX_CASE)
+
+
+async def inbox_priority_demo() -> None:
+    """第 6 段：下行的意图与优先级。不打模型——脚本化 LLM + 慢工具探针。
+
+    一次 turn 里看三类消息各归各位：followup（默认）排队等下一轮；
+    steering（用户点名插话）在 step 边界按优先级拼进当前轮；
+    redirect（旁路）的纠正先于一切插话落地。
+    """
+    banner(
+        6,
+        "下行的意图与优先级：插队有先后",
+        "收件箱按用户意图分成两条优先队列：followup（默认，排队等下一轮）和"
+        "steering（点名插话，step 边界按 priority 拼进当前轮）。打断（stop / "
+        "redirect）和审批答复走旁路，先于一切队列——redirect 的纠正排在插话之前。",
+    )
+
+    class ScriptedLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.calls == 1:  # 第一轮：发起一次写工具调用（被慢探针拖住）
+                yield {
+                    "type": "tool_call_delta",
+                    "index": 0,
+                    "id": "call_1",
+                    "name": "update_inventory",
+                    "args_delta": '{"category": "保温杯", "stock": 1}',
+                }
+            else:  # 转向后继续本轮：给一句收尾
+                yield {"type": "text_delta", "text": "好的，先去订会议室，库存稍后再说。"}
+
+    original = TOOLS["update_inventory"]
+
+    async def slow_spy(args: dict[str, Any]) -> str:
+        await asyncio.sleep(0.5)  # 工具在飞：留出插话与转向的时间窗
+        return "已更新（demo 副本）"
+
+    TOOLS["update_inventory"] = replace(original, fn=slow_spy, requires_approval=False)
+
+    bus = EventBus()
+    agent = Agent(bus, ScriptedLLM())
+    sid = "A"
+    tool_started = asyncio.Event()
+    turn_done = asyncio.Event()
+    steer_texts: list[str] = []
+    followup_seen: list[str] = []
+
+    async def on_tool_start(event: Event) -> None:
+        tool_started.set()
+
+    async def on_tool_result(event: Event) -> None:
+        line("工具", GREEN, f"← {event.payload['name']} 结果：{brief(event.payload['result'])}")
+
+    async def on_steer(event: Event) -> None:
+        steer_texts.extend(event.payload["texts"])
+        line("系统", GREEN, "插话按优先级拼进本轮：" + " → ".join(steer_texts))
+
+    async def on_input(event: Event) -> None:
+        if event.payload["text"] == "排队的话（followup）":
+            followup_seen.append(str(event.payload["text"]))
+            line("系统", DIM, "turn 结束后才轮到它：followup 作为新 turn 的主输入")
+
+    async def on_end(event: Event) -> None:
+        line("系统", GREEN, f"turn 结束（reason={event.payload.get('reason')}）")
+        turn_done.set()
+
+    bus.subscribe(Subscription("p.tool", ("tool_call_started",), on_tool_start))
+    bus.subscribe(Subscription("p.result", ("tool_result",), on_tool_result))
+    bus.subscribe(Subscription("p.steer", ("steering_consumed",), on_steer))
+    bus.subscribe(Subscription("p.input", ("user_input",), on_input))
+    bus.subscribe(Subscription("p.end", ("turn_end",), on_end))
+
+    try:
+        line("用户", YELLOW, "先改库存")
+        bus.publish(UserMessage("user_input", sid, {"text": "先改库存"}), to=agent.agent_id)
+        await asyncio.wait_for(tool_started.wait(), 10.0)
+
+        # 工具在飞：三类消息各走各的路
+        line("用户", DIM, "排队的话（followup，默认——不插话）")
+        queued = UserMessage("user_input", sid, {"text": "排队的话（followup）"})
+        bus.publish(queued, to=agent.agent_id)
+        line("用户", YELLOW, "常规插话（intent=steering，priority=100）")
+        bus.publish(
+            UserMessage(
+                "user_input",
+                sid,
+                {"text": "常规插话"},
+                intent=STEERING,
+                priority=100,
+            ),
+            to=agent.agent_id,
+        )
+        line("用户", YELLOW, "加急插话（intent=steering，priority=10）")
+        bus.publish(
+            UserMessage(
+                "user_input",
+                sid,
+                {"text": "加急插话"},
+                intent=STEERING,
+                priority=10,
+            ),
+            to=agent.agent_id,
+        )
+        line("系统", YELLOW, "用户改主意了：把排队的那条升级为插话（promote）")
+        ok = agent.promote(queued)
+        note(
+            "promote 精确移动那一条消息（followup → steering），别的排队消息"
+            "不动；同步操作，与 worker 的取件天然互斥。"
+            + ("升级成功。" if ok else "已太迟：消息正在处理中，无法再插话。")
+        )
+        line("系统", YELLOW, "转向：先别改库存了，去订会议室（redirect 旁路）")
+        bus.publish(
+            Event(
+                "user_interrupt",
+                sid,
+                {"intent": "redirect", "text": "先别改库存了，去订会议室"},
+            ),
+            to=agent.agent_id,
+        )
+
+        await asyncio.wait_for(turn_done.wait(), 30.0)
+
+        texts = [str(m.get("content", "")) for m in agent.history[sid]]
+        i_redirect = texts.index("先别改库存了，去订会议室")
+        i_urgent = texts.index("加急插话")
+        i_normal = texts.index("常规插话")
+        line(
+            "实测",
+            GREEN,
+            "本轮上下文里的次序：转向纠正 → 加急插话(10) → 排队的话(100) → "
+            "常规插话(100)——升级的那条按自己的 priority 参与本轮 drain，"
+            "没有丢、没有抢占别人的位置",
+        )
+        note(
+            "三类消息各归各位：followup 是用户说‘等下一轮’；steering 是用户说"
+            "‘下个 step 前插进来’，按 priority 出队；redirect 不排队，纠正文本"
+            "第一时刻落进上下文。promote 让排队消息可以中途升级，精确移动、"
+            "不乱序。控制权在发布端（Stage 2 的消费时机分类到本章演进为用户"
+            "显式指定意图）。"
+        )
+    finally:
+        TOOLS["update_inventory"] = original
+        await agent.stop()
 
 
 async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = None) -> None:
     sessions_dir = sessions_dir or (Path(__file__).resolve().parents[2] / "sessions" / "stage04")
     shutil.rmtree(sessions_dir, ignore_errors=True)
     sessions_dir.mkdir(parents=True, exist_ok=True)
-    log = EventLog(str(sessions_dir), segment_bytes=32 * 1024, keep_segments=8)
-    bus = EventBus(log, state_size=1024, stream_size=64)
+    run_inbox = not case_ids or "all" in case_ids or INBOX_CASE in case_ids
+    if case_ids and set(case_ids) == {INBOX_CASE}:
+        await inbox_priority_demo()
+        return
+    bus = EventBus()
     agent = Agent(bus, RealLLM())
 
     picked = [c for c in CASE_ORDER if not case_ids or "all" in case_ids or c in case_ids]
@@ -133,17 +270,17 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
         print(f"{GREY}没有匹配的 case：{case_ids}；可选：{', '.join(CASE_IDS)}{RESET}")
         return
     upto = CASE_ORDER.index(picked[-1]) + 1
-    bufs: list = []  # 第 3 段才建缓冲；finish() 按需停
+    consumers: list[StreamConsumer] = []  # 第 3 段才建；finish() 按需停
 
     async def finish() -> None:
-        for buf in bufs:
-            await buf.stop()
+        for c in consumers:
+            await c.stop()
         await agent.stop()
         print(f"\n{BOLD}── history 尾部（这一轮的真实消息形状）──{RESET}")
         for msg in agent.history.get("A", [])[-3:]:
             print(f"{GREY}  {json.dumps(msg, ensure_ascii=False)}{RESET}")
         line("系统", GREEN, "demo 结束")
-        print(f"{GREY}  session log: {sessions_dir}{RESET}")
+        print(f"{GREY}  sessions 目录: {sessions_dir}{RESET}")
 
     print(f"{BOLD}Stage 4：消息机制 —— 事件离开 agent 之后要走多远{RESET}")
     if case_ids:
@@ -152,47 +289,52 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
     # ------------------------------------------------------------- 第 1 段
     banner(
         1,
-        "同步扇出 vs 异步分发（同一个慢订阅者）",
-        f"慢订阅者每个事件睡 {SLOW * 1000:.0f}ms，同样发 200 个事件。左边是 stage02/03 的"
-        "写法（emit 里 await 每一个订阅者），右边是本章的写法（emit 只入队，lane worker 去送）。",
+        "逐事件渲染 vs 缓冲消费者（同一个慢 UI）",
+        f"同一个 UI、同样 200 个事件：左边把渲染写在 await 型 handler 里"
+        f"（每次 {SLOW * 1000:.0f}ms——违约：重活进了热路径）；右边是 "
+        "StreamConsumer：offer 只做缓冲追加（微秒级），渲染挪到帧界回调、每帧一次。",
     )
-    seen: dict[str, int] = {}
+    rendered: list[str] = []
 
-    async def slow_one(event: Event) -> None:
-        await asyncio.sleep(SLOW)
+    class PerEventRender:
+        """违约写法：await 型 handler 里做重活（渲染一次 5ms）。"""
 
-    bus.subscribe(slow_observer(SLOW, session="S1", name="slow@S1"))
-    bus.subscribe(counter(seen, session="S1"))
+        async def handle(self, event: Event) -> None:
+            await asyncio.sleep(SLOW)
+            rendered.append("x")
 
+    class BufferedRender(StreamConsumer):
+        def on_flush(self, text: str) -> None:
+            time.sleep(SLOW)  # 渲染一帧的耗时，与逐事件渲染同量级
+            rendered.append("frame")
+
+    per_event = PerEventRender()
+    bus.subscribe(Subscription("slow-render", ("tick",), per_event.handle))
     t0 = time.perf_counter()
     for _ in range(200):
-        await slow_one(Event("tick", "S1", {"text": "字"}))
-    sync_cost = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    for i in range(200):
-        # tick 走 state 道（不可丢）：这一段要比的是“谁在等”，不能有丢弃掺进来
         await bus.emit(Event("tick", "S1", {"text": "字"}))
-        if i % 10 == 0:
-            await asyncio.sleep(0)  # 让出：lane worker 有机会边发边消费
-    emit_cost = time.perf_counter() - t0
-    consumed_during = seen.get("total", 0)  # 发完时 worker 已经送掉多少
-    queued_after = bus.stats()["lanes"]["state"]["queued"]  # 还压在队列里的
-    t0 = time.perf_counter()
-    await bus.drain(timeout=30.0)
-    drain_cost = time.perf_counter() - t0
+    slow_cost = time.perf_counter() - t0
 
-    line("实测", GREEN, f"同步扇出：200 个事件，loop 等订阅者等了 {sync_cost:.2f}s")
+    buffered = BufferedRender()
+    await buffered.start()
+    bus.subscribe(Subscription("buffered-render", ("tick",), buffered))
+    t0 = time.perf_counter()
+    for _ in range(200):
+        await bus.emit(Event("tick", "S1", {"text": "字"}))
+    fast_cost = time.perf_counter() - t0
+    await buffered.stop()
+
+    line("实测", GREEN, f"违约写法（渲染进热路径）：200 个事件花了 {slow_cost:.2f}s")
     line(
         "实测",
         GREEN,
-        f"异步分发：emit 只花 {emit_cost:.3f}s，发完时已顺带送掉 {consumed_during} 条"
-        f"（队列压着 {queued_after} 条，drain 再等 {drain_cost:.2f}s）",
+        f"StreamConsumer：emit 只花 {fast_cost:.3f}s——offer 是微秒级缓冲追加，"
+        f"渲染按帧结算（{buffered.flushes} 帧摊掉 200 次渲染）",
     )
     note(
-        f"两套发法订阅者都收到了 {seen.get('total', 0)} 条：异步分发没有少送，"
-        "只是把“等”从 loop 挪到了 lane worker——而且消费和发送是并发的："
-        "生产者每让出一次，worker 就消化一批，不必等全部发完。"
+        "handler 的耗时就是 emit 的延迟：await 型 handler 里做重活，每次调用"
+        "都被放大进 emit。重活挪进 on_flush 后按帧结算——热路径回到微秒级。"
+        "做不快的消费者还有一条路：提供邮箱（mailbox），投递即返回、自己排干。"
     )
 
     if upto <= 1:
@@ -202,89 +344,42 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
     # ------------------------------------------------------------- 第 2 段
     banner(
         2,
-        "洪峰压测：token 流里夹一条 turn_end",
-        f"直接往总线灌 {FLOOD} 个 token 增量（stream 道，队列 64，满了丢最新），"
-        "中间夹一条 turn_end（state 道，不可丢）。看两条道各自的账。",
+        "洪峰压测：2000 个 delta 全部送达",
+        f"直接往总线灌 {FLOOD} 个 token 增量，UI 是 StreamConsumer——offer 逐条"
+        "缓冲（微秒级），帧界合并刷屏。总线零策略：没有丢弃、没有专用队列，"
+        "全送达的代价是 UI 自己合并，节奏归消费者。",
     )
-    async def flood(
-        session: str,
-        n: int,
-        yield_every: int = 10,
-        samples: list[tuple[int, int, int, int]] | None = None,
-        at: int | None = None,
-        mid: Callable[[], Awaitable[None]] | None = None,
-        progress: list[int] | None = None,
-    ) -> None:
-        """灌洪峰。每 yield_every 条让出一次：真实 token 之间有 await（等 HTTP
-        流），emit 自己不主动让出——lane worker 能跑起来靠的是 agent loop 的
-        await 点，这里用 sleep(0) 模拟它。samples 不为 None 时，每 200 条记一次
-        两条道的（已灌条数，stream 深度，stream 已丢，state 深度）：
-        洪峰进行中两条道各是什么水位，看得见。at + mid：灌到第 at 条时执行
-        mid（洪峰中间夹事件）；progress 是单元素 list，每条更新，观测者用它
-        记“送达时灌到第几条”。"""
-        for i in range(n):
-            if progress is not None:
-                progress[0] = i
-            if at is not None and mid is not None and i == at:
-                await mid()
+
+    class FloodUI(StreamConsumer):
+        def __init__(self) -> None:
+            super().__init__(max_chars=96, frame=0.05)
+            self.received = 0
+
+        def offer(self, event: Event) -> None:
+            self.received += 1
+            super().offer(event)
+
+        def on_flush(self, text: str) -> None:
+            pass  # 压测不刷屏，只数帧
+
+    flood_ui = FloodUI()
+    await flood_ui.start()
+    bus.subscribe(Subscription("flood-ui", ("agent_delta",), flood_ui))
+    life_seen: dict[str, int] = {}
+    bus.subscribe(counter(life_seen, session="F"))
+
+    async def flood(session: str, n: int) -> None:
+        for _ in range(n):
             await bus.emit(Event("agent_delta", session, {"text": "字"}))
-            if i % yield_every == 0:
-                if samples is not None and (i + 1) % 200 == 0:
-                    ln = bus.stats()["lanes"]
-                    samples.append(
-                        (
-                            i + 1,
-                            ln["stream"]["queued"],
-                            ln["stream"]["dropped"],
-                            ln["state"]["queued"],
-                        )
-                    )
-                await asyncio.sleep(0)
-
-    bus.subscribe(slow_observer(0.02, session="F", name="flood-consumer"))
-    flood_seen: dict[str, int] = {}
-    bus.subscribe(counter(flood_seen, session="F"))
-    lags: list[float] = []
-    bus.subscribe(latency_probe(lags, session="F"))
-    samples: list[tuple[int, int, int, int]] = []
-    pos = [0]  # flood 的当前进度；观测者在 state worker 里跑，用它记送达时刻
-    arrivals: list[dict[str, Any]] = []
-
-    def show_arrival(r: dict[str, Any]) -> None:
-        lanes = r["lanes"]
-        line(
-            "道",
-            GREEN,
-            f"→ {r['type']} 送达（洪峰第 {r['at']} 条；此刻 stream 道 "
-            f"{bar(lanes['stream']['queued'])} {lanes['stream']['queued']}/64，"
-            f"已丢 {lanes['stream']['dropped']}）",
-        )
-
-    bus.subscribe(
-        arrival_probe(
-            arrivals,
-            session="F",
-            types=("turn_end", "agent_reply"),
-            progress=pos,
-            snapshot=bus.stats,
-            on_arrival=show_arrival,
-        )
-    )
 
     async def insert_turn_end() -> None:
-        ln = bus.stats()["lanes"]
-        line(
-            "道",
-            YELLOW,
-            f"洪峰正猛：stream 道 {bar(ln['stream']['queued'])} "
-            f"{ln['stream']['queued']}/64，已丢 {ln['stream']['dropped']:4d} │ "
-            f"state 道 {bar(ln['state']['queued'], 1024)}——此刻插入一条 turn_end",
-        )
+        line("系统", YELLOW, "洪峰过半：此刻插入一条 turn_end（直接分派，无队列积压）")
         await bus.emit(Event("turn_end", "F", {"reason": "flood test"}))
 
     t0 = time.perf_counter()
-    await flood("F", FLOOD, samples=samples, at=FLOOD // 2, mid=insert_turn_end, progress=pos)
-    # 洪峰之后紧跟着完整答案 agent_reply（不可丢，state 道）
+    await flood("F", FLOOD // 2)
+    await insert_turn_end()
+    await flood("F", FLOOD // 2)
     await bus.emit(
         Event(
             "agent_reply",
@@ -293,85 +388,23 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
         )
     )
     flood_cost = time.perf_counter() - t0
-    produced_at = time.perf_counter()
-    await bus.drain(timeout=60.0)
-    tail = time.perf_counter() - produced_at
-    st = bus.stats()
-    for filled, sq, sd, pq in samples:
-        line(
-            "道",
-            YELLOW,
-            f"灌到 {filled:4d} 条：stream 道 {bar(sq)} {sq:2d}/64，已丢 {sd:4d} │ state 道 {pq}",
-        )
     line(
-        "统计",
+        "实测",
         GREEN,
-        f"stream 道：投递 {st['lanes']['stream']['delivered']} / "
-        f"丢弃 {st['lanes']['stream']['dropped']}（{flood_cost:.2f}s）",
+        f"{FLOOD} 个 delta 全部送达（received={flood_ui.received}），"
+        f"合并成 {flood_ui.flushes} 帧刷屏（{flood_cost:.2f}s）",
     )
     line(
-        "统计",
+        "实测",
         GREEN,
-        f"state 道：投递 {st['lanes']['state']['delivered']} / "
-        f"丢弃 {st['lanes']['state']['dropped']}；turn_end 收到 "
-        f"{flood_seen.get('turn_end', 0)} 条、agent_reply 收到 "
-        f"{flood_seen.get('agent_reply', 0)} 条",
+        f"生命周期事件一条没丢：turn_end 收到 {life_seen.get('turn_end', 0)} 条、"
+        f"agent_reply 收到 {life_seen.get('agent_reply', 0)} 条——直接分派，"
+        "没有队列积压",
     )
-    if lags:
-        lags.sort()
-        line(
-            "道",
-            YELLOW,
-            f"送达延迟：送到的 {len(lags)} 条里最快 {lags[0] * 1000:.0f}ms、"
-            f"最迟 {lags[-1]:.2f}s；生产 {flood_cost:.2f}s 就结束了，"
-            f"消费者又追了 {tail:.2f}s 才清空积压",
-        )
     note(
-        "两条道各有自己的 worker：token 流堵了只丢自己的；turn_end 在洪峰过半、"
-        "stream 道满格丢弃时插入，照样直达 —— 这就是 QoS 分道要买的东西。丢的"
-        "是可丢的：屏幕上会少几个字，但完整答案走 state 道（agent_reply）一条"
-        "没丢，UI 拿它兜底就能补齐。"
-    )
-
-    # 2b：同样的洪峰，消费者不慢 + UI 侧合并缓冲 → 不丢，且刷屏次数远少于事件数
-    frames: list[str] = []
-    flood_buf = CoalescingBuffer(frames.append, max_chars=96, frame=0.05)
-    await flood_buf.start()
-    g_seen: dict[str, int] = {}
-    bus.subscribe(counter(g_seen, session="G"))
-    g_lags: list[float] = []
-    bus.subscribe(buffer_feeder(flood_buf, session="G"))
-    bus.subscribe(latency_probe(g_lags, session="G"))
-    g_samples: list[tuple[int, int, int, int]] = []
-    await flood("G", 800, samples=g_samples)
-    for filled, sq, sd, pq in g_samples:
-        line(
-            "道",
-            YELLOW,
-            f"灌到 {filled:4d} 条：stream 道 {bar(sq)} {sq:2d}/64，已丢 {sd:4d} │ state 道 {pq}",
-        )
-    await bus.drain(timeout=30.0)
-    await flood_buf.stop()
-    line(
-        "统计",
-        GREEN,
-        f"同样的洪峰换个快消费者：{g_seen.get('agent_delta', 0)} 个增量一条没丢；"
-        f"逐条上屏是 {g_seen.get('agent_delta', 0)} 帧，合并缓冲刷成了 {flood_buf.flushes} 帧",
-    )
-    if g_lags:
-        g_lags.sort()
-        line(
-            "道",
-            GREEN,
-            f"送达延迟：最迟 {g_lags[-1] * 1000:.1f}ms——每条都实时到，"
-            "消费者没被拖垮",
-        )
-    note(
-        "“没丢”是让出点挣来的，不是缓冲的功劳：每 yield 一次，worker 都能在一个"
-        "调度片里清空积的 10 条（各 handler 内部无 await），队列永远不满。把 "
-        "yield 去掉：800 条一个调度片灌完，worker 一条都捞不到，队列 64 条之外的"
-        "全会丢——那时消费者快慢根本不起作用。缓冲买到的是另一半：上屏 IO 从 "
-        f"{g_seen.get('agent_delta', 0)} 次降到十来次，这才是“UI 刷不动”的解药。"
+        "洪峰的应对不在总线，在消费者：offer 逐条缓冲是微秒级热路径，渲染按帧"
+        "结算。总线的契约只有一条——handler 必须快；做不快的消费者用邮箱型"
+        "（offer 即返回，自己排干）。"
     )
 
     if upto <= 2:
@@ -381,40 +414,41 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
     # ------------------------------------------------------------- 第 3 段
     banner(
         3,
-        "真跑一轮：慢订阅者不拖 loop，UI 用合并缓冲刷屏",
-        "同一个慢订阅者挂在这一轮上（每事件 5ms）。loop 不等它；UI 侧把 token 攒成"
-        "帧再刷：满 96 字或到 50ms 帧界，先到先刷（只等满会一顿一顿）。",
+        "真跑一轮：UI 在 StreamConsumer 里自管刷新节奏",
+        "真模型跑一轮。UI 的回答 / 思考消费者是 StreamConsumer 子类——offer "
+        "逐条缓冲（微秒级），满 96 字或 50ms 帧界刷一次屏，什么时候刷新由 "
+        "UI 自己决定。",
     )
     turn_seen: dict[str, int] = {}
-    bus.subscribe(slow_observer(SLOW, session="A", name="slow@A"))
     bus.subscribe(counter(turn_seen, session="A"))
 
     turn_done = asyncio.Event()
     stream_open = [False]
 
-    def make_sink(label: str, color: str):
-        def sink(text: str) -> None:
+    class StreamToLine(StreamConsumer):
+        """把本 turn 的流式文本合并刷到一行里；turn 结束时由 ui_turn_end 收口。"""
+
+        def __init__(self, label: str, color: str) -> None:
+            super().__init__(max_chars=96, frame=0.05)
+            self._label = label
+            self._color = color
+
+        def offer(self, event: Event) -> None:
+            if event.session_id != "A":
+                return
             if not stream_open[0]:
-                print(f"\n{BOLD}{color}[{label}] {RESET}{color}", end="")
+                print(f"\n{BOLD}[{self._label}] {RESET}{self._color}", end="")
                 stream_open[0] = True
+            super().offer(event)
+
+        def on_flush(self, text: str) -> None:
             print(text, end="", flush=True)
 
-        return sink
-
-    text_buf = CoalescingBuffer(make_sink("回答", BLUE), max_chars=96, frame=0.05)
-    think_buf = CoalescingBuffer(make_sink("思考", DIM), max_chars=96, frame=0.05)
-    await think_buf.start()
-    await text_buf.start()
-    await think_buf.start()
-    bufs.extend([think_buf, text_buf])  # 提前收尾时由 finish() 停
-
-    async def ui_delta(event: Event) -> None:
-        if event.session_id == "A":
-            text_buf.add(str(event.payload.get("text", "")))
-
-    async def ui_thinking(event: Event) -> None:
-        if event.session_id == "A":
-            think_buf.add(str(event.payload.get("text", "")))
+    text_ui = StreamToLine("回答", BLUE)
+    think_ui = StreamToLine("思考", DIM)
+    await think_ui.start()
+    await text_ui.start()
+    consumers.extend([think_ui, text_ui])  # 提前收尾时由 finish() 停
 
     async def ui_tool_result(event: Event) -> None:
         p = event.payload
@@ -428,24 +462,23 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
     async def ui_turn_end(event: Event) -> None:
         if event.session_id != "A":
             return
-        text_buf.flush()
-        think_buf.flush()
+        text_ui.flush()
+        think_ui.flush()
         stream_open[0] = False
         line("系统", GREEN, f"turn 结束（reason={event.payload.get('reason')}）")
         turn_done.set()
 
-    bus.subscribe(Subscription("ui.delta", ("agent_delta",), ui_delta, mode=OBSERVE))
-    bus.subscribe(Subscription("ui.thinking", ("agent_thinking",), ui_thinking, mode=OBSERVE))
-    bus.subscribe(Subscription("ui.tool", ("tool_result",), ui_tool_result, mode=OBSERVE))
-    bus.subscribe(Subscription("ui.turn_end", ("turn_end",), ui_turn_end, mode=OBSERVE))
+    bus.subscribe(Subscription("ui.delta", ("agent_delta",), text_ui))
+    bus.subscribe(Subscription("ui.thinking", ("agent_thinking",), think_ui))
+    bus.subscribe(Subscription("ui.tool", ("tool_result",), ui_tool_result))
+    bus.subscribe(Subscription("ui.turn_end", ("turn_end",), ui_turn_end))
 
     line("用户", YELLOW, "保温杯还有库存吗")
     t0 = time.perf_counter()
-    bus.publish(Event("user_input", "A", {"text": "保温杯还有库存吗"}), to=agent.agent_id)
+    bus.publish(UserMessage("user_input", "A", {"text": "保温杯还有库存吗"}), to=agent.agent_id)
     await turn_done.wait()
     turn_cost = time.perf_counter() - t0
     turn_done.clear()
-    await bus.drain(timeout=30.0)
 
     total = turn_seen.get("total", 0)
     deltas = turn_seen.get("agent_delta", 0)
@@ -456,15 +489,15 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
         f"从投递到 turn_end = {turn_cost:.2f}s",
     )
     note(
-        f"同步扇出的写法要在每个事件上等 {SLOW * 1000:.0f}ms，"
-        f"光等待就 ≈ {total * SLOW:.2f}s（这一轮的实测总耗时是 {turn_cost:.2f}s，"
-        "里面主要是模型请求）"
+        f"如果 UI 逐事件渲染（每次 {SLOW * 1000:.0f}ms），光渲染就 ≈ "
+        f"{total * SLOW:.2f}s。StreamConsumer 把渲染挪到帧界——热路径只有"
+        "缓冲追加，节奏由 UI 自己的帧界决定。"
     )
     line(
         "实测",
         GREEN,
-        f"合并缓冲：{text_buf.merged + think_buf.merged} 个增量 → "
-        f"{text_buf.flushes + think_buf.flushes} 帧（每帧 ≤96 字或 50ms 一次）",
+        f"合并刷屏：{text_ui.merged + think_ui.merged} 个增量 → "
+        f"{text_ui.flushes + think_ui.flushes} 帧（每帧 ≤96 字或 50ms 一次）",
     )
 
     if upto <= 3:
@@ -475,22 +508,21 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
     banner(
         4,
         "当场否决：规则说了算",
-        "挂上 permission_guard，把 update_rules（改规则库）拉黑。让 agent 去加一条规则，"
-        "预期：before_tool_call 被否决，工具一条没执行，rules.txt 字节未变。",
+        "挂上 permission_guard（治理规则），把 update_rules（改规则库）拉黑。让 agent 去加一条规则，"
+        "预期：工具调用在执行前被治理链否决，工具一条没执行，rules.txt 字节未变。",
     )
-    bus.subscribe(permission_guard("update_rules"))
+    agent.governor.add(permission_guard("update_rules"))
     kb = Path(__file__).resolve().parents[2] / "knowledge-base"
     rules_file = kb / "rules.txt"
     rules_before = rules_file.read_text(encoding="utf-8")
 
     line("用户", YELLOW, "加一条规则：会议室要提前一天预订")
     bus.publish(
-        Event("user_input", "A", {"text": "加一条规则：会议室要提前一天预订"}),
+        UserMessage("user_input", "A", {"text": "加一条规则：会议室要提前一天预订"}),
         to=agent.agent_id,
     )
     await turn_done.wait()
     turn_done.clear()
-    await bus.drain(timeout=30.0)
 
     if rules_file.read_text(encoding="utf-8") == rules_before:
         line("实测", GREEN, "rules.txt 未被改动（治理生效，工具没执行）")
@@ -501,8 +533,8 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
     ]
     note(
         f"被否决的结果作为一条 tool 消息进了上下文（{len(blocked)} 条，占位以"
-        f"“{BLOCKED_PREFIX}”开头），模型知道这不是工具的真实输出；裁决本身也在 log 里，"
-        "事后答得出“这个工具为什么没执行”。"
+        f"“{BLOCKED_PREFIX}”开头），模型知道这不是工具的真实输出；裁决的事实"
+        "就在占位文本里，下一章它们随 history 落进轨迹。"
     )
 
     if upto <= 4:
@@ -513,7 +545,7 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
     banner(
         5,
         "人工确认：人说了算（等答复的那一半）",
-        "规则只判“这个要不要问人”（当场，微秒级）；答案由人来给（之后，可能要几十秒）。"
+        "update_inventory 自己声明“执行前要问人”（Tool.requires_approval）；答案由人给。"
         "这一段的“人”就是下面这个订阅者：看到 approval_required 就打一句批准，"
         "再把答复 publish 回 agent——答复不走收件箱，直接交给正在等它的那次等待。"
         "为了让 demo 能反复跑，写工具落在 sessions/stage04/ 的副本上；工具是真执行的。",
@@ -521,17 +553,13 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
     inventory = kb / "inventory.txt"
     demo_inventory = sessions_dir / "inventory-demo.txt"
     demo_inventory.write_text(inventory.read_text(encoding="utf-8"), encoding="utf-8")
-    llm_mod._INVENTORY = demo_inventory  # 只改这次 demo 的落点，不改仓库里那份
-    bus.subscribe(approval_policy("update_inventory"))
-
-    asked_ids: list[str] = []
+    tools_mod._INVENTORY = demo_inventory  # 只改这次 demo 的落点，不改仓库里那份
 
     async def demo_human(event: Event) -> None:
         p = event.payload
-        asked_ids.append(str(p["request_id"]))
         line("人工", YELLOW, f"？ {p['name']} 要执行：{brief(p['arguments'])}")
         note(
-            f"approval_required（seq={event.seq}，request_id={p['request_id']}，"
+            f"approval_required（request_id={p['request_id']}，"
             f"超时 {p['timeout']:g}s）：agent 正挂在这次等待上，等的人不在队列那头"
         )
         await asyncio.sleep(0.4)  # 人去点了一下
@@ -551,22 +579,21 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
 
     async def ui_decided(event: Event) -> None:
         p = event.payload
-        line("系统", GREEN, f"确认结果：{p['action']} by {p['by']}（seq={event.seq}）")
+        line("系统", GREEN, f"确认结果：{p['action']} by {p['by']}")
 
     bus.subscribe(
-        Subscription("demo.human", ("approval_required",), demo_human, mode=OBSERVE)
+        Subscription("demo.human", ("approval_required",), demo_human)
     )
     bus.subscribe(
-        Subscription("demo.decided", ("approval_decided",), ui_decided, mode=OBSERVE)
+        Subscription("demo.decided", ("approval_decided",), ui_decided)
     )
 
     line("用户", YELLOW, "把保温杯库存改成 45 件")
     bus.publish(
-        Event("user_input", "A", {"text": "把保温杯库存改成 45 件"}), to=agent.agent_id
+        UserMessage("user_input", "A", {"text": "把保温杯库存改成 45 件"}), to=agent.agent_id
     )
     await turn_done.wait()
     turn_done.clear()
-    await bus.drain(timeout=30.0)
 
     written = [
         ln
@@ -579,96 +606,17 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
         f"工具真执行了，副本上现在是：{written[0] if written else '（没找到）'}",
     )
     note(
-        "确认的请求和结果都是事件，seq 排得出来：什么时候问的、谁批的、批完工具返回了"
-        "什么。审计链就是这么攒出来的——不用另外写一套日志。"
-        "等不到答复时按拒绝处理（fail-closed），不会是“没人管就放行”。"
+        "确认的请求和结果都是事件：什么时候问的、谁批的、批完工具返回了什么，"
+        "屏幕上这一串就是全部经过。等不到答复时按拒绝处理（fail-closed），不会是"
+        "“没人管就放行”。"
     )
 
-    async def ui_stale(event: Event) -> None:
-        p = event.payload
-        line(
-            "系统",
-            YELLOW,
-            f"又一条答复到了（request_id={p['request_id']}）：没人在等它了 → "
-            f"不认领，只留痕（seq={event.seq}）",
-        )
-
-    bus.subscribe(
-        Subscription("demo.stale", ("approval_reply",), ui_stale, mode=OBSERVE)
-    )
-    line("人工", YELLOW, "（手抖又点了一下同一条确认）")
-    bus.publish(
-        Event(
-            "user_approval",
-            "A",
-            {
-                "request_id": asked_ids[0],
-                "approve": True,
-                "reason": "重复点了一下",
-            },
-        ),
-        to=agent.agent_id,
-    )
-    await bus.drain(timeout=30.0)
-    note(
-        "没人等的答复也进 log（`approval_reply`，带 stale=true）：一次确认的输入不能因为"
-        "“没人在等”就消失——否则用户以为批了、系统按拒绝走了，两边对不上账。"
-        "但留痕不等于伪造裁决：那次确认的回执仍然只有超时/批准那一条。"
-    )
-
-    if upto <= 5:
+    if upto <= 5 and not run_inbox:
         await finish()
         return
 
     # ------------------------------------------------------------- 第 6 段
-    banner(
-        6,
-        "落盘与位点",
-        "段 + 稀疏索引 + 长度前缀 + CRC；位点记在 offsets.json，重启从下一条续读；"
-        "崩进程留下的残尾读到这里为止，前面一条不少。",
-    )
-    log.close()
-    st = log.stats()
-    line(
-        "统计",
-        GREEN,
-        f"落盘：{st['segments']} 段 / {st['bytes']} 字节 / "
-        f"seq 1..{st['last_seq']}（最老可用 {st['oldest_seq']}）",
-    )
-    log.commit("ui", 5)
-    rest = log.read_since(log.offset("ui"))
-    line(
-        "统计",
-        GREEN,
-        f"位点：ui 已消费到 seq {log.offset('ui')}，从下一条续读 → {len(rest)} 条"
-        f"（{rest[0]['seq'] if rest else '-'}..{rest[-1]['seq'] if rest else '-'}）",
-    )
-    note(
-        f"位点 5 已经落在保留窗口之外（最老可用 {log.oldest_seq}）：保留策略删掉的段"
-        "读不回来，续读只能从现存最老的一条开始——这是保留与位点唯一的冲突点，"
-        "要么把保留期放长，要么接受“回放不回那么远”。"
-    )
-
-    torn_dir = sessions_dir / "_torn"
-    shutil.rmtree(torn_dir, ignore_errors=True)
-    torn_dir.mkdir()
-    seg = sorted(sessions_dir.glob("evt-*.log"))[-1]
-    raw = seg.read_bytes()
-    (torn_dir / seg.name).write_bytes(raw)
-    intact = len(EventLog(str(torn_dir)).read_since(0))
-    (torn_dir / seg.name).write_bytes(raw[:-11])  # 砍掉最后 11 字节 = 崩在写一半
-    torn = EventLog(str(torn_dir))
-    got = torn.read_since(0)
-    line(
-        "统计",
-        GREEN,
-        f"残尾：完好时这一段读到 {intact} 条；砍掉最后 11 字节后读到 {len(got)} 条"
-        f"（停在坏记录之前，没炸，前 {len(got)} 条一条不少）",
-    )
-    note(
-        f"判定靠长度前缀 + CRC，不靠 try/except 猜：这一段原本 {len(raw)} 字节，"
-        "砍掉最后 11 字节模拟崩在写一半，只丢没写完的那一条。"
-    )
+    await inbox_priority_demo()
 
     # ------------------------------------------------------------- 收尾
     await finish()
@@ -679,6 +627,7 @@ def cli() -> None:
 
         stage04-demo                        # 跑全部（默认）
         stage04-demo 03-slow-subscriber     # 只跑到第 3 段（累积；名字见 --list）
+        stage04-demo 06-inbox-priority      # 只跑下行的意图与优先级（独立）
         stage04-demo --list                 # 列 case 及其说明（不加载模型配置）
     """
     parser = argparse.ArgumentParser(
@@ -692,6 +641,7 @@ def cli() -> None:
         print(f"all\t{ALL_TITLE}")
         for cid in CASE_ORDER:
             print(f"{cid}\t{CASE_TITLES[cid]}")
+        print(f"{INBOX_CASE}\t{INBOX_TITLE}")
         return
     asyncio.run(
         main(args.cases or None, Path(args.sessions_dir) if args.sessions_dir else None)

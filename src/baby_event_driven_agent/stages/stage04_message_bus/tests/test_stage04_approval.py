@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -20,13 +21,11 @@ from baby_event_driven_agent.stages.stage04_message_bus import agent as agent_mo
 from baby_event_driven_agent.stages.stage04_message_bus.agent import Agent
 from baby_event_driven_agent.stages.stage04_message_bus.bus import EventBus
 from baby_event_driven_agent.stages.stage04_message_bus.events import (
-    OBSERVE,
     Event,
     Subscription,
+    UserMessage,
 )
-from baby_event_driven_agent.stages.stage04_message_bus.llm import TOOLS
-from baby_event_driven_agent.stages.stage04_message_bus.persistence import EventLog
-from baby_event_driven_agent.stages.stage04_message_bus.subscribers import approval_policy
+from baby_event_driven_agent.stages.stage04_message_bus.tools import TOOLS
 
 TIMEOUT = 15.0
 SID = "A"
@@ -73,18 +72,20 @@ def inventory_spy() -> list[dict[str, Any]]:
         calls.append(args)
         return f"已更新：{args.get('category')}：库存 {args.get('stock')} 件"
 
-    TOOLS["update_inventory"] = spy
+    TOOLS["update_inventory"] = replace(original, fn=spy)
     yield calls
     TOOLS["update_inventory"] = original
 
 
 class Case:
-    """一个装了"人"的台子：谁问、谁答、什么时候结束，都在这里。"""
+    """一个装了"人"的台子：谁问、谁答、什么时候结束，都在这里。
+
+    要不要审批不用台子操心——update_inventory 在 tools.py 里自己声明了
+    `requires_approval=True`，agent 执行前查声明。
+    """
 
     def __init__(self, workdir: Path, *, timeout: float = 5.0) -> None:
-        self.log = EventLog(str(workdir / "log"))
-        self.bus = EventBus(self.log)
-        self.bus.subscribe(approval_policy("update_inventory"))
+        self.bus = EventBus()
         self.agent = Agent(
             self.bus,
             ScriptedLLM([CALL_INVENTORY, FINAL_TEXT]),
@@ -93,15 +94,22 @@ class Case:
         self.asked: asyncio.Queue[Event] = asyncio.Queue()
         self.ended = asyncio.Event()
         self.end_event: Event | None = None
+        self.decided_events: list[Event] = []
         self.bus.subscribe(
-            Subscription("rec-ask", ("approval_required",), self._record_ask, mode=OBSERVE)
+            Subscription("rec-ask", ("approval_required",), self._record_ask)
         )
         self.bus.subscribe(
-            Subscription("rec-end", ("turn_end",), self._record_end, mode=OBSERVE)
+            Subscription("rec-decided", ("approval_decided",), self._record_decided)
+        )
+        self.bus.subscribe(
+            Subscription("rec-end", ("turn_end",), self._record_end)
         )
 
     async def _record_ask(self, event: Event) -> None:
         self.asked.put_nowait(event)
+
+    async def _record_decided(self, event: Event) -> None:
+        self.decided_events.append(event)
 
     async def _record_end(self, event: Event) -> None:
         self.end_event = event
@@ -109,7 +117,7 @@ class Case:
 
     def send(self) -> None:
         self.bus.publish(
-            Event("user_input", SID, {"text": "把保温杯库存改成 45 件"}), to=self.agent.agent_id
+            UserMessage("user_input", SID, {"text": "把保温杯库存改成 45 件"}), to=self.agent.agent_id
         )
 
     async def wait_ask(self) -> Event:
@@ -131,7 +139,6 @@ class Case:
     async def settle(self) -> None:
         """等人答完、turn 收尾。"""
         await asyncio.wait_for(self.ended.wait(), TIMEOUT)
-        await self.bus.drain(timeout=TIMEOUT)
         await self.agent.stop()
 
     def tool_messages(self) -> list[str]:
@@ -142,11 +149,7 @@ class Case:
         ]
 
     def decided(self) -> list[dict[str, Any]]:
-        return [
-            r["payload"]
-            for r in EventLog(str(self.log._dir)).read_since(0)
-            if r["type"] == "approval_decided"
-        ]
+        return [ev.payload for ev in self.decided_events]
 
 
 def run(coro):  # type: ignore[no-untyped-def]
@@ -163,7 +166,7 @@ async def drive(case: Case, answer):  # type: ignore[no-untyped-def]
 
 
 def test_approved_executes_the_tool(workdir: Path, inventory_spy: list[dict[str, Any]]) -> None:
-    """批准 → 工具真的执行，确认的请求与结果都在 log 里。"""
+    """批准 → 工具真的执行，确认的请求与回执都是事件、靠 request_id 配对。"""
     case = Case(workdir)
 
     async def go() -> None:
@@ -174,12 +177,8 @@ def test_approved_executes_the_tool(workdir: Path, inventory_spy: list[dict[str,
     assert inventory_spy == [{"category": "保温杯", "stock": 45}]
     assert case.tool_messages() and case.tool_messages()[0].startswith("已更新")
     assert case.end_event is not None and case.end_event.payload["reason"] == "turn end"
-    records = EventLog(str(workdir / "log")).read_since(0)
-    types = [r["type"] for r in records]
-    assert "approval_required" in types and "approval_decided" in types
-    asked = next(r for r in records if r["type"] == "approval_required")["payload"]
+    assert len(case.decided_events) == 1
     decided = case.decided()[0]
-    assert asked["request_id"] == decided["request_id"]  # 配对靠号，不靠顺序
     assert (decided["action"], decided["by"]) == ("allow", "user")
 
 
@@ -261,8 +260,12 @@ def test_interrupt_during_the_wait(workdir: Path, inventory_spy: list[dict[str, 
     assert (decided[0]["action"], decided[0]["by"]) == ("abandoned", "user_interrupt")
 
 
-def test_stale_reply_is_recorded(workdir: Path, inventory_spy: list[dict[str, Any]]) -> None:
-    """号不对 / 迟到的答复：不伪造一次确认，但**必须留痕**，等的那条继续走到超时。"""
+def test_stale_reply_is_not_claimed(workdir: Path, inventory_spy: list[dict[str, Any]]) -> None:
+    """号不对 / 迟到的答复：不认领、不伪造裁决，等的那条继续走到超时。
+
+    迟到输入怎么留痕（approval_reply 进账）是下一章事件账的事，本章只保证
+    它不会误伤任何一次等待。
+    """
     case = Case(workdir, timeout=0.2)
     asked_ids: list[str] = []
 
@@ -278,12 +281,5 @@ def test_stale_reply_is_recorded(workdir: Path, inventory_spy: list[dict[str, An
     run(go())
     assert inventory_spy == []  # 迟到的"同意"救不回已经按拒绝走完的那次调用
     assert case.tool_messages()[0].startswith(agent_mod.APPROVAL_TIMEOUT)
-    replies = [
-        r["payload"]
-        for r in EventLog(str(workdir / "log")).read_since(0)
-        if r["type"] == "approval_reply"
-    ]
-    assert [r["request_id"] for r in replies] == ["ap-00000000", asked_ids[0]]
-    assert all(r["stale"] for r in replies)
-    # 留痕 ≠ 伪造裁决：那次确认的回执只有超时那一条
+    # 不认领 ≠ 伪造裁决：那次确认的回执只有超时那一条
     assert [(d["action"], d["by"]) for d in case.decided()] == [("deny", "approval_timeout")]

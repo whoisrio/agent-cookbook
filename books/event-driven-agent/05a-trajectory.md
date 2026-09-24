@@ -107,7 +107,7 @@ e3 起原样保留"的刀口；节点本身挂在压缩那一刻的 leaf 上。
 
 ### rewind 与 fork——切换不修改历史，只创造新的"当前"
 
-**rewind**（`branch(to_id)`）的实现核心就一行：`self.leaf_id = to_id`。
+**rewind**（`branch(to_id)`）的实现是一行赋值：`self.leaf_id = to_id`。
 rewind后，从rewind点拉出session分支，如下所示，从4rewind到3后，新的5的parent是3.
 
 ```text
@@ -181,8 +181,7 @@ e1 e2 e3 e4 e5                          ← 原样克隆：id / parentId 不改
 session_resumed {forked_from: A}        ← 生命周期标记，也是新的 leaf
 ```
 
-id 原样保留（不重新编号）——per-session 文件隔离，两份文件里的同名 id互不冲突。和原始路径的关系只有一条线索：`session_resumed` 里的
-`forked_from`（审计留痕，不是引用）；之后两条轨迹各自生长，一边 rewind /压缩 / 追加都影响不到另一边。
+id 原样保留（不重新编号）——per-session 文件隔离，两份文件里的同名 id互不冲突。和原始路径的关系记在 `session_resumed` 的 `forked_from` 里（审计留痕，不是引用）；之后两条轨迹各自生长，一边 rewind /压缩 / 追加都影响不到另一边。
 
 ### 异常恢复——三级收口
 下面，再来看看从trajectory恢复session时的异常保护；
@@ -215,8 +214,159 @@ resume 后（EventLog）：... approval_required
                        → approval_decided{action: abandoned}      ← bus.record 补，幂等
 ```
 
-## 代码改动
+## 代码改动：session 层新增，agent 侧只动三处
 
+`session/`（trajectory + store）是本章新增的，`agent.py` 是唯一被改的老文件。
+先看新增层的两个类，再看 agent 动的那三刀。
+
+### Trajectory：一棵常驻内存的 entry 树
+
+事实层本体就两个类。`TrajectoryLog` 管单会话文件：第一行是 session header
+（type=session，带 sid / cwd / system_prompt 原文——header 不是树节点），
+其后 entry 逐行追加，框架和 Stage 4 的 EventLog 相同：长度前缀 + CRC，崩在
+写一半时读到坏记录为止，残尾字节裁掉再续写：
+
+```python
+line = b"%08x %08x " % (len(data), zlib.crc32(data)) + data + b"\n"   # 长度 + CRC + json
+```
+
+`Trajectory` 是文件的内存镜像，状态有三个：`header`、全树索引 `_by_id`、
+一个指针 `leaf_id`。所有操作围绕这三个状态，核心是 append：
+
+```python
+def append(self, etype: str, payload: dict[str, Any]) -> Entry:
+    """追加 O(1) 三步：建节点（认父）→ 落盘 → 索引 + 移 leaf。不修改任何旧节点。"""
+    if self.torn:                          # 加载时撞过残尾：第一次追加前先裁
+        self.log.truncate_torn()
+        self.torn = False
+    entry = Entry(
+        id=_short_id(),                    # 8 位短 id（pi 同款）
+        parent_id=self.leaf_id,            # 认父：父 = 此刻的 leaf
+        type=etype, ts=_now(), payload=payload,
+    )
+    self.log.append(entry.to_dict())       # 先落盘，后动内存
+    self._index(entry)
+    return entry
+
+def _index(self, entry: Entry) -> None:
+    if entry.id in self._by_id:
+        raise ValueError(f"entry id 冲突：{entry.id}")
+    if entry.parent_id is not None and entry.parent_id not in self._by_id:
+        raise ValueError(f"entry {entry.id} 的父节点不存在：{entry.parent_id}")
+    self._by_id[entry.id] = entry
+    self.leaf_id = entry.id                # 追加即移动 leaf：树末端永远指向最新事实
+```
+
+`_index` 同时是数据合法性的检查点：id 冲突、父节点不存在都直接抛错，
+"认父不认子"和 id 唯一由它保证。投影要的当前路径来自 `path()`：
+
+```python
+def path(self) -> list[Entry]:
+    """当前路径：leaf 沿 parentId 走回根，再 reverse 成根→叶顺序。
+
+    只有这条线上的 entry 会进投影——其他分支的数据不是"被过滤"，
+    是遍历根本不经过它们。
+    """
+    out: list[Entry] = []
+    cur = self.leaf
+    while cur is not None:
+        out.append(cur)
+        cur = self._by_id.get(cur.parent_id) if cur.parent_id else None
+    out.reverse()
+    return out
+```
+
+branch / branch_with_summary / fork 都是"移指针 + append"的组合（见前面
+几节）；观测另有 `entries()`（全树、按文件顺序）和 `branch_points()`（同父
+多子的分叉点，grep parentId 的程序版）。
+
+### SessionStore：sid 从这里出
+
+一个目录管一批会话（`<root>/<sid>.jsonl`），三个入口，判据都是"store 里
+有没有这个 sid"：
+
+```python
+def start(self, *, cwd="", model=None, note="", system_prompt="") -> Trajectory:
+    sid = uuid.uuid4().hex                     # sid 由 store 分配，文件名即 sid
+    traj = Trajectory.create(
+        TrajectoryLog(self.root / f"{sid}.jsonl"), sid=sid, cwd=cwd, note=note,
+        system_prompt=system_prompt,           # header 记 prompt 原文，审计用
+    )
+    traj.append(SESSION_STARTED, {"by": "store"})
+    if model:
+        traj.append(MODEL_CHANGE, {"model_id": model, "by": "store"})
+    return traj
+
+def resume(self, sid: str, *, note="") -> Trajectory:
+    path = self.root / f"{sid}.jsonl"
+    if not path.exists():
+        raise KeyError(f"store 里没有这个 session：{sid!r}（{path}）")
+    traj = Trajectory.load(TrajectoryLog(path))     # 重建树；撞残尾停在最后一条完好 entry
+    traj.append(SESSION_RESUMED, {"torn_tail": traj.torn, "note": note})
+    return traj
+
+def close(self, traj: Trajectory, *, reason="") -> None:
+    traj.append(SESSION_END, {"reason": reason})
+```
+
+三条基本规矩，后面章节不再展开：
+
+- **sid 由 store 分配**（uuid4 hex，文件名即 sid），不是调用方随口给——
+  谁分配谁负责"这个 id 指哪段历史"。
+- **生命周期事件进轨迹**：started / resumed（带 torn_tail 或 forked_from）/
+  end 都落盘。否则一个文件里两段进程的历史首尾相接，回放看不出中间断过
+  ——和 Stage 2"排队的消息连 log 里都没痕迹"是同一类坑。
+- **同 session 单写者**：一个 sid 同时只有一个 Trajectory 在写（一个 agent）。
+
+### agent 侧：只动三处
+
+这正是把机制放在轨迹层上的意义（对照 04 章"agent 侧改动只有三处"）：
+
+1. `self.history: dict[sid, list]` → `self.trajectories: dict[sid, Trajectory]`：
+   所有 `history.append(...)` 换成 `traj.append(MESSAGE, message_payload(...))`
+   ——消息进 append-only 的 entry 树，而不是内存 list。sid 的唯一入口是
+   `attach`：登记 store.start/resume 的产物，顺手处理 prompt 变更留痕——
+
+```python
+def attach(self, traj: Trajectory) -> str:
+    self.trajectories[traj.sid] = traj
+    recorded = str(traj.header.get("system_prompt", ""))
+    for e in traj.path():
+        if e.type == PROMPT_CHANGE and e.payload.get("system_prompt"):
+            recorded = str(e.payload["system_prompt"])
+    if recorded != self.system_prompt:     # resume 换了模板：变更落盘留痕
+        traj.append(PROMPT_CHANGE, {"system_prompt": self.system_prompt, "by": "agent_attach"})
+    return traj.sid
+```
+
+   没 attach 过的 sid 来了直接报错——宁可炸也不静默开一段新历史（Stage 4
+   结尾那个困境的结构性解法）：
+
+```python
+def _traj(self, sid: str) -> Trajectory:
+    traj = self.trajectories.get(sid)
+    if traj is None:
+        raise KeyError(f"未知 session：{sid!r}——sid 由 SessionStore 分配（start/resume），"
+                       "再用 agent.attach(traj) 登记")
+    return traj
+```
+
+2. `_step` 的上下文从内存 list 换成投影——每次 LLM 调用前从轨迹现算，
+   不缓存；rewind / 压缩之后，下一次调用自动就是新视图：
+
+```python
+def build_context(self, traj: Trajectory) -> Projection:
+    return build_context(traj)   # 路径遍历 → 按类型分派 → sanitize；纯函数，逐字节可复现
+```
+
+3. 合成消息（中断标记、assistant 占位、纠正 user）照旧进事实层
+   （`synthetic: true` + note），只是落点从 history 变成轨迹——否则
+   "history 是 log 的投影"在合成消息这条路上断掉。
+
+中断 / steering / redirect 的逻辑一字未动：被掐的 step 不留半截消息这条
+Stage 3 纪律，在树上同样成立——append 只发生在 step 成功结算之后。
+bus / events / persistence / llm / outbound / subscribers 与 stage04 一字
+未改。
 
 ## demo
 ### 实测（demo 第 3 段）
@@ -260,39 +410,7 @@ resume 后（EventLog）：... approval_required
              的投影（语义级）；补的裁决走 record 留痕，不伪造"当时批过"（审批）。
 ```
 
-## 机制五：会话身份与生命周期——sid 由 store 分配
 
-`SessionStore` 三个入口：`start` / `resume` / `close`，判据是"store 里有没有
-这个 sid"。三条规矩：
-
-- **sid 由 store 分配**（uuid4 hex，文件名即 sid），不是调用方随口给。agent
-  只认 store 里 start/resume 过的会话（`attach` 之后收工）；没 attach 过的
-  sid 来了直接报错——宁可炸也不静默开一段新历史（Stage 4 结尾那个困境的
-  结构性解法）。
-- **生命周期事件进轨迹**：`session_started` / `session_resumed`（带
-  torn_tail / forked_from）/ `session_end` 都落盘。否则一个文件里两段进程
-  的历史首尾相接，回放时看不出中间断过——和 Stage 2"排队的消息连 log 里
-  都没痕迹"是同一类坑。
-- **同 session 单写者**：一个 sid 同时只有一个 Trajectory 在写（一个 agent）。
-
-## agent 侧的改动只有三处
-
-这正是把机制放在轨迹层上的意义（对照 04 章"agent 侧改动只有三处"）：
-
-1. `self.history: dict[sid, list]` → `self.trajectories: dict[sid, Trajectory]`。
-   所有 `history.append(...)` 换成 `traj.append(MESSAGE, message_payload(...))`。
-2. `_step` 的上下文从内存 list 换成 `build_context(traj, ...)`——
-   history 降格为投影，每次 LLM 调用前从轨迹现算（build 是 agent 自己的
-   方法，轨迹层只暴露 path()）。rewind / 压缩之后，下一次调用自动就是
-   新视图。
-3. 合成消息（中断标记、assistant 占位、纠正 user）照旧进事实层
-   （`synthetic: true` + note），只是落点从 history 变成轨迹——否则
-   "history 是 log 的投影"在合成消息这条路上断掉。
-
-中断 / steering / redirect 的逻辑一字未动：被掐的 step 不留半截消息这条
-Stage 3 纪律，在树上同样成立——append 只发生在 step 成功结算之后。
-bus / events / persistence / llm / outbound / subscribers 与 stage04 一字
-未改。
 
 ## 与 pi 的对照
 
