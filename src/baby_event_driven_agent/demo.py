@@ -1,4 +1,4 @@
-"""可跑的演示。不需要 API key —— 要验的是事件机制，不是模型。
+"""可跑的演示（真模型：需要仓库根 .env 里的 OPENAI_API_KEY / OPENAI_API_BASE）。
 
     PYTHONPATH=src python -m baby_event_driven_agent.demo
 
@@ -21,20 +21,13 @@ from .extensions import (
     memory_extractor,
     permission_guard,
 )
-from .llm import ScriptedLLM
+from .llm import OpenAIChatLLM
 from .trajectory import Trajectory
 
 AGENT_ID = "baby"
 SESSION = "sess_demo"
 
-SCRIPT = [
-    {"tool_calls": [{"name": "run_shell", "args": {"command": "rm -rf /tmp/demo"}}]},
-    {"content": "这个命令被安全策略拦下了，我不会执行它。"},
-    {"tool_calls": [{"name": "slow_task", "args": {"seconds": 5}}]},
-    {"content": "长任务已经停了，会话还在，你想让我做什么？"},
-    {"tool_calls": [{"name": "write_file", "args": {"path": "/tmp/x.txt"}}]},
-    {"content": "写文件要先经过你批准，我在等你的确认。"},
-]
+# 现在直接打真模型（OpenAIChatLLM），不再用脚本化的离线回放。
 
 
 async def get_weather(args: dict) -> str:
@@ -71,7 +64,7 @@ def build() -> tuple[AgentRuntime, EventBus, Trajectory, list]:
         agent_id=AGENT_ID,
         session_id=SESSION,
         bus=bus,
-        llm=ScriptedLLM(SCRIPT),
+        llm=OpenAIChatLLM(),
         tools=tools,
         trajectory=trajectory,
         system_prompt="你是一个助手，可以调用工具。",

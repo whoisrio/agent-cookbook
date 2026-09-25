@@ -23,6 +23,7 @@ from baby_event_driven_agent.stages.stage05_session.agent import (
     STOP_CLOSER,
     STOP_MARKER,
     Agent,
+    build_context,
 )
 from baby_event_driven_agent.stages.stage05_session.transport.bus import EventBus
 from baby_event_driven_agent.stages.stage05_session.transport.events import (
@@ -105,7 +106,6 @@ def test_turn_lands_on_disk_and_projects_legally(workdir: Path) -> None:
     assert projection.messages[1]["content"] == "保温杯还有库存吗"
     assert projection.messages[-1]["role"] == "assistant"
     # 重启重放：从盘上重建的轨迹投影出同样的 messages
-    from baby_event_driven_agent.stages.stage05_session.agent import build_context
     from baby_event_driven_agent.stages.stage05_session.session.trajectory import Trajectory, TrajectoryLog
 
     reloaded = Trajectory.load(TrajectoryLog(h.store.path_of(h.sid)))

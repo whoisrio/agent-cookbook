@@ -30,7 +30,17 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .transport.bus import EventBus
-from .transport.events import ALLOW, ASK, DENY, MODIFY, Decision, Event
+from .transport.events import (
+    ALLOW,
+    ASK,
+    DENY,
+    FOLLOWUP,
+    MODIFY,
+    STEERING,
+    Decision,
+    Event,
+    UserMessage,
+)
 from .llm import TOOLS, build_system_prompt
 from .session.store import SessionStore
 from .session.trajectory import (
@@ -231,6 +241,7 @@ class Agent:
         self.system_prompt = system_prompt or SYSTEM_PROMPT
         self.trajectories: dict[str, Trajectory] = {}
         self.inboxes: dict[str, asyncio.Queue[Event]] = {}
+        self._steering: dict[str, list[Event]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._inflight: dict[str, asyncio.Task[Any] | None] = {}
         self._turn_active: dict[str, bool] = {}
@@ -302,6 +313,11 @@ class Agent:
         下行本身照旧：普通消息进收件箱排队。**只有两条旁路**——中断（Stage 3）
         和人工确认的答复（stage04）——因为它们都是"只对某一次等待有效"的东西：
         排进队列就等于永远递不到（等在那一头的不是队列）。
+
+        用户消息的意图（照搬 stage04 的 UserMessage）：
+        - FOLLOWUP（默认）：进收件箱排队，等当前 turn 结束作为新 turn 处理；
+        - STEERING：升级成插话，暂存到 ``_steering``，下一个 step 边界拼进当前
+          上下文（本轮不断）。打断 / 审批答复是独立旁路，不在这里。
         """
         if event.type == "user_interrupt":
             self.on_interrupt(event)
@@ -309,10 +325,31 @@ class Agent:
         if event.type == "user_approval":
             self.on_approval(event)
             return
+        if event.type == "user_input":
+            sid = event.session_id
+            if getattr(event, "intent", FOLLOWUP) == STEERING:
+                self._steering.setdefault(sid, []).append(event)
+            else:
+                self.inboxes.setdefault(sid, asyncio.Queue()).put_nowait(event)
+                if sid not in self._workers or self._workers[sid].done():
+                    self._workers[sid] = asyncio.create_task(self._worker(sid))
+            return
         sid = event.session_id
         self.inboxes.setdefault(sid, asyncio.Queue()).put_nowait(event)
         if sid not in self._workers or self._workers[sid].done():
             self._workers[sid] = asyncio.create_task(self._worker(sid))
+
+    def promote(self, msg: UserMessage) -> None:
+        """把一个 followup 升级成 steering（stage04 同名方法）。
+
+        stage05 的收件箱是逐条取的队列，没有"取出某条 followup"的钩子；
+        这里直接把消息追加进 steering 暂存——语义等价：它会在下一个 step
+        边界拼进当前上下文。
+        """
+        sid = msg.session_id
+        if sid not in self.inboxes and sid not in self._steering:
+            return
+        self._steering.setdefault(sid, []).append(msg)
 
     def on_interrupt(self, event: Event) -> None:
         """中断：控制信号，不进收件箱（**同步**，无 await）。
@@ -410,11 +447,22 @@ class Agent:
             await self._run_turn(event)
 
     async def _drain_steering(self, sid: str, traj: Trajectory) -> int:
-        """step 边界 drain：此刻 inbox 里的消息全部当 steering，追加进轨迹。"""
+        """step 边界 drain：此刻 inbox 里的消息 + 暂存的 steering 全部当 steering。
+
+        STEERING 意图的消息（或经 promote 升级的）直接拼进当前上下文、本轮不断；
+        FOLLOWUP 意图的（默认）也在这里一并拼入——stage05 收敛了 stage04 的
+        两条队列，step 边界一次 drain。
+        """
         inbox = self.inboxes[sid]
+        steered = self._steering.pop(sid, [])
         texts: list[str] = []
         while not inbox.empty():
             ev = inbox.get_nowait()
+            texts.append(ev.payload["text"])
+            traj.append(
+                MESSAGE, message_payload({"role": "user", "content": ev.payload["text"]})
+            )
+        for ev in steered:
             texts.append(ev.payload["text"])
             traj.append(
                 MESSAGE, message_payload({"role": "user", "content": ev.payload["text"]})

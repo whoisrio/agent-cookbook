@@ -23,7 +23,7 @@ from __future__ import annotations
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, ClassVar, Protocol, runtime_checkable
 
 # ---- QoS：两条道 ----
 STATE = "state"  # 生命周期 / 命令回执：低频、不可丢、按序。满了背压给生产者
@@ -61,6 +61,10 @@ class Event:
     correlation_id: str = ""  # 一次 turn 的簇 id
     ts: float = field(default_factory=time.time)
 
+    #: 能消费我的 handler 必须满足的形状；object = 无约束。
+    #: 声明在事件类上，子类改写它——这是"我能被谁消费"的唯一出处。
+    HANDLER_SHAPE: ClassVar[type] = object
+
     def with_patch(self, patch: Mapping[str, Any]) -> "Event":
         """治理改写：返回一个 payload 被改过的新事件，原事件不动。"""
         return replace(self, payload={**self.payload, **patch})
@@ -74,6 +78,72 @@ class Event:
             "corr": self.correlation_id,
             "lane": lane_of(self.type),
         }
+
+
+# ---- 下行消息的用户意图（UserMessage 的路由元数据） ----
+# 照搬自 stage04：排队还是插话、同队列内的先后。打断（stop / redirect）与
+# 审批答复不走队列，是独立的旁路事件（user_interrupt / user_approval）。
+
+FOLLOWUP = "followup"  # 默认：排队，等当前 turn 结束后作为新 turn 处理
+STEERING = "steering"  # 插话：turn 在飞时，下一个 step 之前拼进当前上下文
+DEFAULT_PRIORITY = 100
+
+
+@runtime_checkable
+class Mailbox(Protocol):
+    """邮箱型消费者的结构：offer 把事件放进消费者自己的缓冲，永不阻塞。
+
+    结构约束而非基类——任何提供 offer 的对象都是邮箱型（StreamConsumer、
+    自定义邮箱皆可）；总线分派时只认这个结构。
+    """
+
+    def offer(self, event: "Event") -> None: ...
+
+
+class StreamEvent(Event):
+    """stream 事件（高频、逐 token）：只允许邮箱型消费者订阅。"""
+
+    HANDLER_SHAPE = Mailbox
+
+
+@dataclass(frozen=True)
+class UserMessage(Event):
+    """下行用户消息：收件箱的路由元数据声明在这个类型上。
+
+    上行事件不带这些字段——排队是下行消息的事，与总线 emit 的事件无关。
+    """
+
+    intent: str = FOLLOWUP  # 排队（默认）或插话
+    priority: int = DEFAULT_PRIORITY  # 同一队列内的先后：小的先被取，同序按到达先后
+
+
+# wire 类型名 → 事件类：约束跟着类型声明，查表只在这一处。
+EVENT_CLASSES: dict[str, type[Event]] = {
+    "agent_delta": StreamEvent,
+    "agent_thinking": StreamEvent,
+}
+
+
+def event_class(event_type: str) -> type[Event]:
+    """wire 类型名对应的事件类；没登记的按基类（无约束）。"""
+    return EVENT_CLASSES.get(event_type, Event)
+
+
+def require_consumable(event_type: str, handler: object) -> None:
+    """事件类型自己的消费约束：我能被谁消费，问我（的类），不查别处。"""
+    shape = event_class(event_type).HANDLER_SHAPE
+    if shape is not object and not isinstance(handler, shape):
+        raise ValueError(
+            f"事件 {event_type} 只允许 {shape.__name__} 型消费者"
+            "（提供 offer，如 StreamConsumer）："
+            "逐条 await handler 会把每次调用的耗时放大进 emit"
+        )
+
+
+def validate_subscription(sub: "Subscription") -> None:
+    """订阅进门时，对声明的每个事件类型问一遍消费约束（fail fast）。"""
+    for event_type in sub.event_types:
+        require_consumable(event_type, sub.handler)
 
 
 Handler = Callable[[Event], Awaitable[None]]
@@ -131,7 +201,7 @@ class Subscription:
 
     name: str  # 进轨迹，用于归因
     event_types: tuple[str, ...]
-    handler: Callable[[Event], Awaitable[Decision | None]]
+    handler: Callable[[Event], Awaitable[Decision | None]] | Mailbox
     mode: str = OBSERVE
     order: int = 100  # 拦截型串行顺序，小的先跑
     on_failure: str = FAIL_OPEN  # open | closed，仅拦截型有效

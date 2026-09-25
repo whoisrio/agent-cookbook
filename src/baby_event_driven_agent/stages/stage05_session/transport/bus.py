@@ -48,9 +48,11 @@ from .events import (
     Decision,
     EmitResult,
     Event,
+    Mailbox,
     Sink,
     Subscription,
     lane_of,
+    validate_subscription,
 )
 from .persistence import EventLog
 
@@ -103,6 +105,13 @@ class EventBus:
         self._sinks[agent_id] = sink
 
     def subscribe(self, sub: Subscription) -> Subscription:
+        """订阅进门：校验消费约束后登记（fail fast）。
+
+        进门执行的唯一检查是**绑定形成处的通用类型检查**——handler 满足
+        事件类声明的 HANDLER_SHAPE，对所有事件类型永远是同一条规则；
+        具体哪个类型要求什么形状，声明在事件子类上（照搬 stage04）。
+        """
+        validate_subscription(sub)
         self._subs.append(sub)
         return sub
 
@@ -255,9 +264,15 @@ class EventBus:
         lane worker，而 lane 全局共享——所有 session 的这条道连坐（拦截者有
         wait_for + 预算，观测者没有）。"慢"有界、"死"无界；"观测者超时算不算
         已消费"是新语义，留给需求真出现的那天（04 章降级项）。
+
+        邮箱型消费者（提供 offer，如 StreamConsumer）走 offer——微秒级，热路径
+        只做缓冲追加，永不阻塞；其余 handler 直接 await（契约：微秒级只做接收）。
         """
         try:
-            await sub.handler(event)
+            if isinstance(sub.handler, Mailbox):
+                sub.handler.offer(event)
+            else:
+                await sub.handler(event)
         except Exception as exc:  # noqa: BLE001 - 观测者失败与 agent 无关
             logger.warning("观测者 %s 处理 %s 失败：%r", sub.name, event.type, exc)
 

@@ -158,7 +158,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_rules",
-            "description": "检索团队规则、流程、制度（如会议室预订、VPN 申请、报销）",
+            "description": "检索团队规则、流程、制度（如会议室预订、VPN 申请、报销）。只要用户问到任何团队规定、流程或制度，必须调用本工具取原文，不得凭记忆作答。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -210,8 +210,9 @@ def build_system_prompt(schemas: list[dict[str, Any]] | None = None) -> str:
         params = "、".join(fn["parameters"].get("properties", {}))
         lines.append(f"- {fn['name']}：{fn['description']}" + (f"（参数：{params}）" if params else ""))
     lines.append(
-        "必须基于事实回答用户问题。用户的问题或请求涉及上面某个工具时，"
-        "选对工具、先拿到真实结果再回答；获取不到准确信息就回答不知道，严禁编造。"
+        "必须基于事实回答用户问题。涉及具体业务事实（报销规定、库存数量、会议室/VPN 流程等）时，"
+        "必须先调用对应工具取到真实结果再回答，不要凭自己的知识回答业务规定类问题；"
+        "获取不到准确信息就如实说不知道，严禁编造。"
         "用户要求记录或修改时，用对应的写工具落库，然后一句话确认改了什么。"
     )
     return "\n".join(lines)

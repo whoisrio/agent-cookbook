@@ -57,6 +57,7 @@ class RealLLM:
             model=self.model,
             messages=messages,
             tools=TOOL_SCHEMAS,
+            temperature=0.0,  # demo 要可复现：拿掉随机性，模型每次都走同一条解码路径
             stream=True,
         )
         async for chunk in stream:

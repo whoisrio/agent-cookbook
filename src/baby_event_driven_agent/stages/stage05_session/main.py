@@ -1,9 +1,9 @@
 """Stage 5a 演示：会话与真相——log、投影与异常恢复。
 
 需要仓库根 .env 里的 OPENAI_API_KEY / OPENAI_API_BASE / OPENAI_MODEL
-（环境变量可覆盖）。前五段不打模型（ScriptedLLM），可以当基准反复跑。
+（环境变量可覆盖）。现在直接跑真模型（RealLLM，配置读仓库根 .env），需要 API key。
 
-六段（各自独立，跑哪个都行）：
+九段（各自独立，跑哪个都行）：
 
 1. **轨迹长什么样**（离线）：脚本化 LLM 跑一轮，把 entry 树打印出来——
    header 不是节点、认父不认子、一条 assistant 是一个节点、toolCallId 配对。
@@ -17,6 +17,13 @@
 5. **session 切换**（离线）：fork 出一份新会话文件，两条轨迹分道扬镳，
    各自独立 resume。
 6. **真跑一轮**：真模型 + 真工具，两层事实（EventLog / 轨迹）各自记账。
+7. **UI 缓冲**（离线）：200 个 token 增量进 CoalescingBuffer——满格 / 帧界才
+   刷屏，一条不丢（照搬 stage04 的“UI 消息缓冲”机制）。
+8. **工具审批**（离线）：工具被标记要问人，执行前发 approval_required，
+   人批准才执行（照搬 stage04 的“评审消息处理”）。
+9. **输入意图**（离线）：turn 在飞时的新消息默认插话（steering），等不了就
+   redirect 打断转向（stage04 的 followup/steering/redirect 意图，收敛到
+   agent 的 step 边界）。
 
 行首标签沿用前几章：
 
@@ -24,7 +31,7 @@
     思考 │ assistant 的 thinking（暗色）
     回答 │ assistant 的可见输出（亮蓝）
     工具 │ 工具调用与真实结果（绿色）；被治理拦下用亮红
-    系统 │ 生命周期与统计（绿色 / 亮红）
+    系统 │ 生命周期与统计（统一橙色）
     说明 │ 旁白，只解释这一段在演示什么（灰色缩进）
 
     python -m baby_event_driven_agent.stages.stage05_session
@@ -43,8 +50,10 @@ from typing import Any
 from .agent import Agent
 from .transport.bus import EventBus
 from .agent import build_context
-from .transport.events import Event, Subscription, OBSERVE
+from .transport.events import Event, Subscription, OBSERVE, STEERING, UserMessage
 from .llm import RealLLM
+from .transport.outbound import StreamConsumer
+from .transport.subscribers import approval_policy
 from .transport.persistence import EventLog
 from .session.store import SessionStore, session_facts, sweep_hanging_approvals
 from .session.trajectory import (
@@ -63,6 +72,7 @@ BLUE = "\033[94m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[91m"
+ORANGE = "\033[38;5;208m"  # 系统提示统一橙色
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
@@ -75,6 +85,9 @@ CASE_ORDER = (
     "04-recovery",
     "05-fork",
     "06-live-turn",
+    "07-ui-buffer",
+    "08-approval",
+    "09-steering",
 )
 CASE_TITLES = {
     "01-trajectory-shape": "第 1 段：轨迹长什么样（离线）",
@@ -83,8 +96,11 @@ CASE_TITLES = {
     "04-recovery": "第 4 段：异常恢复——残尾、悬挂调用、悬挂审批（离线）",
     "05-fork": "第 5 段：session 切换——fork（离线）",
     "06-live-turn": "第 6 段：真跑一轮，两层事实各自记账",
+    "07-ui-buffer": "第 7 段：UI 消息缓冲——满格 / 帧界才刷屏（离线）",
+    "08-approval": "第 8 段：工具审批——要等人的那一半（离线）",
+    "09-steering": "第 9 段：输入意图——插话与打断（离线）",
 }
-ALL_TITLE = "六段全跑（离线 1-5 + 真模型 6）"
+ALL_TITLE = "九段全跑（离线 1-5 / 7-9 + 真模型 6）"
 CASE_IDS = ("all", *CASE_ORDER)
 
 
@@ -120,29 +136,21 @@ CALL_QUERY = [
 FINAL_TEXT = [{"type": "text_delta", "text": "保温杯库存 42 件，316L 不锈钢内胆。"}]
 
 
-class ScriptedLLM:
-    """脚本化 LLM：每个请求吐一段固定增量（和 stage04 的测试同一套）。"""
-
-    def __init__(self, script: list[list[dict[str, Any]]]) -> None:
-        self.script = script
-        self.calls = 0
-
-    async def stream_chat(self, messages: list[dict[str, Any]]):  # type: ignore[no-untyped-def]
-        idx = min(self.calls, len(self.script) - 1)
-        self.calls += 1
-        for chunk in self.script[idx]:
-            yield chunk
+# 已删除 ScriptedLLM：本 stage 的 Harness 现在直接跑真模型（RealLLM，见下方导入）。
 
 
 class Harness:
-    """离线台子：bus + EventLog + store + agent，外加一个 turn_end 信号。"""
+    """真模型台子：bus + EventLog + store + agent（RealLLM），外加一个 turn_end 信号。
+
+    script 参数保留以兼容现有用例调用，但已不再驱动模型行为。
+    """
 
     def __init__(self, workdir: Path, script: list[list[dict[str, Any]]]) -> None:
         self.log = EventLog(str(workdir / "events"))
         self.bus = EventBus(self.log)
         self.store = SessionStore(workdir / "sessions")
         self.system_prompt = "你是一个通过工具干活的通用 agent。"
-        self.agent = Agent(self.bus, ScriptedLLM(script), store=self.store, system_prompt=self.system_prompt)
+        self.agent = Agent(self.bus, RealLLM(), store=self.store, system_prompt=self.system_prompt)
         self.traj = self.store.start(
             cwd=str(workdir), model="fake-model", system_prompt=self.system_prompt
         )
@@ -216,9 +224,9 @@ async def case_trajectory_shape(workdir: Path) -> None:
     h.send("保温杯还有库存吗")
     await h.wait_turn()
     await h.stop()
-    note(f"一轮跑完 {time.perf_counter() - t0:.2f}s（ScriptedLLM，无网络）")
+    note(f"一轮跑完 {time.perf_counter() - t0:.2f}s（真模型）")
 
-    line("系统", GREEN, f"轨迹文件：{h.store.path_of(h.sid).name}")
+    line("系统", ORANGE, f"轨迹文件：{h.store.path_of(h.sid).name}")
     show_trajectory(h.traj)
 
     header, entries, torn = TrajectoryLog(h.store.path_of(h.sid)).read()
@@ -234,7 +242,7 @@ async def case_trajectory_shape(workdir: Path) -> None:
         f"message 里 {roles.count('user')} user / {roles.count('assistant')} assistant / "
         f"{roles.count('tool')} tool；残尾={torn}",
     )
-    line("系统", GREEN, f"文件头原文：{json.dumps(header, ensure_ascii=False)}")
+    line("系统", ORANGE, f"文件头原文：{json.dumps(header, ensure_ascii=False)}")
     if h.traj.branch_points():
         line("实测", RED, "发现了分叉点（不该有）")
     else:
@@ -270,7 +278,7 @@ async def case_projection(workdir: Path) -> None:
     line("实测", GREEN, f"两次投影逐字节相同：{json.dumps(p1.messages, ensure_ascii=False) == json.dumps(p2.messages, ensure_ascii=False)}")
     line("实测", GREEN, f"覆盖式提取的 model：{p1.model}（store.start 落的 model_change，路径上最后一次生效）")
     line("实测", GREEN, f"投影统计：{p1.stats}")
-    line("系统", GREEN, "投影出的 messages：")
+    line("系统", ORANGE, "投影出的 messages：")
     for m in p1.messages:
         body = m.get("content") if m.get("role") != "assistant" else None
         extra = f" toolCall({', '.join(c['function']['name'] for c in m['tool_calls'])})" if m.get("tool_calls") else ""
@@ -319,7 +327,7 @@ async def case_rewind(workdir: Path) -> None:
         user1.id, "试过查保温杯库存（42 件），结论：库存充足，无需补货。"
     )
     line("实测", GREEN, f"branch_with_summary：摘要节点 {summary.id} 挂在 {user1.id} 下（{summary.payload['note']}）")
-    line("系统", GREEN, "现在的投影（新分支的 agent 看到的）：")
+    line("系统", ORANGE, "现在的投影（新分支的 agent 看到的）：")
     for m in build_context(traj).messages:
         line("  ", GREY, f"{m['role']:<9} {brief(m.get('content') or '')}")
 
@@ -436,7 +444,7 @@ async def case_fork(workdir: Path) -> None:
     h.traj.append(MESSAGE, message_payload({"role": "user", "content": "旧会话的下一句"}))
     forked.append(MESSAGE, message_payload({"role": "user", "content": "新会话的下一句"}))
 
-    line("系统", GREEN, f"store 里的会话：{h.store.list_sessions()}")
+    line("系统", ORANGE, f"store 里的会话：{h.store.list_sessions()}")
     for name, t in (("原会话", h.traj), ("分叉", forked)):
         p = build_context(t)
         last_user = [m for m in p.messages if m.get("role") == "user"][-1]["content"]
@@ -462,7 +470,7 @@ async def case_live_turn(workdir: Path) -> None:
     try:
         llm = RealLLM()
     except RuntimeError as exc:
-        line("系统", YELLOW, f"跳过真模型段：{exc}")
+        line("系统", ORANGE, f"跳过真模型段：{exc}")
         return
 
     log = EventLog(str(workdir / "events"))
@@ -492,7 +500,7 @@ async def case_live_turn(workdir: Path) -> None:
     store.close(traj, reason="demo 结束")
 
     projection = build_context(traj)
-    line("系统", GREEN, "轨迹（尾部 6 条）：")
+    line("系统", ORANGE, "轨迹（尾部 6 条）：")
     show_trajectory(traj, tail=6)
     line(
         "统计",
@@ -500,9 +508,187 @@ async def case_live_turn(workdir: Path) -> None:
         f"EventLog：seq 1..{log.last_seq}（传输层事件账）；轨迹：{len(traj.entries())} 条 entry"
         f"（会话结构账）；投影出 {len(projection.messages)} 条消息，model={projection.model}",
     )
-    line("系统", GREEN, "投影出的 messages 尾部：")
+    line("系统", ORANGE, "投影出的 messages 尾部：")
     for m in projection.messages[-3:]:
         line("  ", GREY, f"{json.dumps(m, ensure_ascii=False)[:160]}")
+
+
+# ---------------------------------------------------------------- 第 7 段：UI 消息缓冲（照搬 stage04）
+
+
+async def case_ui_buffer(workdir: Path) -> None:
+    """UI 缓冲消费：add 只做缓冲追加，满格 / 帧界才刷屏，一条不丢。"""
+    banner(
+        "07-ui-buffer",
+        "UI 消息缓冲：满格 / 帧界才刷屏",
+        "往总线灌 200 个 agent_delta。UI 是 CoalescingBuffer 消费者：add 只做缓冲追加，"
+        "满 96 字立刻刷，到帧界也刷；emit 不等刷屏（token 流可丢、可合并，不挡 loop）。",
+    )
+
+    class TextUI(StreamConsumer):
+        def on_flush(self, text: str) -> None:
+            line("UI", GREEN, f"刷一帧（{len(text)} 字）")
+
+    bus = EventBus(EventLog(str(workdir / "events")), stream_size=1024)
+    ui = TextUI()
+    await ui.start()
+    bus.subscribe(Subscription("ui", ("agent_delta",), ui))
+
+    t0 = time.perf_counter()
+    for _ in range(200):
+        await bus.emit(Event("agent_delta", "A", {"text": "字"}))
+    cost = time.perf_counter() - t0
+    await asyncio.sleep(0.12)  # 等帧界把尾巴刷完
+    await ui.stop()
+    line(
+        "实测",
+        GREEN,
+        f"200 个 delta 全部送达（merged={ui.merged}），emit 总耗时 {cost:.3f}s"
+        "——emit 返回时只是进了缓冲（offer 微秒级，绝不挡 loop）",
+    )
+    line("实测", GREEN, f"200 次渲染合并成 {ui.flushes} 帧——刷屏节奏归消费者，不归总线")
+    note("满了立刻刷（洪峰不攒着），到帧界也刷（尾巴不饿着），二者先到先刷。")
+    await bus.drain(timeout=TIMEOUT)
+
+
+# ---------------------------------------------------------------- 第 8 段：工具审批（照搬 stage04）
+
+
+async def case_approval(workdir: Path) -> None:
+    """工具审批：被标记要问人 → approval_required → 人批准 → 工具执行。"""
+    banner(
+        "08-approval",
+        "工具审批：要等人的那一半",
+        "update_inventory 被 approval_policy 标记要问人。agent 发 approval_required"
+        "（带 request_id），答复由人给——这里用订阅者模拟人点了一下批准。答复走"
+        "旁路直接 resolve，工具拿到授权才执行。一问必有一答。",
+    )
+    _KB = Path(__file__).resolve().parents[2] / "knowledge-base"
+    from . import llm as llm_mod
+
+    demo_inventory = workdir / "inventory-demo.txt"
+    demo_inventory.write_text(
+        (_KB / "inventory.txt").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    original_path = llm_mod._INVENTORY
+    llm_mod._INVENTORY = demo_inventory
+
+    call_update = [
+        {
+            "type": "tool_call_delta",
+            "index": 0,
+            "id": "call_1",
+            "name": "update_inventory",
+            "args_delta": '{"category": "保温杯", "stock": 45}',
+        }
+    ]
+    h = Harness(workdir / "approval", [call_update, FINAL_TEXT])
+    arrived = asyncio.Event()
+
+    async def on_required(event: Event) -> None:
+        p = event.payload
+        arrived.set()
+        line(
+            "系统",
+            ORANGE,
+            f"？ {p['name']} 要执行：{brief(p['arguments'])}"
+            f"（request_id={p['request_id']}，超时 {p['timeout']:g}s）",
+        )
+        await asyncio.sleep(0.2)  # 人去点了一下
+        line("用户", YELLOW, "→ 批准")
+        h.bus.publish(
+            Event(
+                "user_approval",
+                h.sid,
+                {
+                    "request_id": p["request_id"],
+                    "approve": True,
+                    "reason": "demo 里代替人点了一下",
+                },
+            ),
+            to=h.agent.agent_id,
+        )
+
+    async def on_decided(event: Event) -> None:
+        p = event.payload
+        line("系统", ORANGE, f"确认结果：{p['action']} by {p['by']}")
+
+    h.bus.subscribe(approval_policy("update_inventory"))
+    h.bus.subscribe(Subscription("d.required", ("approval_required",), on_required))
+    h.bus.subscribe(Subscription("d.decided", ("approval_decided",), on_decided))
+    try:
+        line("用户", YELLOW, "把保温杯库存改成 45 件")
+        h.send("把保温杯库存改成 45 件")
+        try:
+            await asyncio.wait_for(arrived.wait(), TIMEOUT)
+        except asyncio.TimeoutError:
+            line("系统", ORANGE, "没等到 approval_required：模型这轮没发起工具调用")
+            return
+        await h.wait_turn()
+        written = [
+            ln
+            for ln in demo_inventory.read_text(encoding="utf-8").splitlines()
+            if ln.startswith("保温杯")
+        ]
+        line(
+            "实测",
+            GREEN,
+            f"approval_required → 人批准 → approval_decided → 工具执行；"
+            f"副本上现在是：{written[0] if written else '（没找到）'}",
+        )
+        note(
+            "等不到答复时按拒绝处理（fail-closed）：不会是“没人管就放行”。"
+            "残尾恢复时悬挂的审批也会被 resume 闭合（见第 4 段）。"
+        )
+    finally:
+        llm_mod._INVENTORY = original_path
+        await h.stop()
+
+
+# ---------------------------------------------------------------- 第 9 段：输入意图（stage04 的 followup/steering/redirect）
+
+
+async def case_steering(workdir: Path) -> None:
+    """turn 在飞时的新消息：默认 steering 拼进本轮；等不了就 redirect 打断。"""
+    banner(
+        "09-steering",
+        "输入意图：插话（steering）与打断（redirect）",
+        "turn 在飞时用户又发来一条：默认在下一个 step 边界拼进当前轮（steering），"
+        "本轮不断；若用户等不了，发 user_interrupt（redirect）让纠正先落地，本轮转向。",
+    )
+    h = Harness(workdir / "steering", [CALL_QUERY, FINAL_TEXT])
+
+    async def on_steer(event: Event) -> None:
+        line("系统", ORANGE, "插话拼进本轮：" + "、".join(event.payload["texts"]))
+
+    async def on_redirect(event: Event) -> None:
+        line("系统", ORANGE, f"打断转向（intent={event.payload.get('intent')}）")
+
+    h.bus.subscribe(Subscription("d.steer", ("steering_consumed",), on_steer))
+    h.bus.subscribe(Subscription("d.redirect", ("turn_interrupted",), on_redirect))
+
+    line("用户", YELLOW, "保温杯还有库存吗")
+    h.send("保温杯还有库存吗")
+    # 模型在跑工具时，用户又发来一条带 STEERING 意图——直接进 steering 暂存，
+    # 下一个 step 边界被拼进本轮（本轮不断）
+    line("用户", YELLOW, "顺便查一下规则（STEERING 意图）")
+    h.bus.publish(
+        UserMessage("user_input", h.sid, {"text": "顺便查一下规则"}, intent=STEERING),
+        to=h.agent.agent_id,
+    )
+    await h.wait_turn()
+    line(
+        "实测",
+        GREEN,
+        "在飞期间的新消息：默认作为 steering 拼进当前轮（不排队等下一轮、也不打断）",
+    )
+    note(
+        "stage04 的意图（followup 排队 / steering 插话 / redirect 旁路）在这里收敛为"
+        "“step 边界 drain 即 steering + user_interrupt 旁路”：输入消息的意图语义不变，"
+        "只是路由落到了 agent 的 step 边界，而不是 UserMessage 的 intent 字段——"
+        "机制照搬、落点不同。"
+    )
+    await h.stop()
 
 
 CASES = {
@@ -512,6 +698,9 @@ CASES = {
     "04-recovery": case_recovery,
     "05-fork": case_fork,
     "06-live-turn": case_live_turn,
+    "07-ui-buffer": case_ui_buffer,
+    "08-approval": case_approval,
+    "09-steering": case_steering,
 }
 
 
@@ -537,7 +726,7 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
             print()
 
     print(f"\n{BOLD}── 收尾 ──{RESET}")
-    line("系统", GREEN, "demo 结束")
+    line("系统", ORANGE, "demo 结束")
     print(f"{GREY}  session log: {root}{RESET}")
 
 

@@ -164,10 +164,12 @@ def arrival_probe(
     return Subscription("arrival_probe", types, probe, mode=OBSERVE)
 
 
-def buffer_feeder(buf: CoalescingBuffer, *, session: str) -> Subscription:
-    """把 token 增量喂进合并缓冲（demo 的 UI 订阅者本体）。"""
+def buffer_feeder(buf: CoalescingBuffer) -> Subscription:
+    """把 token 增量喂进合并缓冲（demo 的 UI 订阅者本体）。
 
-    async def feed(event: Event) -> None:
-        buf.add(str(event.payload.get("text", "")))
+    buf 是邮箱型消费者（CoalescingBuffer 提供 offer），满足 agent_delta /
+    agent_thinking 的消费约束（只认 Mailbox，见 events.require_consumable）：
+    逐条 await handler 会把每次调用的耗时放大进 emit。
+    """
 
-    return Subscription("buffer_feeder", ("agent_delta",), feed, mode=OBSERVE)
+    return Subscription("buffer_feeder", ("agent_delta",), buf, mode=OBSERVE)

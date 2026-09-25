@@ -57,6 +57,14 @@ NO_EXEC = "[被用户中断，未执行]"
 # 内容是声明"这里被打断过"，绝不回灌思维链本身。
 INTERRUPTED_SHELL = "[response interrupted]"
 
+
+class _StepAborted(Exception):
+    """流里检测到待消费中断，主动中止本轮流式消费（不等 cancel 时序生效）。
+
+    on_interrupt 同步置位 _pending_interrupt 后才调 task.cancel()；协作式 cancel
+    真正生效前，模型流里可能还残几个增量被渲染出来、落到 stop 行之后。这里在
+    _step 循环顶部直接 raise，保证 stop 之后绝不再发任何 LLM 增量。"""
+
 # 完全没有 system prompt 时，实测模型会把"保温杯还有库存吗"当闲聊，
 # 回一句"我无法访问实时库存"——得告诉它工具能摸到什么。工具的分工
 # 不在这里手写，从 schemas 生成（路由信息只写在 description 一处）。
@@ -92,6 +100,7 @@ class Agent:
         self._inflight: dict[str, asyncio.Task[Any] | None] = {}
         self._turn_active: dict[str, bool] = {}
         self._phase: dict[str, str] = {}
+        self._running_tool: dict[str, bool] = {}  # 工具是否正在执行（决定中断掐不掐）
         self._pending_interrupt: dict[str, dict[str, Any]] = {}
         # inbound 路由：publish(event, to=agent_id) 会落到 enqueue
         bus.register(agent_id, self.enqueue)
@@ -138,7 +147,12 @@ class Agent:
                 "intent": intent,
                 "text": event.payload.get("text"),
             }
-            if task is not None and not task.done() and self._phase.get(sid) == "stream":
+            # 流式输出这一段、或工具正在执行中：当场掐掉在飞的 step（真打断）。
+            # 工具已返回、step 还在收尾（tool_done 落点）那一小段不掐——让 step
+            # 跑完、由 step 边界收尾，工具结果才留得住（否则会随 cancel 一起丢）。
+            if task is not None and not task.done() and (
+                self._phase.get(sid) == "stream" or self._running_tool.get(sid)
+            ):
                 task.cancel()
         self.log.append(event, note="interrupt received")
 
@@ -193,6 +207,11 @@ class Agent:
         tool_calls: dict[int, dict[str, str]] = partial["tool_calls"]
         tool_started = False
         async for chunk in self.llm.stream_chat(history):
+            if self._pending_interrupt.get(sid) is not None:
+                # 中断已在飞：立刻停手，不再发任何增量——stop 之后再冒出
+                # thinking/文本残片会破坏呈现顺序。直接中止，收尾交给
+                # _run_steps 的取消路径（与 task.cancel() 殊途同归）。
+                raise _StepAborted()
             if chunk["type"] == "reasoning_delta":
                 # 思考内容：边到边发 UI，但不进 history 也不进 log。
                 # 只记一笔"吐过思考"——redirect 收尾时要靠它决定补不补空壳。
@@ -271,7 +290,13 @@ class Agent:
             elif name not in TOOLS:
                 result = f"未知工具：{name}"
             else:
-                result = await TOOLS[name](json.loads(call["function"]["arguments"]))
+                # 标记"工具正在执行"：让 on_interrupt 能当场掐死在跑的工具
+                # （Stage 3 默认工具可中断——真实副作用工具应自行保证可重入/可回滚）。
+                self._running_tool[sid] = True
+                try:
+                    result = await TOOLS[name](json.loads(call["function"]["arguments"]))
+                finally:
+                    self._running_tool[sid] = False
             # 工具结果一落地就进 log 和总线（不等到 turn 收尾）：真执行过的
             # 可能已经改动外部世界，即便这一步随后被取消，发生过的事实也该
             # 在轨迹里；UI 也得立刻看见"未执行"的占位。
@@ -281,6 +306,7 @@ class Agent:
                 {
                     "tool_call_id": call["id"],
                     "name": name,
+                    "args": json.loads(call["function"]["arguments"]),
                     "result": result,
                     "skipped": skipped,
                 },
@@ -313,7 +339,26 @@ class Agent:
             # 标志只活在当前 turn 里：留在 session 上会杀错下一个 turn。
             self._turn_active[sid] = False
             self._phase.pop(sid, None)
+            self._running_tool.pop(sid, None)
             self._pending_interrupt.pop(sid, None)
+
+    async def _settle_aborted(
+        self, sid: str, history: list[dict[str, Any]], partial: dict[str, Any]
+    ) -> bool:
+        """在飞 step 被取消/中止后的统一收尾：记 step_cancelled，再决定 turn 走向。
+
+        返回 True 表示同一个 turn 还要继续（redirect）。stop 与 _StepAborted 两条
+        路都走这里——区别只在前者由 task.cancel() 触发、后者由流里主动 raise 触发，
+        目的都是"在飞这一步别再发任何东西"。"""
+        self._inflight[sid] = None
+        pending = self._pending_interrupt.pop(sid, None) or {
+            "intent": "stop",
+            "text": None,
+        }
+        event = Event("step_cancelled", sid, {"intent": pending["intent"]})
+        self.log.append(event, note="interrupt")
+        await self.bus.emit(event)
+        return await self._close_after_cancel(sid, history, pending, partial)
 
     async def _run_steps(self, sid: str, history: list[dict[str, Any]]) -> None:
         """turn 主循环：step 边界查中断、跑一步、结算。"""
@@ -342,21 +387,18 @@ class Agent:
             self._inflight[sid] = step_task
             try:
                 msg, tool_results = await step_task
+            except _StepAborted:
+                # 流里主动中止（pending_interrupt 已置位，不等 cancel 时序）：
+                # 与下面 task.cancel() 那条路收尾完全一致。
+                if await self._settle_aborted(sid, history, partial):
+                    continue
+                return
             except asyncio.CancelledError:
                 # 区分两种取消：step_task 被 on_interrupt 掐掉（本 turn 交给
                 # 我们收尾），或者 turn 协程自己被 stop() 掐掉（继续往外抛）。
                 if not step_task.cancelled():
                     raise
-                self._inflight[sid] = None
-                pending = self._pending_interrupt.pop(sid, None) or {
-                    "intent": "stop",
-                    "text": None,
-                }
-                payload = {"intent": pending["intent"]}
-                event = Event("step_cancelled", sid, payload)
-                self.log.append(event, note="interrupt")
-                await self.bus.emit(event)
-                if await self._close_after_cancel(sid, history, pending, partial):
+                if await self._settle_aborted(sid, history, partial):
                     continue          # redirect：同一个 turn 里带着纠正重发
                 return
             finally:
