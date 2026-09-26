@@ -1,15 +1,16 @@
 # Stage 5a：会话与真相 —— log、投影与异常恢复
 
-> 配套代码：`src/baby_event_driven_agent/stages/stage04_trajectory/`，
-> `stage04-demo` 跑演示（前五段离线不打模型，可当基准反复跑；第六段打真模型），
-> `stage04-test` 跑测试（**38 条：36 离线 + 2 真模型**，2026-09-21 实测，
-> 2026-09-22 重构投影（移 agent 侧、prompt_change 落盘）后离线 36 条）。
+> 配套代码：`src/baby_event_driven_agent/stages/stage04_trajectory/`
+>（与 3c 同包：工具层与长程任务场景见 3c，本章落轨迹层与手动压缩），
+> `stage04-demo` 跑演示（十三段：1-5 / 7-11 / 13 离线可反复跑；6 / 12 打真模型），
+> `stage04-test` 跑测试（**57 条：55 离线 + 2 真模型**，2026-09-26 实测）。
 > 本章机制形状参考 pi coding agent 的 session 设计（树、认父不认子、rewind
-> 移指针、投影式上下文），落盘工程沿用 Stage 4 的长度前缀 + CRC，文末有逐项对照。
-> 压缩只留口子（entry 类型 + 投影语义），触发逻辑归 5b。
-> 包从本章起分三层：`transport/`（Stage 4 传输层原样搬入，一字未改）、
-> `session/`（trajectory + store，本章新增的事实层）、`agent.py`（agent +
-> 投影，build_context 在这一侧）——和"账分两层记"是同一个分法。
+> 移指针、投影式上下文），落盘工程沿用 3b 的长度前缀 + CRC，文末有逐项对照。
+> 压缩的语义（entry 类型 + 投影规则）与手动触发（compact_request + Summarizer）
+> 都在本章落地；自动触发策略（水位、滚动折叠）归 05。
+> 包分三层：`transport/`（3b 传输层）、`session/`（trajectory + store +
+> compaction，事实层）、`agent.py`（agent + 投影 + 压缩接线）——和"账分两层记"
+> 是同一个分法。
 
 前面几章，一直在处理的是用户的新增消息的输入。
 这一节，我们来给agent增加上从已有session中恢复，继续之前对话(reload)，以及在对话中跳转到指定消息的能力(rewind)；
@@ -183,6 +184,37 @@ session_resumed {forked_from: A}        ← 生命周期标记，也是新的 le
 
 id 原样保留（不重新编号）——per-session 文件隔离，两份文件里的同名 id互不冲突。和原始路径的关系记在 `session_resumed` 的 `forked_from` 里（审计留痕，不是引用）；之后两条轨迹各自生长，一边 rewind /压缩 / 追加都影响不到另一边。
 
+### 手动压缩：把口子插上电（compact_request + Summarizer）
+
+压缩的语义钉死了，谁来按按钮？本章给手动档：一条 `compact_request` 控制事件
+（旁路，与 user_interrupt / user_approval 同一待遇，不进收件箱），agent 在
+**step 边界**处理它——与 steering（等边界拼消息）、interrupt（揸在飞）、
+redirect（揸 + 补消息）并列的第四种边界动作：换一副更短的视图，再发下一次调用。
+流中间不换上下文，在飞请求的视图不漂移：
+
+```python
+compact_reason = self._pending_compact.pop(sid, None)
+if compact_reason is not None:
+    # 不消耗 step 预算；摘要失败 fail-open，不挡 turn
+    await self._compact(sid, traj, reason=compact_reason)
+```
+
+`_compact` 做三件事：算刀口（保留最近 N 轮，刀口 = 倒数第 N 轮的第一条真实
+user entry，天然落在 turn 边界，tool 配对完整）→ 摘要（Summarizer 协议两档：
+ScriptedSummarizer 离线确定性 / LiveSummarizer 裸 chat 不带工具、max_tokens
+封顶）→ 追加 `compaction` entry（summary + keep_from_id + reason）。
+投影一字未改：下一次 build_context 自动就是新视图。
+
+两个纪律值得点名：
+
+- **摘要的输入是刀口前的投影视图**，不是原始 entry——branch_summary 的
+  <summary> 也在里面，"摘要吞摘要"在手动档就第一次发生。滚动折叠（多刀
+  互吞、投影认最后一刀）归 05，在那之前 maybe_compact 拒绝第二刀。
+- **摘要编错一句会污染之后所有轮次**。所以摘要调用是裸 chat、按四段输出
+  （已完成 / 关键事实与规则 / 副作用 / 待办）、只压缩不推理；原文可靠 rewind
+  和轨迹回查。摘要的代价也真实可感：刻意遗漏一条"已处理"，模型对不上账
+  就会重查一次——一次冗余查询换整段窗口（demo 第 13 段实测）。
+
 ### 异常恢复——三级收口
 下面，再来看看从trajectory恢复session时的异常保护；
 假如agent在运行时出现了异常导致进程挂掉，trajectory可能就会不完整，按残迹分三种。resume（store 的第二个入口：从盘上读回轨迹重建树，然后追加一条 `session_resumed`，标记"第二次运行从这里开始"）逐个处理：
@@ -206,7 +238,7 @@ resume 后： ... user → assistant(tool_calls c1)
 ```
 
 **3. 审批悬挂**——死在 `approval_required` 落盘后、decided 前。审批住在
-EventLog 那本账上（Stage 4 的审批流），Trajectory 不涉及：
+EventLog 那本账上（3b 的审批流），Trajectory 不涉及：
 
 ```text
 崩溃时（EventLog）：   ... approval_required{request_id: ap-x}    ← 没有配对的 decided
@@ -223,7 +255,7 @@ resume 后（EventLog）：... approval_required
 
 事实层本体就两个类。`TrajectoryLog` 管单会话文件：第一行是 session header
 （type=session，带 sid / cwd / system_prompt 原文——header 不是树节点），
-其后 entry 逐行追加，框架和 Stage 4 的 EventLog 相同：长度前缀 + CRC，崩在
+其后 entry 逐行追加，框架和 3b 的 EventLog 相同：长度前缀 + CRC，崩在
 写一半时读到坏记录为止，残尾字节裁掉再续写：
 
 ```python
@@ -301,7 +333,7 @@ def attach(self, traj: Trajectory) -> str:
     return traj.sid
 ```
 
-   没 attach 过的 sid 来了直接报错——宁可炸也不静默开一段新历史（Stage 4
+   没 attach 过的 sid 来了直接报错——宁可炸也不静默开一段新历史（3b
    结尾那个困境的结构性解法）：
 
 ```python
@@ -327,8 +359,15 @@ def build_context(self, traj: Trajectory) -> Projection:
 
 中断 / steering / redirect 的逻辑一字未动：被掐的 step 不留半截消息这条
 Stage 3 纪律，在树上同样成立——append 只发生在 step 成功结算之后。
-bus / events / persistence / llm / outbound / subscribers 与 stage03b 一字
-未改。
+bus / events / persistence / outbound / subscribers 与 3b 一字未改；
+工具层与数据源见 3c（tools.py + data/）。
+
+4. 手动压缩接线：`compact_request` 控制事件走旁路（与 interrupt 同待遇，
+   同步置标记），`_run_steps` 在 step 边界检查并调 `_compact`——算刀口 →
+   摘要 → 追加 compaction entry → 发 `context_compacted`（EventLog 答
+   "什么时候、压了多少"，轨迹 entry 答"刀口在哪、摘要是什么"）。
+   摘要失败 fail-open：留痕（`context_compact_failed`）、不 append、
+   不挡 turn，下一个边界可重试。投影零改动。
 
 ## demo
 ### 实测（demo 第 3 段）
@@ -342,7 +381,7 @@ bus / events / persistence / llm / outbound / subscribers 与 stage03b 一字
 [系统] 现在的投影（新分支的 agent 看到的）：
   system    你是一个通过工具干活的通用 agent。
   user      保温杯还有库存吗
-  user      <summary>试过查保温杯库存（42 件），结论：库存充足，无需补货。</summary>
+  user      <summary>试过查保温杯库存（3 件），结论：库存偏紧，建议按目标补货。</summary>
        说明 │ 被抛弃的分支原样躺在文件里——想回头随时能回（branch 回去即可）。
 ```
 
@@ -383,7 +422,7 @@ bus / events / persistence / llm / outbound / subscribers 与 stage03b 一字
 | 追加 | appendEntry：认父 + 移 leafId | 同 |
 | rewind | `branch()`：leafId = to_id；`branchWithSummary`（切分支时总结被弃分支，摘要由模型生成） | 同；摘要是收的文本，模型生成与否归宿主 |
 | 上下文 | buildSessionContext：路径遍历 + 分派 | build_context：同构 + sanitize 补占位收口 |
-| 压缩 | CompactionEntry + firstKeptEntryId | 同语义，本书叫 `keep_from_id`（"从它开始保留"），触发归 5b |
+| 压缩 | CompactionEntry + firstKeptEntryId；/compact 手动 + auto 水位 | 同语义，本书叫 `keep_from_id`（"从它开始保留"）；手动触发本章落地（compact_request + Summarizer 两档），自动策略归 05 |
 | 恢复 | transformMessages 收口（drop） | sanitize 补占位 + CRC 残尾 + 悬挂审批闭合 |
 | session 切换 | `_rewriteFile` 克隆当前路径 | `fork()` 克隆路径 + 新 sid |
 
@@ -394,28 +433,52 @@ bus / events / persistence / llm / outbound / subscribers 与 stage03b 一字
        说明 │ 真模型 + 真工具。EventLog 记传输层的事件账（token 流、治理、
              生命周期），轨迹记会话的结构账（消息树、投影）。两层坐标不同。
 [用户] 保温杯还有库存吗
-[工具] ← query_inventory 结果：保温杯：库存 42 件；316L 不锈钢内胆，500ml，杯身磨砂黑。
+[工具] ← query_inventory 结果：保温杯：库存 3 件；316L 不锈钢内胆，500ml，杯身磨砂黑。
 [系统] 轨迹（尾部 6 条）：
-  7a1c5273 ← 5bd45442  model_change     → live
-  1a8e07a4 ← 7a1c5273  message          user: 保温杯还有库存吗
-  37a12755 ← 1a8e07a4  message          assistant → toolCall(query_inventory)
-  9047591c ← 37a12755  message          tool: 保温杯：库存 42 件；316L 不锈钢内胆…
-  86864f7c ← 9047591c  message          assistant: 有库存，目前还有42件…
-  1b7de00a ← 86864f7c  session_end      {"reason": "demo 结束"}
-[统计] EventLog：seq 1..86（传输层事件账）；轨迹：7 条 entry（会话结构账）；
+  8c71520b ← a6b61df9  prompt_change    {"system_prompt": "…可用工具：query_inventory、…"}
+  fe11fdbd ← 8c71520b  message          user: 保温杯还有库存吗
+  f89418e1 ← fe11fdbd  message          assistant → toolCall(query_inventory)
+  697e79f0 ← f89418e1  message          tool: 保温杯：库存 3 件；316L 不锈钢内胆…
+  e3e9bf05 ← 697e79f0  message          assistant: 有的，保温杯目前还有库存，共3件…
+  12d7ef0e ← e3e9bf05  session_end      {"reason": "demo 结束"}
+[统计] EventLog：seq 1..141（传输层事件账）；轨迹：8 条 entry（会话结构账）；
        投影出 5 条消息，model=live
 ```
 
-同一轮对话：EventLog 86 条（30 个 token 增量 + 生命周期 + 治理），轨迹 7 条
+同一轮对话：EventLog 141 条（token 增量 + 生命周期 + 治理），轨迹 8 条
 entry。**账分两层记，各答各的问题**：传输层答"事件怎么流的、谁批的"，
 会话层答"模型看到了什么、从哪能回退"。
 
+```text
+── 第 13 段：长任务的轨迹解法（离线，一镜到底） ──
+       说明 │ 同一张任务单（第 11 段的命运），换轨迹跑法。
+[实测] branch_with_summary：移指针 + 追加遗言节点 720a9e41（挂在 cdc6d013 下）；
+       抛弃 8 条 entry，原样躺在文件里——副作用（保温杯 50）在遗言里带账
+[实测] 边界压缩：投影 32 → 13 条消息；compaction entry 677cd0a2
+       （keep_from=ca80f7a2，reason=manual）
+[系统] 摘要全文：【已完成】T-101 补货核查处理完：保温杯此前已直接补到 50
+       （副作用，已确认无需重做）；玻璃杯补到 20；马克杯需补 52 件超上限、
+       报备被店长拒绝、未补；保温壶补到 20。【关键规则】…【副作用】…【待办】…
+[工具] ← query_inventory 结果：雨伞：库存 13 件。   ← 摘要漏了它，模型对不上账重查
+[系统] 进程在工具执行前被杀：assistant 要了围巾的数据，结果永远没来
+[实测] resume 后投影 15 条 = 压缩视图（[system, <摘要>, 保留窗…]），不是全量原文；
+       悬挂调用补了 1 条占位：[UNKNOWN: 会话在工具执行前中断，结果缺失]
+[实测] append-only：resume 前字节是 resume 后的前缀：True
+[统计] 全树 58 条 entry（被抛弃分支 8 条 + compaction 原文都在）；
+       当前路径 50 条；EventLog seq 1..105
+```
+
+一个摘要吞另一份摘要（幕 3 遗言进了压缩摘要）、一次冗余查询（刻意遗漏的
+代价）、一次不丢历史的崩溃——三个场景，同一个纪律：修复只作用于视图，
+事实层只追加。
 
 ## 总结
 
-会话立住了、也能从崩溃里重建了，但会话一长上下文装不下；一旦压缩，
-"重放出来的上下文跟当时不一样"——可复现性没了。Stage 5b（压缩与上下文）
-接手：压缩是事件（`context_compacted {from, to, summary, 版本号,
-hash}` 进 log）、只在 step 边界触发、不变式是"给定 (log, 参数版本) →
-唯一 messages"。本章已把口子留好：`compaction` entry 的类型、`keep_from_id`
-的投影语义都在，缺的只是"什么时候压、压成什么"的策略——那是 5b 的全部内容。
+会话立住了、也能从崩溃里重建了，纠偏、压缩、恢复三个场景都跑通了。
+但手动压缩有个天生的局限：它靠人眼判断"上下文太长了"——等你看出来，
+窗口可能已经爆了；而且第二次压缩怎么办（新摘要怎么吞旧摘要、投影认哪
+一刀）语义还没定义。05（压缩与上下文）接手：压缩是事件
+（`context_compacted {…}` 进 EventLog）、自动触发按水位检测、滚动折叠
+补全多次压缩的语义、不变式是"给定 (log, 参数版本) → 唯一 messages"。
+本章留下的口子刚好够它用：`compaction` entry、`keep_from_id` 投影语义、
+`maybe_compact` 的 reason 参数——自动档只是换一个触发者，机制一字不改。

@@ -254,11 +254,10 @@ query → update），马克杯报备被拒后如实汇报、未重试；盘点�
 
 ## 对后续章节的影响
 
-- **04-trajectory（同包增量）**：手动压缩（compact_request + Summarizer +
-  追加 compaction entry，认第一刀不动）+ 长任务的轨迹 demo 段
-  （幕 3 branch / 幕 6 compact / 幕 8 resume，骑在本章场景上）+ 章节文字更新
-  （“压缩只留口子、触发归 5b”改为“手动压缩在本章、自动策略归 05”；
-  实测段回填）。工具层已就位，04 的正文里四件套的提法随本章改为六件套。
+- **04-trajectory（同包增量，已落地）**：手动压缩（compact_request + Summarizer +
+  追加 compaction entry，认第一刀不动）+ demo 第 13 段（幕 3 branch / 幕 6 compact /
+  幕 8 resume，骑在本章场景上，实测投影 32 → 13 条）+ 章节文字已更新
+  （“手动压缩在本章、自动策略归 05”；工具层提法已改六件套）。
 - **05-compaction（转纯策略章）**：水位检测、滚动折叠、cap + blob、兜底阶梯不变；
   原“工具集扩充”一节由本章吸收 list_tasks / get_task，剩分页契约与批次句柄
   （为大规模数据与写防重放）；其 data/ 在本章世界上加密度，不改设定。

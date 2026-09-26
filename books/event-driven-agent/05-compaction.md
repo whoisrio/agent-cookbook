@@ -1,13 +1,16 @@
-# Stage 5b：上下文压缩——有损变换的纪律
+# Stage 5：上下文压缩——有损变换的纪律（原 5b）
 
-> 配套代码（初稿，代码尚未落地）：计划新增
+> 配套代码（设计稿，代码尚未落地）：计划新增
 > `src/baby_event_driven_agent/stages/stage05_compaction/`（从 stage04_trajectory
 > 拷贝后增量改），`stage05-demo` 跑演示、`stage05-test` 跑测试；测试条数与
 > 实测输出落地后回填，本稿不预填数字。
 >
-> 5a 已钉死压缩的视图语义（`compaction` entry：`summary` + `keep_from_id`；
-> 摘要插视图最前、刀口之前跳过、rewind 过压缩点旧消息回来）。本章补三件事：
-> 什么时候压、刀口在哪、压完怎么还能重放得回来。触发形状参考 pi 的
+> 04 已落地压缩的语义与**手动档**（`compaction` entry：`summary` +
+> `keep_from_id`；摘要插视图最前、刀口之前跳过、rewind 过压缩点旧消息回来；
+> compact_request 控制事件 + Summarizer 两档 + maybe_compact，机制件在
+> `session/compaction.py`）。本章补三件事：什么时候压（自动水位）、
+> 多次压怎么折叠（认最后一刀）、压完怎么还能重放得回来（不变式）。
+> 触发形状参考 pi 的
 > auto-compaction（`/compact`、`session_before_compact` / `session_compact`
 > / `session_compact_failed`）。
 
@@ -84,7 +87,8 @@ N 轮的 token 量有上界，因为单轮工具结果有分页和 cap 兜着（
 steering  = 等 step 边界，把消息拼进当前上下文，不打断在飞的（Stage 2）
 interrupt = 掐掉在飞的 step，turn 结束（Stage 3）
 redirect  = 掐掉在飞的 step + 补消息，turn 不结束（Stage 3）
-compact   = step 边界处换一副更短的视图，再发下一次调用（本章）
+compact   = step 边界处换一副更短的视图，再发下一次调用
+            （手动档已在 04 落地；本章补自动水位触发，同一函数、reason 不同）
 ```
 
 流中间不换 messages，在飞请求的上下文会漂移。压缩调用本身也是一次
@@ -320,7 +324,8 @@ policy_version，不存压缩后的 messages（否则评测被某一次策略
 新包 `stage05_compaction/` 从 `stage04_trajectory/` 拷贝，
 `transport/`、`session/` 不动，增量如下。
 
-新增 `session/compaction.py`：
+`session/compaction.py` 已有手动档（cut_before_turn / Summarizer 两档 /
+maybe_compact，见 04），本章在同一个文件上扩展：
 
 ```python
 @dataclass(frozen=True)

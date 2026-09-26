@@ -194,7 +194,7 @@
 - 下章需求预告：试错回不去（只能往前追加）、上下文压不下（无刀可用，消息数
   单调递增）、崩了全丢（EventLog 有账读不回"聊到哪了"）——04 接手。
 
-## Stage 4：会话与真相——log、投影与异常恢复（04-trajectory.md，正文已有；手动压缩增量待落地）
+## Stage 4：会话与真相——log、投影与异常恢复（04-trajectory.md，2026-09-26 实测定稿）
 
 （原 Stage 5「会话与轨迹」拆分的前半，章节重排后归位为 4；与 3c 同包。）
 
@@ -228,12 +228,12 @@
      - 重放幂等：resume = 位点续读，checkpoint = 位点（读到哪）+ 视图快照
        （上下文是什么），平行 Kafka consumer offset，物理实现在 3b；
        重放不产生重复事实。
-  4. **手动压缩（增量，设计已定、形状由 3c 锁定）**：compact_request 控制事件
+  4. **手动压缩（已落地，形状由 3c 锁定）**：compact_request 控制事件
      （旁路，同 interrupt 的待遇，step 边界生效）+ Summarizer 协议
      （ScriptedSummarizer 离线确定性 / LiveSummarizer 裸 chat 封顶）+
      追加 `compaction` entry（summary + keep_from_id，投影认第一刀不动）；
-     demo 补长任务的轨迹段——幕 3 branch / 幕 6 compact / 幕 8 resume，
-     骑在 3c 的场景上。
+     demo 第 13 段实测：长任务的轨迹解法——幕 3 branch / 幕 6 compact /
+     幕 8 resume，骑在 3c 的场景上（投影 32 → 13 条，全树 58 条原文都在）。
 - 关键论点：append-only 的是**事实层**；视图层允许有损，但每一次有损变换都要在
   事实层留痕——否则 log 不是唯一真相，只是"唯一真相的一半"。
 - 关键论点：恢复的前提有两个——log 本身**可判定**（写一半能认出来，3b 的
