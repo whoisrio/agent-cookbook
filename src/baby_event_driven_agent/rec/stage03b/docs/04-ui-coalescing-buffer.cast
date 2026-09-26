@@ -1,0 +1,8 @@
+{"version":3,"term":{"cols":120,"rows":40},"timestamp":1790344783,"idle_time_limit":1.0,"command":"/Users/rio/repos/myprjs/agent-cookbook/.venv/bin/python3 -m baby_event_driven_agent.stages.stage04_message_bus.main 04-ui-coalescing-buffer --sessions-dir /Users/rio/repos/myprjs/agent-cookbook/src/baby_event_driven_agent/sessions/stage04","title":"stage04/04-ui-coalescing-buffer","env":{"SHELL":"/bin/zsh"}}
+[0.420, "o", "\u001b[1mStage 4：消息机制 —— 事件离开 agent 之后要走多远\u001b[0m\r\n\u001b[90m  01~03、05 的回答来自：真模型（本地 ollama，读仓库根 .env）；04 只测总线，不打模型\u001b[0m\r\n\u001b[90m  （只跑：04-ui-coalescing-buffer）\u001b[0m\r\n\r\n\u001b[1m── 04-ui-coalescing-buffer · 第 4 段：UI 缓冲消费：满格 / 帧界才刷屏 ──\u001b[0m\r\n\u001b[90m       说明 │ 往总线灌 200 个 agent_delta。UI 是 StreamConsumer：offer 把增量攒进CoalescingBuffer——满 96 字立刻刷，到 50ms 帧界也刷；emit 不等刷屏。\u001b[0m\r\n"]
+[0.000, "o", "\r\n\u001b[1m\u001b[32m[UI] \u001b[0m\u001b[32m刷一帧（96 字）\u001b[0m\r\n"]
+[0.000, "o", "\r\n\u001b[1m\u001b[32m[UI] \u001b[0m\u001b[32m刷一帧（96 字）\u001b[0m\r\n"]
+[0.000, "o", "\r\n\u001b[1m\u001b[32m[实测] \u001b[0m\u001b[32m200 个 delta 全部送达（merged=200），emit 总耗时 0.000s——emit 返回时事件只是进了缓冲\u001b[0m\r\n"]
+[0.052, "o", "\r\n\u001b[1m\u001b[32m[UI] \u001b[0m\u001b[32m刷一帧（8 字）\u001b[0m\r\n"]
+[0.070, "o", "\r\n\u001b[1m\u001b[32m[实测] \u001b[0m\u001b[32m200 次渲染合并成 3 帧——刷屏节奏归消费者，不归总线\u001b[0m\r\n\u001b[90m       说明 │ 满了立刻刷（洪峰不攒着），到帧界也刷（尾巴不饿着），二者先到先刷。\u001b[0m\r\n\r\n\u001b[90m  sessions 目录: /Users/rio/repos/myprjs/agent-cookbook/src/baby_event_driven_agent/sessions/stage04\u001b[0m\r\n"]
+[0.053, "x", "0"]

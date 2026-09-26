@@ -1,0 +1,73 @@
+{
+  "stage": "04",
+  "run_id": "docs",
+  "window_size": "120x40",
+  "idle_time_limit": 1.0,
+  "cases": [
+    {
+      "case": "01-followup-default",
+      "title": "",
+      "exit": 0,
+      "timeout": false,
+      "secs": 16.4,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/01-followup-default.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/01-followup-default.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/01-followup-default.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "02-promote-to-steering",
+      "title": "",
+      "exit": 0,
+      "timeout": false,
+      "secs": 14.4,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/02-promote-to-steering.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/02-promote-to-steering.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/02-promote-to-steering.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "03-interrupt-redirect",
+      "title": "",
+      "exit": 0,
+      "timeout": false,
+      "secs": 24.1,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/03-interrupt-redirect.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/03-interrupt-redirect.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/03-interrupt-redirect.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "04-ui-coalescing-buffer",
+      "title": "",
+      "exit": 0,
+      "timeout": false,
+      "secs": 0.6,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/04-ui-coalescing-buffer.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/04-ui-coalescing-buffer.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/04-ui-coalescing-buffer.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "05-approval-flow",
+      "title": "",
+      "exit": 0,
+      "timeout": false,
+      "secs": 6.7,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/05-approval-flow.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/05-approval-flow.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/05-approval-flow.mp4",
+      "render_error": ""
+    }
+  ]
+}

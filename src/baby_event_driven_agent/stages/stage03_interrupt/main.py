@@ -8,30 +8,24 @@
 用户输入和中断信号都从 inbound 进来——中断只是另一种类型的命令，
 不额外订阅、也不经过 UI handler。
 
-按 books/event-driven-agent/03-interrupt.md
-的六个场景逐个演示（等中断信号落在目标那一格再按）：
+按 books/event-driven-agent/03-interrupt.md 演示。三个"LLM 输出没走完"的时机
+（thinking / tool_call 流中 / 半句回答）history 形状与"已发未回"完全一样，
+时机覆盖由 live 测试压，demo 只留形状标本，共 6 个 case：
 
-    场景 1  已发 LLM、未回复    —— 请求刚发出，一个增量都还没回
-    场景 2  只在吐 thinking    —— 还没吐可见文本
-    场景 3  要调工具、参数没吐完 —— 流里已有 tool_call_delta，工具没执行
-    场景 4  tool 执行中        —— 在跑的工具当场掐死（不再等它跑完）
-    场景 5  tool 刚好跑完      —— 结果都拿到了，模型还没给最终回答
-    场景 6  回答只说了一半     —— 流里只有 text_delta
+    01/02  已发未回          —— 纯停止：补 assistant 打断占位；
+                              02 在打断时附了一条新的用户消息，turn 不结束
+    03     半句回答          —— 已经上屏的输出也整步丢
+    04/05  工具执行中        —— 边界命中：在跑的跑完、没开始的补占位；
+                              纯停止补封口，05 附新消息后 turn 不结束
+    06     工具刚好跑完      —— 收口 ≠ 残缺：工具完整，封口只是 turn 要收尾
 
-每个场景演示一次 stop；场景 1–4 另演示一次 redirect（折标注 / 补空壳 /
-全丢+折标注 / 纯 steering）。case 名 = **编号 + 落点 + 意图**（`--list` 看全，名字即录制产物名，
-字典序就是演示顺序）。收尾只有一条规则：
+case 名 = **编号 + 落点 + 意图**（`--list` 看全，
+名字即录制产物名，字典序就是演示顺序）。收尾只有一条规则：
 
-    stop     ：看**尾部角色**——尾部是 tool → 补 assistant 封口占位；否则 → 补 user 中断标记。
-    redirect ：一律补纠正 user；折不折 REDIRECT_NOTE，只看 assistant 输出有没有被截断。
-
-什么时候是 stop、什么时候是 redirect —— **由用户选，agent 不猜**：
-
-    用户意图            信封                             收尾
-    ───────────────────────────────────────────────────────────────
-    停（问错了/等不及）   {"intent": "stop"}              掐掉 + 封口，turn 结束
-    转向（改主意、接着干）{"intent": "redirect",          掐掉 + 补纠正 user，
-                        "text": "…纠正内容…"}            turn 不结束，同 turn 重发
+    纯停止（不带新消息）  ：一律补 assistant 占位——尾部是 tool 用"不再作答"文本，
+                            否则用被打断声明（封死没被回答的 user）。
+    打断并附新消息        ：掐在跑 = 打断占位 + 新消息（turn 不结束）；
+                            边界命中（工具段）= 只有新消息，就是 steering。
 
 每一行都带**行首标签**，角色一眼分得开：
 
@@ -61,10 +55,10 @@ from .llm import TOOLS, RealLLM
 
 # ---------------------------------------------------------------- 屏幕上色
 # 与 stage01 / stage02 同一套底子：思考暗色、正文亮蓝、工具绿色、用户输入黄色。
-# 系统提示（生命周期：掐掉 / 边界命中 / turn 结束）统一橙色，不按 intent 上色；
+# 系统提示（生命周期：掐掉 / 边界命中 / turn 结束）统一橙色；
 # 本章多出两类用户动作，各给一色（只标在"用户"行上，标明谁按的、命中哪一步）：
-#   亮红 = 停（intent=stop，掐掉就结束）
-#   洋红 = 转向（intent=redirect，掐掉后原地重发）
+#   亮红 = 纯停止（掐掉就结束）
+#   洋红 = 输入新消息（打断当前回复，掐掉后同 turn 继续处理新消息）
 # 旁白单独用灰色，且只缩进不出现在对话流里——不再和"思考"共用一个暗色。
 DIM = "\033[2m"  # 思考内容
 GREY = "\033[90m"  # 旁白说明 / 收尾信息 / history 尾部
@@ -96,7 +90,7 @@ def _end_stream_line() -> None:
 
 
 def line(label: str, color: str, text: str) -> None:
-    """对话流里的一行：`[标签] 内容`（和 stage04 / stage05 同一套行首与上色）。"""
+    """对话流里的一行：`[标签] 内容`（和 stage03b / stage04 同一套行首与上色）。"""
     _end_stream_line()
     print(f"\n{BOLD}{color}[{label}] {RESET}{color}{text}{RESET}")
 
@@ -137,75 +131,53 @@ def brief(text: str, limit: int = 140) -> str:
 
 @dataclass(frozen=True)
 class Case:
-    """一段可单独执行的演示：等中断落在 landing 这一格，再发 intent。
+    """一段可单独执行的演示：等中断落在 landing 这一格，再发中断。
 
-    landing 决定发中断的时机，intent 决定 stop 还是 redirect。"""
+    landing 决定发中断的时机，redirect_text 有值表示打断时附一条新消息。"""
 
     id: str
     tag: str
     title: str
     question: str
     landing: str = ""
-    intent: str = ""
     note: str = ""
     redirect_text: str = ""
 
 
-# case 名是 `两位编号-落点-意图`（如 07-tool-running-stop = 工具执行中被 stop）：
+# case 名是 `两位编号-落点-意图`（如 04-tool-running-stop = 工具执行中被 stop）：
 # 编号让**文件名字典序 = 演示顺序**，语义部分说明"在演示哪一格"；整串也是录制产物名。
 CASES: tuple[Case, ...] = (
     Case(
-        "01-sent-stop", "场景 1", "已发 LLM、未回复 —— stop", "你好，用一句话介绍你自己",
-        "immediate", "stop",
-        note="还没有任何输出可留；尾部是没被回答的 user → 补 user 中断标记。",
+        "01-sent-stop", "掐在跑", "已发 LLM、未回复 —— 纯停止", "你好，用一句话介绍你自己",
+        "immediate",
+        note="还没有任何输出可留；尾部是没被回答的 user → 补 assistant 打断占位，封死重答。",
     ),
     Case(
-        "02-sent-redirect", "场景 1", "已发 LLM、未回复 —— redirect", "你好，用一句话介绍你自己",
-        "immediate", "redirect",
+        "02-sent-redirect", "掐在跑", "已发 LLM、未回复 —— 打断并附新消息", "你好，用一句话介绍你自己",
+        "immediate",
         redirect_text="别自我介绍了，改成说说报销规定",
-        note="同一个落点、只差 intent：turn 不结束，补一条折了 REDIRECT_NOTE 的纠正 user。",
+        note="通过用户输入新消息，触发对之前消息的中断；打断占位之后是新消息，turn 不结束。",
     ),
     Case(
-        "03-thinking-stop", "场景 2", "只在吐 thinking —— stop",
-        "报销和 VPN 分别怎么申请？先想清楚再决定查什么", "thinking", "stop",
-        note="thinking 不进 history，尾部仍是 user → 同场景 1，补 user 中断标记。",
-    ),
-    Case(
-        "04-thinking-redirect", "场景 2", "只在吐 thinking —— redirect",
-        "报销和 VPN 分别怎么申请？先想清楚再决定查什么", "thinking", "redirect",
-        redirect_text="先别查了，改成订会议室",
-        note="redirect 先补一个 assistant 空壳占位（只声明被打断，不回灌思维链），再补折标注的纠正 user。",
-    ),
-    Case(
-        "05-toolcall-stop", "场景 3", "要调工具、参数还没吐完 —— stop", "报销有什么规定",
-        "tool_start", "stop",
-        note="半截 tool_call 不是合法消息、也没执行过 → 整步丢，尾部补 user 中断标记。",
-    ),
-    Case(
-        "06-toolcall-redirect", "场景 3", "要调工具、参数还没吐完 —— redirect", "报销有什么规定",
-        "tool_start", "redirect", redirect_text="先别查了，改成订会议室",
-        note="没收到完整返回就当没收到：半截 tool_call 整步丢，只补折标注的纠正 user。",
-    ),
-    Case(
-        "07-tool-running-stop", "场景 4", "tool 执行中 —— stop", "报销和 VPN 分别有什么规定，都要查",
-        "tool_running", "stop",
-        note="在跑的工具被当场掐死（不再等它跑完）；模型已发起的 tool_call 随 step 一起丢，尾部补 user 中断标记。",
-    ),
-    Case(
-        "08-tool-running-redirect", "场景 4", "tool 执行中 —— redirect", "报销和 VPN 分别有什么规定，都要查",
-        "tool_running", "redirect", redirect_text="先别查了，改成订会议室",
-        note="同上：在跑的工具被当场掐死，不放封口，换成纯纠正 user（工具阶段 = steering，不加标注）。",
-    ),
-    Case(
-        "09-tools-done-stop", "场景 5", "tool 刚好跑完 —— stop", "报销有什么规定",
-        "tool_done", "stop",
-        note="工具结果都真拿到了；尾部停在 tool → 补 assistant 封口占位（不是因为残缺，是 turn 要收口）。",
-    ),
-    Case(
-        "10-half-answer-stop", "场景 6", "回答只说了一半 —— stop",
+        "03-half-answer-stop", "掐在跑", "回答只说了一半 —— 纯停止",
         "用三句话说说，事件驱动架构相比轮询好在哪儿",
-        "text", "stop",
-        note="模型在写最终回答、只说了一半就被掐掉；尾部仍是 user → 补 user 中断标记。",
+        "text",
+        note="模型在写最终回答、只说了一半就被掐掉，半句丢弃 → 补 assistant 打断占位。",
+    ),
+    Case(
+        "04-tool-running-stop", "边界命中", "tool 执行中 —— 纯停止", "报销和 VPN 分别有什么规定，都要查",
+        "tool_running",
+        note="工具不被打断：在跑的跑完，没开始的补未执行占位；尾部 tool → 补 assistant 封口。",
+    ),
+    Case(
+        "05-tool-running-redirect", "边界命中", "tool 执行中 —— 打断并附新消息", "报销和 VPN 分别有什么规定，都要查",
+        "tool_running", redirect_text="先别查了，改成订会议室",
+        note="同样跑完+补占位；新消息在 step 边界处理（steering），turn 不结束。",
+    ),
+    Case(
+        "06-tools-done-stop", "边界命中", "tool 刚好跑完 —— 纯停止", "报销有什么规定",
+        "tool_done",
+        note="工具结果都真拿到了；尾部停在 tool → 补 assistant 封口占位（不是因为残缺，是 turn 要收口）。",
     ),
 )
 
@@ -275,22 +247,10 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
             line("执行工具", GREEN, f"← {tag} 结果：{brief(p['result'])}")
 
     async def ui_step_cancelled(e: Event) -> None:
-        intent = e.payload.get("intent", "stop")
-        line(
-            "系统",
-            ORANGE,
-            f"已掐掉在飞的那一步（intent={intent}，step_cancelled）",
-        )
+        line("系统", ORANGE, "已掐掉在跑的那一步（step_cancelled）")
 
     async def ui_turn_interrupted(e: Event) -> None:
-        intent = e.payload.get("intent", "stop")
-        line(
-            "系统",
-            ORANGE,
-            f"边界命中：step 没在飞，turn 在这里"
-            f"{'转向' if intent == 'redirect' else '收尾'}"
-            f"（intent={intent}，turn_interrupted）",
-        )
+        line("系统", ORANGE, "边界命中：step 没在飞，turn 在 step 边界被处理（turn_interrupted）")
 
     async def ui_turn_end(e: Event) -> None:
         reason = e.payload.get("reason", "")
@@ -327,15 +287,17 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
 
 
 
-    # 场景 4 要一个"进去后卡住"的慢工具：中断落在它执行中时，step 被 cancel，
-    # 下面的 await 就是 cancel 命中的点（事件永不 set，靠外部中断唤醒）。
+    # 场景 4 要一个"进去后卡住等放行"的慢工具：中断落在它执行中时不会被掐——
+    # 在跑的等它跑完，step 正常返回，由 step 边界收尾（turn_interrupted）。
     real_search = TOOLS["search_rules"]
-    gate_in = asyncio.Event()
+    gate_in = asyncio.Event()       # 已进入工具：demo 等它决定发中断的时机
+    gate_release = asyncio.Event()  # 放行：中断发出后置位，让在跑的工具跑完
 
     async def gated_search(args: dict) -> str:
-        gate_in.set()                      # 标记"工具开始执行"——hit 等这个
-        await asyncio.Event().wait()       # 永不自发结束，专等中断 cancel
-        return await real_search(args)     # 被 cancel 时不会跑到这里
+        if not gate_in.is_set():
+            gate_in.set()                # 第一次调用：标记"工具开始执行"——hit 等这个
+            await gate_release.wait()    # 等放行（scenario 发完中断就放行）
+        return await real_search(args)   # 之后的调用（redirect 后的转向轮）正常执行
 
     LANDING_EVENT = {
         "thinking": "agent_thinking",
@@ -347,7 +309,7 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
         "immediate": "请求刚发出、一个增量都还没回（已发 LLM、未回复）",
         "thinking": "只吐了 thinking，可见文本一个字都还没有",
         "tool_start": "流里已出现 tool_call_delta（要调工具，参数没吐完、工具没执行）",
-        "tool_running": "工具正在执行（当场掐死在跑的工具）",
+        "tool_running": "工具正在执行（工具不被打断：在跑的跑完，没开始的补占位）",
         "tool_done": "工具已经拿到结果，模型还没给最终回答",
         "text": "模型在写最终回答、只说了一半",
     }
@@ -413,28 +375,31 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
         banner(
             f"{case.tag} · {case.id}",
             case.title,
-            f"命中落点：{LANDING_WHAT[case.landing]}；意图：{case.intent}",
+            f"命中落点：{LANDING_WHAT[case.landing]}"
+            + (f"；打断并附新消息：{case.redirect_text}" if case.redirect_text else ""),
         )
         line("用户", YELLOW, f"[{sid}] {case.question}")
         turn_done.clear()
         bus.publish(Event("user_input", sid, {"text": case.question}), to=agent.agent_id)
 
         await hit(sid, case.landing)
-        if case.intent == "stop":
-            line("用户", RED, "按下停止（intent=stop）")
-            bus.publish(Event("user_interrupt", sid, {"intent": "stop"}), to=agent.agent_id)
+        if not case.redirect_text:
+            line("用户", RED, "按下停止")
+            bus.publish(Event("user_interrupt", sid, {}), to=agent.agent_id)
         else:
-            line("用户", MAGENTA, f"改主意（intent=redirect）：{case.redirect_text}")
+            line("用户", MAGENTA, f"输入新消息（会打断上一条的回复）：{case.redirect_text}")
             bus.publish(
                 Event(
                     "user_interrupt",
                     sid,
-                    {"intent": "redirect", "text": case.redirect_text},
+                    {"text": case.redirect_text},
                 ),
                 to=agent.agent_id,
             )
-        # tool_running 落点：工具正在执行，on_interrupt 会当场掐死在飞的 step
-        #（不再 gate_open.set() 放行）——被掐的工具随 cancel 终止，不会跑完。
+        # tool_running 落点：中断不打断工具——放行让在跑的跑完，step 正常返回，
+        # 由 step 边界收尾；没开始的调用由 agent 补"未执行"占位。
+        if case.landing == "tool_running":
+            gate_release.set()
         try:
             await asyncio.wait_for(turn_done.wait(), timeout=TURN_TIMEOUT)
         except asyncio.TimeoutError:
@@ -454,9 +419,10 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
         note(f"只跑：{', '.join(c.id for c in selected)}")
 
     for case in selected:
-        # 场景 4 要一个"进去后卡住"的慢工具，只在跑它时替换
+        # 场景 4 要一个"进去后卡住等放行"的慢工具，只在跑它时替换
         if case.landing == "tool_running":
             gate_in.clear()
+            gate_release.clear()
             TOOLS["search_rules"] = gated_search
         try:
             await scenario(case)

@@ -26,10 +26,9 @@ from pathlib import Path
 import pytest
 
 from baby_event_driven_agent.stages.stage03_interrupt.agent import (
+    INTERRUPTED,
     NO_EXEC,
-    REDIRECT_NOTE,
     STOP_CLOSER,
-    STOP_MARKER,
     Agent,
 )
 from baby_event_driven_agent.stages.stage03_interrupt.events import (
@@ -106,12 +105,8 @@ class Harness:
             Event("user_input", sid, {"text": text}), to=self.agent.agent_id
         )
 
-    def interrupt(
-        self, sid: str = "A", intent: str = "stop", text: str | None = None
-    ) -> None:
-        payload: dict = {"intent": intent}
-        if text is not None:
-            payload["text"] = text
+    def interrupt(self, sid: str = "A", text: str | None = None) -> None:
+        payload: dict = {"text": text} if text is not None else {}
         # 中断也是 inbound 命令：同一个收件地址，不进收件箱
         self.bus.publish(
             Event("user_interrupt", sid, payload), to=self.agent.agent_id
@@ -143,7 +138,7 @@ def tail(history: list[dict]) -> dict:
 def test_idle_stop_is_noop(workdir: Path) -> None:
     """① 空闲（turn 之间）和 ⑨ turn 已收尾：中断什么都不该做，也不该残留。
 
-    两次 turn 都完整，且日志里没有 step_cancelled / turn_interrupted。
+    两次 turn 都完整；会话账只投影消息，生命周期事件不进账。
     """
     log_path = workdir / "session.jsonl"
     h = Harness(log_path)
@@ -159,9 +154,8 @@ def test_idle_stop_is_noop(workdir: Path) -> None:
 
     asyncio.run(run())
 
-    assert not [r for r in records(log_path) if r["type"] == "step_cancelled"]
-    assert not [r for r in records(log_path) if r["type"] == "turn_interrupted"]
-    assert len(notes(log_path, "interrupt received")) == 2
+    recs = records(log_path)
+    assert {r["type"] for r in recs} <= {"user_input", "agent_reply", "tool_result"}
     # 第二个 turn 没有被残留的标志掐掉
     assert len(notes(log_path, "final")) == 2
 
@@ -169,11 +163,12 @@ def test_idle_stop_is_noop(workdir: Path) -> None:
 # ------------------------------------------------------------------ ② / ④ / ⑧（stop）
 
 
-def test_stream_stop_closes_with_marker(workdir: Path) -> None:
-    """②④⑧ stop：掐掉在飞的 step，尾部补 user 中断标记封口。
+def test_stream_stop_closes_with_assistant(workdir: Path) -> None:
+    """②④⑧ stop：掐掉在飞的 step，尾部补 assistant 打断占位封口。
 
     等不到确定性窗口就按最接近的状态发——断言只压"形状"：step 被取消、
-    turn 以 interrupted 收尾、history 尾部是那条自描述标记。
+    turn 以 interrupted 收尾、history 尾部是那条自描述占位
+    （尾部是没被回答的 user，不补的话下一轮模型会把它翻出来重答）。
     """
     log_path = workdir / "session.jsonl"
     h = Harness(log_path)
@@ -185,17 +180,14 @@ def test_stream_stop_closes_with_marker(workdir: Path) -> None:
             await h.wait("tool_call_started")
         except asyncio.TimeoutError:
             pass
-        h.interrupt(intent="stop")
+        h.interrupt()
         await h.wait("turn_end")
         await h.stop()
 
     asyncio.run(run())
 
-    recs = records(log_path)
-    assert [r for r in recs if r["type"] == "step_cancelled"]
-    assert notes(log_path, "interrupted")
     hist = h.agent.history["A"]
-    assert tail(hist) == {"role": "user", "content": STOP_MARKER}
+    assert tail(hist) == {"role": "assistant", "content": INTERRUPTED}
     # 中断之后 history 仍然是合法序列：没有半截 assistant
     assert hist[-2]["role"] == "user"
 
@@ -215,7 +207,7 @@ def test_tool_phase_stop_waits_then_closes_with_assistant(
         h.send("报销有什么规定")
         await h.wait("tool_call_started")
         await asyncio.wait_for(entered.wait(), TIMEOUT)   # 工具确实在跑
-        h.interrupt(intent="stop")
+        h.interrupt()
         await asyncio.sleep(0)                            # 让信号先落地
         release.set()                                     # 放行工具
         await h.wait("turn_end")
@@ -227,7 +219,6 @@ def test_tool_phase_stop_waits_then_closes_with_assistant(
     # 工具没被掐：拿到的是真实结果，不是占位
     results = [r for r in recs if r["type"] == "tool_result"]
     assert results and results[-1]["payload"]["skipped"] is False
-    assert [r for r in recs if r["type"] == "turn_interrupted"]
     hist = h.agent.history["A"]
     assert tail(hist) == {"role": "assistant", "content": STOP_CLOSER}
     assert hist[-2]["role"] == "tool"
@@ -251,7 +242,7 @@ def test_tool_phase_stop_skips_unstarted_calls(
         h.send("报销和 VPN 分别有什么规定，都要查")
         await h.wait("tool_call_started")
         await asyncio.wait_for(entered.wait(), TIMEOUT)
-        h.interrupt(intent="stop")
+        h.interrupt()
         await asyncio.sleep(0)
         release.set()
         await h.wait("turn_end")
@@ -274,8 +265,8 @@ def test_tools_done_stop_closes_with_assistant_closer(workdir: Path) -> None:
     """⑤ stop：工具已经全跑完、turn 还没收尾时按 stop，收口按**尾部角色**来。
 
     此刻 history 尾部停在 `tool`（工具结果没人接），缺的是 assistant 收尾 →
-    补 assistant 封口占位，**不是** user 中断标记（否则会漏出 `[..., tool, user]`
-    这种"工具结果没人接住"的形状）。
+    补 assistant 封口占位（否则尾部会漏出 `[..., tool, user]` 这种
+    "工具结果没人接住"的形状）。
     """
     log_path = workdir / "session.jsonl"
     h = Harness(log_path)
@@ -283,7 +274,7 @@ def test_tools_done_stop_closes_with_assistant_closer(workdir: Path) -> None:
     async def run() -> None:
         h.send("报销有什么规定")
         await h.wait("tool_result")   # 工具已经跑完，结果马上进 history
-        h.interrupt(intent="stop")
+        h.interrupt()
         await h.wait("turn_end")
         await h.stop()
 
@@ -294,14 +285,15 @@ def test_tools_done_stop_closes_with_assistant_closer(workdir: Path) -> None:
     assert hist[-2]["role"] == "tool", roles(hist)
 
 
-# ------------------------------------------------------------------ ④ / ⑧（redirect）
+# ------------------------------------------------------------------ ④ / ⑧（打断并附新消息）
 
 
-def test_stream_redirect_discards_incomplete_step(workdir: Path) -> None:
-    """①②③ redirect：没收到完整的 LLM 返回就当没收到——在飞 step 的产物一律丢。
+def test_stream_interrupt_with_message_discards_incomplete_step(workdir: Path) -> None:
+    """①②③ 打断并附新消息：没收到完整的 LLM 返回就当没收到——在飞 step 的产物一律丢。
 
     可见文本 / 半截 tool_call 都不进 history：半截的 arguments 断在半路、不是
-    合法消息，也没执行过，补不了占位。只补一条折了 REDIRECT_NOTE 的纠正 user。
+    合法消息，也没执行过，补不了占位。收尾 = assistant 打断占位 + 新消息，
+    三种未完整返回的场景同形状。
     """
     log_path = workdir / "session.jsonl"
     h = Harness(log_path)
@@ -312,7 +304,7 @@ def test_stream_redirect_discards_incomplete_step(workdir: Path) -> None:
             await h.wait("tool_call_started")     # ③：已见到工具意图（参数还没吐完）
         except asyncio.TimeoutError:
             pass
-        h.interrupt(intent="redirect", text="先别查了，改成订会议室")
+        h.interrupt(text="先别查了，改成订会议室")
         await h.wait("turn_end")
         await h.stop()
 
@@ -322,22 +314,24 @@ def test_stream_redirect_discards_incomplete_step(workdir: Path) -> None:
     idx = next(
         i
         for i, m in enumerate(hist)
-        if m.get("role") == "user" and m["content"].startswith(REDIRECT_NOTE)
+        if m.get("role") == "user" and m["content"] == "先别查了，改成订会议室"
     )
-    # 纠正之前的在飞产物全丢：不能出现半截 assistant(tool_calls)、也不能有它的占位
-    before = hist[:idx]
+    # 收尾形状：打断占位紧跟在被丢掉的 user 问题之后，新消息是纯文本
+    assert hist[idx - 1] == {"role": "assistant", "content": INTERRUPTED}
+    # 占位之前的在飞产物全丢：不能出现半截 assistant(tool_calls)、也不能有它的 tool 结果
+    before = hist[: idx - 1]
     assert not [m for m in before if m.get("tool_calls")], roles(hist)
     assert not [m for m in before if m.get("role") == "tool"], roles(hist)
 
 
-# ------------------------------------------------------------------ ⑤ / ⑦（redirect → steering）
+# ------------------------------------------------------------------ ⑤ / ⑦（附新消息 → steering）
 
 
-def test_boundary_redirect_is_plain_steering(
+def test_boundary_message_is_plain_steering(
     workdir: Path, slow_search: tuple[asyncio.Event, asyncio.Event]
 ) -> None:
-    """⑤⑦ redirect：工具阶段（step 边界）转向没有残破消息可修，
-    纠正就是一条普通 user 消息 —— 不加"被打断"标注。
+    """⑤⑦ 打断附新消息落在工具阶段（step 边界）：没有残破消息可修，
+    新消息就是一条普通 user 消息，不加"被打断"标注。
     """
     entered, release = slow_search
     log_path = workdir / "session.jsonl"
@@ -347,7 +341,7 @@ def test_boundary_redirect_is_plain_steering(
         h.send("报销有什么规定")
         await h.wait("tool_call_started")
         await asyncio.wait_for(entered.wait(), TIMEOUT)
-        h.interrupt(intent="redirect", text="先别查了，改成订会议室")
+        h.interrupt(text="先别查了，改成订会议室")
         await asyncio.sleep(0)
         release.set()
         await h.wait("turn_end")
@@ -358,6 +352,7 @@ def test_boundary_redirect_is_plain_steering(
     hist = h.agent.history["A"]
     plain = [m for m in hist if m.get("role") == "user" and m["content"] == "先别查了，改成订会议室"]
     assert plain, roles(hist)
+    # 边界上的新消息没有残破消息可修：只补这条纯 user，不补任何 assistant 打断占位
     assert not [
-        m for m in hist if m.get("role") == "user" and m["content"].startswith(REDIRECT_NOTE)
-    ]
+        m for m in hist if m.get("role") == "assistant" and m["content"] == INTERRUPTED
+    ], roles(hist)

@@ -47,15 +47,12 @@ logger = logging.getLogger(__name__)
 
 MAX_STEPS = 4
 
-# 中断收尾用的标记与占位，都要自描述——不写清身份，模型会把它们当成
+# 中断收尾用的占位，都要自描述——不写清身份，模型会把它们当成
 # 模型输出或工具输出（Hermes 早期用裸文本被当 prompt injection 拒过）。
-STOP_MARKER = "[本轮已被用户中断，不要回答上面那条问题]"
-STOP_CLOSER = "[本轮已被用户中断，不再基于上面的工具结果作答]"
-REDIRECT_NOTE = "[上一轮回答被用户打断，以下是用户的纠正]"
+# 收尾一律补 assistant 占位，只有文本随尾部角色变：
+STOP_CLOSER = "[本轮已被用户中断，不再基于上面的工具结果作答]"  # 尾部 tool：结果没人接
+INTERRUPTED = "[response interrupted]"  # 尾部 user：声明这轮被打断，封死重答
 NO_EXEC = "[被用户中断，未执行]"
-# 只观测到 thinking、一个字可见文本都没有时，用空壳占住 assistant 的位置：
-# 内容是声明"这里被打断过"，绝不回灌思维链本身。
-INTERRUPTED_SHELL = "[response interrupted]"
 
 
 class _StepAborted(Exception):
@@ -100,7 +97,6 @@ class Agent:
         self._inflight: dict[str, asyncio.Task[Any] | None] = {}
         self._turn_active: dict[str, bool] = {}
         self._phase: dict[str, str] = {}
-        self._running_tool: dict[str, bool] = {}  # 工具是否正在执行（决定中断掐不掐）
         self._pending_interrupt: dict[str, dict[str, Any]] = {}
         # inbound 路由：publish(event, to=agent_id) 会落到 enqueue
         bus.register(agent_id, self.enqueue)
@@ -129,32 +125,24 @@ class Agent:
     def on_interrupt(self, event: Event) -> None:
         """中断：控制信号，不进收件箱、不当消息分类（**同步**，无 await）。
 
-        payload 带 intent：stop（掐掉、turn 结束）或 redirect（掐掉、原地转向），
-        缺省 stop；redirect 还要带 text（纠正内容）。
+        payload 可带 text：用户在打断的同时输入的新消息。带 text → turn 不结束，
+        消息在收尾时拼进上下文；不带 → 纯停止，turn 到占位/封口为止。
 
         这里只做两件事：记下"待消费的中断"，以及在**流式输出这一段**把在飞的
-        step 掐掉。工具执行那一段（_phase == "tools"）不掐——Stage 3 的工具默认
-        不可中断，让它跑完、由 step 边界收尾。
+        step 掐掉。工具执行那一段（_phase == "tools"）不掐——Stage 3 的工具
+        不可打断，在跑的跑完、没开始的补"未执行"占位，由 step 边界收尾。
 
         空闲时（没有 turn）什么都不置：标志残留在 session 上会把下一个 turn 掐死。
         """
         sid = event.session_id
-        intent = str(event.payload.get("intent", "stop"))
         task = self._inflight.get(sid)
         active = bool(self._turn_active.get(sid)) or task is not None
         if active:
-            self._pending_interrupt[sid] = {
-                "intent": intent,
-                "text": event.payload.get("text"),
-            }
-            # 流式输出这一段、或工具正在执行中：当场掐掉在飞的 step（真打断）。
-            # 工具已返回、step 还在收尾（tool_done 落点）那一小段不掐——让 step
-            # 跑完、由 step 边界收尾，工具结果才留得住（否则会随 cancel 一起丢）。
-            if task is not None and not task.done() and (
-                self._phase.get(sid) == "stream" or self._running_tool.get(sid)
-            ):
+            self._pending_interrupt[sid] = {"text": event.payload.get("text")}
+            # 只掐流式输出这一段：没收到完整的 LLM 返回就当没收到。
+            # 工具段不掐——打断等着在 step 边界生效。
+            if task is not None and not task.done() and self._phase.get(sid) == "stream":
                 task.cancel()
-        self.log.append(event, note="interrupt received")
 
     async def stop(self) -> None:
         """显式收尾：取消在飞的 step 和所有 worker，并等它们退出。"""
@@ -200,8 +188,9 @@ class Agent:
     ) -> dict[str, Any]:
         """消费一轮流式输出：文本边到边发 agent_delta，边累积，流结束拼完整消息。
 
-        累积结果写进 partial 而不是局部变量——取消会把局部变量一起带走，
-        而"掐完之后要不要保留半成品"（redirect 那一半）得看得到它们。
+        partial 只是累积缓冲（调用方 _run_step 的字典）：step 正常返回时由
+        调用方拼成完整消息；被取消时随 task 一起消失——没收到完整的 LLM
+        返回就当没收到，没有半成品要抢救。
         """
         text_parts: list[str] = partial["text_parts"]
         tool_calls: dict[int, dict[str, str]] = partial["tool_calls"]
@@ -214,8 +203,6 @@ class Agent:
                 raise _StepAborted()
             if chunk["type"] == "reasoning_delta":
                 # 思考内容：边到边发 UI，但不进 history 也不进 log。
-                # 只记一笔"吐过思考"——redirect 收尾时要靠它决定补不补空壳。
-                partial["thinking_seen"] = True
                 await self.bus.emit(
                     Event("agent_thinking", sid, {"text": chunk["text"]})
                 )
@@ -263,13 +250,12 @@ class Agent:
         append，保证 history 里出现的是"完整 assistant 消息 + 紧随的 tool
         结果"这种合法序列。
 
-        Stage 3 的工具默认不可中断：中断落在工具执行这一段时，正在跑的照
-        跑完，**后面没开始的补"未执行"占位、不起新的**，等这一步返回后在
-        step 边界由 turn 协程收尾（见 _run_steps）。
+        Stage 3 的工具不可打断：中断落在工具执行这一段时，正在跑的照跑完，
+        **后面没开始的补"未执行"占位、不起新的**，等这一步返回后在 step 边界
+        由 turn 协程收尾（见 _run_steps）。
         """
         partial["text_parts"] = []
         partial["tool_calls"] = {}
-        partial["thinking_seen"] = False
         self._phase[sid] = "stream"
         msg = await self._step(sid, history, partial)
         # assistant 消息一成形就先发总线、先进 log——必须在工具执行之前：
@@ -290,13 +276,7 @@ class Agent:
             elif name not in TOOLS:
                 result = f"未知工具：{name}"
             else:
-                # 标记"工具正在执行"：让 on_interrupt 能当场掐死在跑的工具
-                # （Stage 3 默认工具可中断——真实副作用工具应自行保证可重入/可回滚）。
-                self._running_tool[sid] = True
-                try:
-                    result = await TOOLS[name](json.loads(call["function"]["arguments"]))
-                finally:
-                    self._running_tool[sid] = False
+                result = await TOOLS[name](json.loads(call["function"]["arguments"]))
             # 工具结果一落地就进 log 和总线（不等到 turn 收尾）：真执行过的
             # 可能已经改动外部世界，即便这一步随后被取消，发生过的事实也该
             # 在轨迹里；UI 也得立刻看见"未执行"的占位。
@@ -339,26 +319,22 @@ class Agent:
             # 标志只活在当前 turn 里：留在 session 上会杀错下一个 turn。
             self._turn_active[sid] = False
             self._phase.pop(sid, None)
-            self._running_tool.pop(sid, None)
             self._pending_interrupt.pop(sid, None)
 
     async def _settle_aborted(
-        self, sid: str, history: list[dict[str, Any]], partial: dict[str, Any]
+        self, sid: str, history: list[dict[str, Any]]
     ) -> bool:
-        """在飞 step 被取消/中止后的统一收尾：记 step_cancelled，再决定 turn 走向。
+        """在飞 step 被取消/中止后的统一收尾：发 step_cancelled（总线事件，UI 用），
+        再决定 turn 走向。
 
-        返回 True 表示同一个 turn 还要继续（redirect）。stop 与 _StepAborted 两条
+        返回 True 表示同一个 turn 还要继续（附了新消息）。纯停止与 _StepAborted 两条
         路都走这里——区别只在前者由 task.cancel() 触发、后者由流里主动 raise 触发，
         目的都是"在飞这一步别再发任何东西"。"""
         self._inflight[sid] = None
-        pending = self._pending_interrupt.pop(sid, None) or {
-            "intent": "stop",
-            "text": None,
-        }
-        event = Event("step_cancelled", sid, {"intent": pending["intent"]})
-        self.log.append(event, note="interrupt")
+        pending = self._pending_interrupt.pop(sid, None) or {"text": None}
+        event = Event("step_cancelled", sid, {})
         await self.bus.emit(event)
-        return await self._close_after_cancel(sid, history, pending, partial)
+        return await self._close_after_cancel(sid, history, pending)
 
     async def _run_steps(self, sid: str, history: list[dict[str, Any]]) -> None:
         """turn 主循环：step 边界查中断、跑一步、结算。"""
@@ -366,8 +342,8 @@ class Agent:
             # step 边界：中断若落在这里（没有在飞的 step），turn 层面照样收。
             pending = self._pending_interrupt.pop(sid, None)
             if pending is not None:
-                if pending.get("intent") == "redirect" and pending.get("text"):
-                    # 边界转向：没有残破消息可修，就是一条普通 user 消息
+                if pending.get("text"):
+                    # 边界上带着新消息：没有残破消息可修，就是一条普通 user 消息
                     # （语义上等于 stage 2 的 steering），turn 继续。
                     self._append_synth(
                         sid,
@@ -375,10 +351,10 @@ class Agent:
                         {"role": "user", "content": str(pending["text"])},
                         "redirect",
                     )
-                    await self._mark_boundary(sid, "redirect")
+                    await self._mark_boundary(sid)
                     continue
                 self._close_stop(sid, history)
-                await self._mark_boundary(sid, "stop")
+                await self._mark_boundary(sid)
                 await self._end_turn(sid, "interrupted")
                 return
             await self._drain_steering(sid, history)
@@ -390,7 +366,7 @@ class Agent:
             except _StepAborted:
                 # 流里主动中止（pending_interrupt 已置位，不等 cancel 时序）：
                 # 与下面 task.cancel() 那条路收尾完全一致。
-                if await self._settle_aborted(sid, history, partial):
+                if await self._settle_aborted(sid, history):
                     continue
                 return
             except asyncio.CancelledError:
@@ -398,8 +374,8 @@ class Agent:
                 # 我们收尾），或者 turn 协程自己被 stop() 掐掉（继续往外抛）。
                 if not step_task.cancelled():
                     raise
-                if await self._settle_aborted(sid, history, partial):
-                    continue          # redirect：同一个 turn 里带着纠正重发
+                if await self._settle_aborted(sid, history):
+                    continue          # 附了新消息：同一个 turn 里接着处理
                 return
             finally:
                 if self._inflight.get(sid) is step_task:
@@ -416,29 +392,29 @@ class Agent:
         sid: str,
         history: list[dict[str, Any]],
         pending: dict[str, Any],
-        partial: dict[str, Any],
     ) -> bool:
-        """流式输出被掐之后的收尾。返回 True 表示同一个 turn 还要继续（redirect）。
+        """流式输出被掐之后的收尾。返回 True 表示同一个 turn 还要继续（附了新消息）。
 
-        形状按"取消那一刻已经观测到什么"定，不推断模型意图。
+        没收到完整的 LLM 返回就当没收到：在飞 step 的产物一律丢，收尾只补
+        合成的占位与新消息，不推断模型意图。
         """
         text = pending.get("text")
-        if pending.get("intent") == "redirect" and text:
+        if text:
             # ①②③ 一个处理：没收到完整的 LLM 返回，就当没收到——在飞 step 的产物
             # 一律丢（可见文本、半截 tool_call 都不进 history）。半截 tool_call 的
             # arguments 断在半路、不是合法消息，也没执行过，补不了占位。
-            # 唯一留痕：只吐过 thinking 时补个空壳 assistant，声明这里被打断过。
-            if partial.get("thinking_seen"):
-                self._append_synth(
-                    sid,
-                    history,
-                    {"role": "assistant", "content": INTERRUPTED_SHELL},
-                    "interrupted",
-                )
+            # 收口补一条 assistant 打断占位（和纯停止同一条规则）；新消息保持
+            # 纯用户文本，不带任何标注。
             self._append_synth(
                 sid,
                 history,
-                {"role": "user", "content": f"{REDIRECT_NOTE}\n\n{text}"},
+                {"role": "assistant", "content": INTERRUPTED},
+                "interrupted",
+            )
+            self._append_synth(
+                sid,
+                history,
+                {"role": "user", "content": str(text)},
                 "redirect",
             )
             return True
@@ -451,10 +427,9 @@ class Agent:
     def _close_stop(self, sid: str, history: list[dict[str, Any]]) -> None:
         """stop 的收口形状，**只在这一处决定**——边界命中和掐在飞两条路共用。
 
-        按**尾部角色**选封口：尾部是 `tool`（工具结果没人接）就补 assistant
-        封口占位；否则补那条 user 中断标记（尾部是没被回答的 user，不补的话
-        下一轮模型会把它翻出来重答）。场景 4/5 尾部必然是 `tool`，所以都补
-        assistant 封口——这跟"tool 完不完整"无关，是 turn 结束要收口。
+        一律补 **assistant** 打断占位，文本按尾部角色选：尾部是 `tool`（工具结果
+        没人接）用"不再作答"文本；尾部是 `user`（没被回答的问题）用被打断声明——
+        不补的话下一轮模型会把它翻出来重答。
         """
         if history and history[-1].get("role") == "tool":
             self._append_synth(
@@ -462,15 +437,13 @@ class Agent:
             )
         else:
             self._append_synth(
-                sid, history, {"role": "user", "content": STOP_MARKER}, "marker"
+                sid, history, {"role": "assistant", "content": INTERRUPTED}, "marker"
             )
 
-    async def _mark_boundary(self, sid: str, intent: str) -> None:
-        """边界命中：step 没被取消，但 turn 在这里被收掉 / 转向。"""
-        payload = {"intent": intent}
-        event = Event("turn_interrupted", sid, payload)
-        self.log.append(event, note="boundary")
-        await self.bus.emit(event)
+    async def _mark_boundary(self, sid: str) -> None:
+        """边界命中：step 没被取消，但 turn 在这里被收掉 / 继续处理新消息
+        （总线事件，UI 用）。"""
+        await self.bus.emit(Event("turn_interrupted", sid, {}))
 
     def _append_synth(
         self,
@@ -512,11 +485,9 @@ class Agent:
         self.log.append(event, note=note)
 
     async def _end_turn(self, sid: str, reason: str) -> None:
-        """turn 收尾：log 记一笔，同时把 turn_end 发上总线（UI 等着它）。
+        """turn 收尾：把 turn_end 发上总线——UI 等着它，demo 靠它判定结束。
 
-        reason 同时进 log 的 note 和 payload——回放时不用再靠"有没有
-        step_cancelled"反推这次 turn 是怎么结束的。
+        reason 进 payload；turn 结束不进会话账，账本里只有消息。
         """
         event = Event("turn_end", sid, {"reason": reason})
-        self.log.append(event, note=reason)
         await self.bus.emit(event)
