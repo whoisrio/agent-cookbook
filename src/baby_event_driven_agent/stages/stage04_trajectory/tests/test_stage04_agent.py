@@ -20,18 +20,20 @@ from typing import Any
 import pytest
 
 from baby_event_driven_agent.stages.stage04_trajectory.agent import (
+    APPROVAL_REJECTED,
     BLOCKED_PREFIX,
     INTERRUPTED,
     STOP_CLOSER,
     Agent,
 )
+from baby_event_driven_agent.stages.stage04_trajectory import tools as tools_mod
 from baby_event_driven_agent.stages.stage04_trajectory.transport.bus import EventBus
 from baby_event_driven_agent.stages.stage04_trajectory.transport.events import (
     OBSERVE,
     Event,
     Subscription,
 )
-from baby_event_driven_agent.stages.stage04_trajectory.llm import TOOLS
+from baby_event_driven_agent.stages.stage04_trajectory.tools import TOOLS, Tool
 from baby_event_driven_agent.stages.stage04_trajectory.transport.persistence import EventLog
 from baby_event_driven_agent.stages.stage04_trajectory.session.store import SessionStore
 from baby_event_driven_agent.stages.stage04_trajectory.transport.subscribers import permission_guard
@@ -101,7 +103,9 @@ def inventory_spy() -> list[dict[str, Any]]:
         calls.append(args)
         return f"已更新：{args.get('category')}：库存 {args.get('stock')} 件"
 
-    TOOLS["update_inventory"] = spy
+    TOOLS["update_inventory"] = Tool(
+        schema=original.schema, fn=spy, approval_check=original.approval_check
+    )
     yield calls
     TOOLS["update_inventory"] = original
 
@@ -316,6 +320,68 @@ def test_interrupt_with_message_keeps_turn_alive(workdir: Path, inventory_spy: l
     assert new_user == ["不对，改成 45 件，规格也要改"], new_user
 
 
+def test_restock_over_limit_asks_human_and_deny_blocks_write(workdir: Path) -> None:
+    """判量审批：补 52 件超上限 → 声明触发 approval_required → 人拒 → 工具不执行。
+
+    "要不要问人"归工具自己的声明（approval_check），不归总线订阅者：
+    Harness 里没有挂任何审批订阅者，马克杯照样被问到。
+    """
+    saved = tools_mod._INVENTORY
+    copy = workdir / "inventory.txt"
+    copy.write_text(saved.read_text(encoding="utf-8"), encoding="utf-8")
+    tools_mod._INVENTORY = copy
+    try:
+        call_mark = [
+            {
+                "type": "tool_call_delta",
+                "index": 0,
+                "id": "call_1",
+                "name": "update_inventory",
+                "args_delta": '{"category": "马克杯", "stock": 60}',
+            }
+        ]
+        h = Harness(workdir, [call_mark, FINAL_TEXT])
+        required: list[Event] = []
+
+        async def on_required(event: Event) -> None:
+            required.append(event)
+            h.publish(
+                Event(
+                    "user_approval",
+                    h.sid,
+                    {
+                        "request_id": event.payload["request_id"],
+                        "approve": False,
+                        "reason": "数量过大，本次不补",
+                    },
+                )
+            )
+
+        h.bus.subscribe(Subscription("t.req", ("approval_required",), on_required))
+
+        async def go() -> None:
+            h.send("把马克杯库存改成 60 件")
+            await h.wait_turn()
+
+        run(go())
+        assert len(required) == 1  # 恰好一次：声明判量触发，小补货不问
+        tool_contents = [
+            str(e.payload["message"].get("content"))
+            for e in h.traj.entries()
+            if e.type == "message" and e.payload["message"].get("role") == "tool"
+        ]
+        assert tool_contents and tool_contents[0].startswith(APPROVAL_REJECTED)
+        decided = [
+            e
+            for e in h.events
+            if e.type == "approval_decided" and e.payload.get("action") == "deny"
+        ]
+        assert decided, "拒绝也要有回执（一问必有一答）"
+        # 写操作没执行：副本里马克杯仍是 8 件
+        assert "马克杯：库存 8 件" in copy.read_text(encoding="utf-8")
+    finally:
+        tools_mod._INVENTORY = saved
+
 def test_governance_deny_placeholder_in_trajectory(
     workdir: Path, inventory_spy: list[dict[str, Any]]
 ) -> None:
@@ -424,3 +490,61 @@ def test_attach_records_prompt_change(workdir: Path) -> None:
 
     agent.attach(traj)  # 幂等：记录已一致，不再追加
     assert len([e for e in traj.entries() if e.type == "prompt_change"]) == 1
+
+
+def test_long_task_offline_end_to_end(workdir: Path) -> None:
+    """长程任务（八幕的无轨迹版）离线端到端：终值、审批恰好一次、上下文单调。
+
+    五轮 19 步跑完整张任务单：领单 → 先干起来 → 纠偏先查规则 → 规则路线
+    （马克杯报备被拒）→ 换单（雨伞按实物调）→ 收尾（帆布包不动、围巾挂起）。
+    """
+    from baby_event_driven_agent.stages.stage04_trajectory.main import (
+        LONG_TASK_SCRIPT,
+        LONG_TASK_TURNS,
+    )
+
+    saved = {a: getattr(tools_mod, a) for a in ("_INVENTORY", "_RULES", "_TASKS")}
+    try:
+        for a, p in saved.items():
+            copy = workdir / p.name
+            copy.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+            setattr(tools_mod, a, copy)
+        h = Harness(workdir, LONG_TASK_SCRIPT)
+
+        async def on_required(event: Event) -> None:
+            h.publish(
+                Event(
+                    "user_approval",
+                    h.sid,
+                    {
+                        "request_id": event.payload["request_id"],
+                        "approve": False,
+                        "reason": "数量过大，本次不补",
+                    },
+                )
+            )
+
+        h.bus.subscribe(Subscription("lt.req", ("approval_required",), on_required))
+
+        async def go() -> list[int]:
+            for text in LONG_TASK_TURNS:
+                h.send(text)
+                await h.wait_turn()
+            return [len(ctx) for ctx in h.agent.llm.contexts]
+
+        counts = run(go())
+        assert h.agent.llm.calls == len(LONG_TASK_SCRIPT)  # 19 步全部跑完
+        decided = [e for e in h.events if e.type == "approval_decided"]
+        assert [e.payload.get("action") for e in decided] == ["deny"]  # 审批恰好一次且被拒
+        assert all(b >= a for a, b in zip(counts, counts[1:]))  # 上下文单调只增不减
+        inv = (workdir / "inventory.txt").read_text(encoding="utf-8")
+        assert "保温杯：库存 50 件" in inv  # 幕 2 落下的副作用
+        assert "玻璃杯：库存 20 件" in inv
+        assert "马克杯：库存 8 件" in inv  # 报备被拒，未动
+        assert "保温壶：库存 20 件" in inv
+        assert "雨伞：库存 13 件" in inv  # 盘点按实物调
+        assert "帆布包：库存 30 件" in inv  # 无差异，未动
+        assert "围巾：库存 8 件" in inv  # 挂起，未动
+    finally:
+        for a, p in saved.items():
+            setattr(tools_mod, a, p)

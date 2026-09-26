@@ -42,7 +42,7 @@ from .transport.events import (
     Event,
     UserMessage,
 )
-from .llm import TOOLS, build_system_prompt
+from .tools import TOOLS, Tool, build_system_prompt
 from .session.store import SessionStore
 from .session.trajectory import (
     BRANCH_SUMMARY,
@@ -241,12 +241,15 @@ class Agent:
         store: SessionStore,
         approval_timeout: float = 30.0,
         system_prompt: str | None = None,
+        tools: dict[str, Tool] | None = None,
     ) -> None:
         self.bus = bus
         self.llm = llm
         self.agent_id = agent_id
         self.store = store
         self.system_prompt = system_prompt or SYSTEM_PROMPT
+        # 工具表：name → Tool（schema + 实现 + 判量审批声明），测试可注入替身
+        self.tools = tools if tools is not None else TOOLS
         self.trajectories: dict[str, Trajectory] = {}
         self.inboxes: dict[str, asyncio.Queue[Event]] = {}
         self._steering: dict[str, list[Event]] = {}
@@ -579,11 +582,14 @@ class Agent:
     ) -> tuple[str, bool, bool]:
         """跑一次工具调用，返回 `(结果文本, 是否被拦, 是否未执行)`。
 
-        治理共三道，顺序就是"先能判的、再要等的"：
-        1. `before_tool_call` 过一遍拦截器：否认（DENY）→ 不执行；改写（MODIFY）→
-           按改过的参数执行；说"要问人"（ASK）→ 进第 2 步。
-        2. 要问人：发 `approval_required`，等答复。等不到（超时）按拒绝处理；
+        执行前的两道关卡都在工具执行路径上，顺序就是"先能判的、再要等的"：
+
+        1. **治理**（before_tool_call 拦截器，当场）：DENY → 不执行；MODIFY →
+           按改过的参数执行。
+        2. **审批**（工具声明 `Tool.approval_check` 判量，要等人）：声明返回
+           理由就发 `approval_required`，等答复。等不到（超时）按拒绝处理；
            等的时候被中断（答复是 `None`）→ 这个调用算没执行。
+           "要不要问人"归工具自己，不归总线订阅者。
         3. 放行：参数的最终形态 = 规则改写（在 `gate.event.payload` 上）
            → 人的改写（在答复的 patch 上）→ 执行。
         """
@@ -594,14 +600,27 @@ class Agent:
             sid,
             {"name": name, "call_id": call["id"], "arguments": args_text},
         )
+        if not gate.allowed:
+            reason = "; ".join(d.reason for d in gate.decisions if d.action == DENY)
+            return f"{BLOCKED_PREFIX}：{reason or '被规则拒绝'}", True, False
+        # 放行：以 emit 返回的事件为准（规则可能改写过参数）
+        args_text = str(gate.event.payload.get("arguments", args_text))
+        tool = self.tools.get(name)
+        if tool is None:
+            return f"未知工具：{name}", False, False
 
-        approved_by_human = False
-        verdict: Decision | None = None
-        if gate.needs_approval:
-            reason = "; ".join(d.reason for d in gate.decisions if d.action == ASK)
-            verdict = await self._request_approval(
-                sid, name, call["id"], str(gate.event.payload.get("arguments", args_text)), reason
+        # 审批：工具声明判量（本地理由优先），拦截器的 ASK（若有）兼容并存
+        declared = ""
+        if tool.approval_check is not None:
+            try:
+                declared = tool.approval_check(json.loads(args_text)) or ""
+            except (TypeError, ValueError):
+                declared = "参数无法解析，需人工确认"
+        if gate.needs_approval or declared:
+            reason = declared or "; ".join(
+                d.reason for d in gate.decisions if d.action == ASK
             )
+            verdict = await self._request_approval(sid, name, call["id"], args_text, reason)
             if verdict is None:
                 return APPROVAL_ABANDONED, False, True  # 等待期间被中断：没批也没拒
             if verdict.action == DENY:
@@ -611,18 +630,10 @@ class Agent:
                     else APPROVAL_REJECTED
                 )
                 return f"{prefix}：{verdict.reason or '未通过确认'}", True, False
-            approved_by_human = True
-        elif not gate.allowed:
-            reason = "; ".join(d.reason for d in gate.decisions if d.action == DENY)
-            return f"{BLOCKED_PREFIX}：{reason or '被规则拒绝'}", True, False
-
-        # 放行：以 emit 返回的事件为准（规则可能改写过参数），人的改写最后覆盖
-        args_text = str(gate.event.payload.get("arguments", args_text))
-        if approved_by_human and verdict is not None and verdict.patch:
-            args_text = str(verdict.patch.get("arguments", args_text))
-        if name not in TOOLS:
-            return f"未知工具：{name}", False, False
-        return await TOOLS[name](json.loads(args_text)), False, False
+            # 人的改写最后覆盖规则的改写
+            if verdict.patch:
+                args_text = str(verdict.patch.get("arguments", args_text))
+        return await tool.fn(json.loads(args_text)), False, False
 
     async def _request_approval(
         self, sid: str, name: str, call_id: str, arguments: str, reason: str

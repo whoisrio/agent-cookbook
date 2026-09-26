@@ -1,9 +1,10 @@
-"""Stage 5a 演示：会话与真相——log、投影与异常恢复。
+"""能力升级 + 会话与真相演示（03c / 04 配套）。
 
 需要仓库根 .env 里的 OPENAI_API_KEY / OPENAI_API_BASE / OPENAI_MODEL
-（环境变量可覆盖）。现在直接跑真模型（RealLLM，配置读仓库根 .env），需要 API key。
+（环境变量可覆盖）。离线段用 ScriptedLLM（可断言、可反复跑），
+真模型段打真模型（RealLLM，配置读仓库根 .env），需要 API key。
 
-九段（各自独立，跑哪个都行）：
+十二段（各自独立，跑哪个都行）：
 
 1. **轨迹长什么样**（离线）：脚本化 LLM 跑一轮，把 entry 树打印出来——
    header 不是节点、认父不认子、一条 assistant 是一个节点、toolCallId 配对。
@@ -18,12 +19,17 @@
    各自独立 resume。
 6. **真跑一轮**：真模型 + 真工具，两层事实（EventLog / 轨迹）各自记账。
 7. **UI 缓冲**（离线）：200 个 token 增量进 CoalescingBuffer——满格 / 帧界才
-   刷屏，一条不丢（照搬 stage04 的“UI 消息缓冲”机制）。
-8. **工具审批**（离线）：工具被标记要问人，执行前发 approval_required，
-   人批准才执行（照搬 stage04 的“评审消息处理”）。
+   刷屏，一条不丢（照搬 stage03b 的“UI 消息缓冲”机制）。
+8. **工具审批**（离线）：工具声明判量超限才要人，执行前发 approval_required，
+   人批准才执行（照搬 stage03b 的“评审消息处理”，声明升级为判量）。
 9. **输入意图**（离线）：turn 在飞时的新消息默认插话（steering），等不了就
-   redirect 打断转向（stage04 的 followup/steering/redirect 意图，收敛到
+   redirect 打断转向（stage03b 的 followup/steering/redirect 意图，收敛到
    agent 的 step 边界）。
+10. **工具层直调**（离线）：任务域两个工具、判量审批边界、数据隔离——
+   能力升级的交付物，不打模型。
+11. **长程任务**（离线）：五轮 19 步跑完整张任务单（补货核查 + 盘点差异），
+   审批判量在真实流程里触发；上下文只增不减——04 要接手的现场。
+12. **真模型长任务**：缩减版任务端到端，真工具、真审批。
 
 行首标签沿用前几章：
 
@@ -48,12 +54,12 @@ from pathlib import Path
 from typing import Any
 
 from .agent import Agent
+from . import tools as tools_mod
 from .transport.bus import EventBus
 from .agent import build_context
 from .transport.events import Event, Subscription, OBSERVE, STEERING, UserMessage
 from .llm import RealLLM
 from .transport.outbound import StreamConsumer
-from .transport.subscribers import approval_policy
 from .transport.persistence import EventLog
 from .session.store import SessionStore, session_facts, sweep_hanging_approvals
 from .session.trajectory import (
@@ -78,6 +84,17 @@ RESET = "\033[0m"
 
 TIMEOUT = 20.0
 
+CALL_QUERY = [
+    {
+        "type": "tool_call_delta",
+        "index": 0,
+        "id": "call_1",
+        "name": "query_inventory",
+        "args_delta": '{"category": "保温杯"}',
+    }
+]
+FINAL_TEXT = [{"type": "text_delta", "text": "保温杯库存 3 件，316L 不锈钢内胆。"}]
+
 CASE_ORDER = (
     "01-trajectory-shape",
     "02-projection",
@@ -88,6 +105,9 @@ CASE_ORDER = (
     "07-ui-buffer",
     "08-approval",
     "09-steering",
+    "10-tools",
+    "11-long-task",
+    "12-live-task",
 )
 CASE_TITLES = {
     "01-trajectory-shape": "第 1 段：轨迹长什么样（离线）",
@@ -99,8 +119,11 @@ CASE_TITLES = {
     "07-ui-buffer": "第 7 段：UI 消息缓冲——满格 / 帧界才刷屏（离线）",
     "08-approval": "第 8 段：工具审批——要等人的那一半（离线）",
     "09-steering": "第 9 段：输入意图——插话与打断（离线）",
+    "10-tools": "第 10 段：工具层直调——任务域与判量审批（离线）",
+    "11-long-task": "第 11 段：长程任务——补货核查与盘点差异（离线）",
+    "12-live-task": "第 12 段：真模型跑缩减版长任务",
 }
-ALL_TITLE = "九段全跑（离线 1-5 / 7-9 + 真模型 6）"
+ALL_TITLE = "十二段全跑（离线 1-5 / 7-11 + 真模型 6 / 12）"
 CASE_IDS = ("all", *CASE_ORDER)
 
 
@@ -124,44 +147,79 @@ def brief(text: str, limit: int = 110) -> str:
 
 # ---------------------------------------------------------------- 脚手架
 
-CALL_QUERY = [
-    {
-        "type": "tool_call_delta",
-        "index": 0,
-        "id": "call_1",
-        "name": "query_inventory",
-        "args_delta": '{"category": "保温杯"}',
-    }
-]
-FINAL_TEXT = [{"type": "text_delta", "text": "保温杯库存 42 件，316L 不锈钢内胆。"}]
+class ScriptedLLM:
+    """离线脚本化 LLM：按调用次序吐脚本块——离线段可断言、可反复跑。"""
+
+    def __init__(self, script: list[list[dict[str, Any]]]) -> None:
+        self.script = script
+        self.calls = 0
+        self.contexts: list[list[dict[str, Any]]] = []
+
+    async def stream_chat(self, messages: list[dict[str, Any]]):  # type: ignore[no-untyped-def]
+        self.contexts.append([dict(m) for m in messages])
+        idx = min(self.calls, len(self.script) - 1)
+        self.calls += 1
+        for chunk in self.script[idx]:
+            yield chunk
 
 
-# 已删除 ScriptedLLM：本 stage 的 Harness 现在直接跑真模型（RealLLM，见下方导入）。
+def use_data_copies(workdir: Path) -> dict[str, Path]:
+    """把包自带 data/ 拷进工作目录并换掉工具的数据源（写操作落副本）。
+
+    返回原路径快照，用完 restore_data(saved) 还原——demo / 测试共用这一对。
+    """
+    attrs = ("_INVENTORY", "_RULES", "_TASKS")
+    saved = {a: getattr(tools_mod, a) for a in attrs}
+    for a in attrs:
+        src: Path = saved[a]
+        dst = workdir / src.name
+        dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        setattr(tools_mod, a, dst)
+    return saved
+
+
+def restore_data(saved: dict[str, Path]) -> None:
+    for attr, path in saved.items():
+        setattr(tools_mod, attr, path)
 
 
 class Harness:
-    """真模型台子：bus + EventLog + store + agent（RealLLM），外加一个 turn_end 信号。
+    """demo 台子：bus + EventLog + store + agent，外加一个 turn_end 信号。
 
-    script 参数保留以兼容现有用例调用，但已不再驱动模型行为。
+    传 script 就是离线段（ScriptedLLM 驱动，确定性，不打模型）；
+    live=True 打真模型（RealLLM）。
     """
 
-    def __init__(self, workdir: Path, script: list[list[dict[str, Any]]]) -> None:
+    def __init__(
+        self,
+        workdir: Path,
+        script: list[list[dict[str, Any]]] | None = None,
+        *,
+        live: bool = False,
+    ) -> None:
         self.log = EventLog(str(workdir / "events"))
         self.bus = EventBus(self.log)
         self.store = SessionStore(workdir / "sessions")
         self.system_prompt = "你是一个通过工具干活的通用 agent。"
-        self.agent = Agent(self.bus, RealLLM(), store=self.store, system_prompt=self.system_prompt)
+        llm = RealLLM() if live else ScriptedLLM(script or [])
+        self.llm = llm
+        self.agent = Agent(self.bus, llm, store=self.store, system_prompt=self.system_prompt)
         self.traj = self.store.start(
             cwd=str(workdir), model="fake-model", system_prompt=self.system_prompt
         )
         self.agent.attach(self.traj)
         self.sid = self.traj.sid
         self.ended = asyncio.Event()
+        self.events: list[Event] = []
 
         async def on_end(event: Event) -> None:
             self.ended.set()
 
+        async def on_any(event: Event) -> None:
+            self.events.append(event)
+
         self.bus.subscribe(Subscription("rec-end", ("turn_end",), on_end, mode=OBSERVE))
+        self.bus.subscribe(Subscription("rec-any", ("*",), on_any, mode=OBSERVE))
 
     def send(self, text: str) -> None:
         self.bus.publish(Event("user_input", self.sid, {"text": text}), to=self.agent.agent_id)
@@ -220,11 +278,10 @@ async def case_trajectory_shape(workdir: Path) -> None:
     )
     h = Harness(workdir, [CALL_QUERY, FINAL_TEXT])
     line("用户", YELLOW, "保温杯还有库存吗")
-    t0 = time.perf_counter()
     h.send("保温杯还有库存吗")
     await h.wait_turn()
     await h.stop()
-    note(f"一轮跑完 {time.perf_counter() - t0:.2f}s（真模型）")
+    note(f"脚本驱动，瞬时跑完（离线，可反复跑）")
 
     line("系统", ORANGE, f"轨迹文件：{h.store.path_of(h.sid).name}")
     show_trajectory(h.traj)
@@ -555,23 +612,17 @@ async def case_ui_buffer(workdir: Path) -> None:
 
 
 async def case_approval(workdir: Path) -> None:
-    """工具审批：被标记要问人 → approval_required → 人批准 → 工具执行。"""
+    """工具审批：声明判量超限 → approval_required → 人批准 → 工具执行。"""
     banner(
         "08-approval",
         "工具审批：要等人的那一半",
-        "update_inventory 被 approval_policy 标记要问人。agent 发 approval_required"
-        "（带 request_id），答复由人给——这里用订阅者模拟人点了一下批准。答复走"
-        "旁路直接 resolve，工具拿到授权才执行。一问必有一答。",
+        "update_inventory 的声明判量发现大额补货（补 97 件，超 50 件上限）要问人。"
+        "agent 发 approval_required（带 request_id），答复由人给——这里用应答通道"
+        "模拟人点了一下批准。答复走旁路直接 resolve，工具拿到授权才执行。"
+        "一问必有一答；小补货则直接放行，不用问。",
     )
-    _KB = Path(__file__).resolve().parents[2] / "knowledge-base"
-    from . import llm as llm_mod
-
-    demo_inventory = workdir / "inventory-demo.txt"
-    demo_inventory.write_text(
-        (_KB / "inventory.txt").read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    original_path = llm_mod._INVENTORY
-    llm_mod._INVENTORY = demo_inventory
+    saved = use_data_copies(workdir)
+    demo_inventory = workdir / "inventory.txt"
 
     call_update = [
         {
@@ -579,7 +630,7 @@ async def case_approval(workdir: Path) -> None:
             "index": 0,
             "id": "call_1",
             "name": "update_inventory",
-            "args_delta": '{"category": "保温杯", "stock": 45}',
+            "args_delta": '{"category": "保温杯", "stock": 100}',
         }
     ]
     h = Harness(workdir / "approval", [call_update, FINAL_TEXT])
@@ -613,12 +664,11 @@ async def case_approval(workdir: Path) -> None:
         p = event.payload
         line("系统", ORANGE, f"确认结果：{p['action']} by {p['by']}")
 
-    h.bus.subscribe(approval_policy("update_inventory"))
     h.bus.subscribe(Subscription("d.required", ("approval_required",), on_required))
     h.bus.subscribe(Subscription("d.decided", ("approval_decided",), on_decided))
     try:
-        line("用户", YELLOW, "把保温杯库存改成 45 件")
-        h.send("把保温杯库存改成 45 件")
+        line("用户", YELLOW, "把保温杯库存改成 100 件（小补货放行，这次是大额，要问人）")
+        h.send("把保温杯库存改成 100 件")
         try:
             await asyncio.wait_for(arrived.wait(), TIMEOUT)
         except asyncio.TimeoutError:
@@ -638,10 +688,12 @@ async def case_approval(workdir: Path) -> None:
         )
         note(
             "等不到答复时按拒绝处理（fail-closed）：不会是“没人管就放行”。"
+            "问人的判量声明在工具自己身上（tools.py 的 approval_check），"
+            "总线与订阅者不参与审批；小补货直接放行，问人只留给大额。"
             "残尾恢复时悬挂的审批也会被 resume 闭合（见第 4 段）。"
         )
     finally:
-        llm_mod._INVENTORY = original_path
+        restore_data(saved)
         await h.stop()
 
 
@@ -691,6 +743,273 @@ async def case_steering(workdir: Path) -> None:
     await h.stop()
 
 
+# ---------------------------------------------------------------- 第 10 段：工具层直调
+
+
+async def case_tools(workdir: Path) -> None:
+    """工具层直调（不打模型）：任务域、判量审批边界、数据隔离、设值语义。"""
+    banner(
+        "10-tools",
+        "工具层直调：任务域与判量审批（离线）",
+        "能力升级的交付物直接看：任务域两个工具的返回形状；判量审批的边界"
+        "（补 50 放行、补 51 问人、负差放行）；写操作设值语义，重放不叠加；"
+        "数据隔离——写落在工作目录副本，包自带 data/ 与共享 knowledge-base "
+        "一个字节不动。",
+    )
+    attrs = ("_INVENTORY", "_RULES", "_TASKS")
+    saved = {a: getattr(tools_mod, a) for a in attrs}
+    kb_dir = saved["_INVENTORY"].parents[2] / "knowledge-base"
+    kb_before = {p.name: p.read_bytes() for p in kb_dir.glob("*.txt")}
+    data_before = {a: p.read_bytes() for a, p in saved.items()}
+    try:
+        use_data_copies(workdir)
+
+        line("实测", GREEN, f"list_tasks →\n{await tools_mod.list_tasks({})}")
+        line("实测", GREEN, f"get_task(T-101) →\n{await tools_mod.get_task({'task_id': 'T-101'})}")
+        line(
+            "实测",
+            GREEN,
+            f"get_task(T-404) → {brief(await tools_mod.get_task({'task_id': 'T-404'}))}",
+        )
+
+        over = tools_mod._restock_approval({"category": "马克杯", "stock": 60})
+        edge = tools_mod._restock_approval({"category": "保温杯", "stock": 53})
+        under = tools_mod._restock_approval({"category": "保温杯", "stock": 50})
+        shrink = tools_mod._restock_approval({"category": "雨伞", "stock": 13})
+        line("实测", GREEN, f"判量：马克杯 3→60（补 52 件）→ {over}")
+        line("实测", GREEN, f"判量：保温杯 3→53（补 50 件，贴线）→ {edge or '放行'}")
+        line("实测", GREEN, f"判量：保温杯 3→50（补 47 件）→ {under or '放行'}")
+        line("实测", GREEN, f"判量：雨伞 15→13（负差，盘点调整）→ {shrink or '放行'}")
+
+        await tools_mod.update_inventory({"category": "保温杯", "stock": 50})
+        await tools_mod.update_inventory({"category": "保温杯", "stock": 50})
+        again = await tools_mod.query_inventory({"category": "保温杯"})
+        line("实测", GREEN, f"设值语义重放：补到 50 两次，仍是一行 → {brief(again)}")
+
+        kb_after = {p.name: p.read_bytes() for p in kb_dir.glob("*.txt")}
+        data_after = {a: p.read_bytes() for a, p in saved.items()}
+        line(
+            "实测",
+            GREEN,
+            f"数据隔离：包 data/ 未变：{data_after == data_before}；"
+            f"共享 knowledge-base 未变：{kb_after == kb_before}",
+        )
+        note(
+            "判量的线和 rules.txt 里的补货规则是同一条：业务规则告诉模型"
+            "“超 50 要报备”，工具声明告诉 harness“超 50 要问人”。"
+            "任务单是只读输入：没有状态字段，“做到哪了”住在会话里——"
+            "这正是 04 压缩要保的东西。"
+        )
+    finally:
+        restore_data(saved)
+
+
+# ---------------------------------------------------------------- 第 11 段：长程任务
+
+
+def _tool_step(cid: str, name: str, args: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "tool_call_delta",
+            "index": 0,
+            "id": cid,
+            "name": name,
+            "args_delta": json.dumps(args, ensure_ascii=False),
+        }
+    ]
+
+
+def _text_step(text: str) -> list[dict[str, Any]]:
+    return [{"type": "text_delta", "text": text}]
+
+
+# 长程任务脚本（五轮 19 步，离线确定性）：T1 领任务+先干起来 → T2 纠偏先查规则
+# → T3 规则路线（马克杯报备被拒）→ T4 换单（雨伞按实物调）→ T5 收尾（帆布包
+# 不动、围巾挂起）。幕 3 / 6 / 8 的轨迹解法（branch / compact / resume）归 04。
+LONG_TASK_SCRIPT = [
+    _tool_step("c01", "list_tasks", {}),
+    _tool_step("c02", "get_task", {"task_id": "T-101"}),
+    _tool_step("c03", "query_inventory", {"category": "保温杯"}),
+    _tool_step("c04", "update_inventory", {"category": "保温杯", "stock": 50}),
+    _tool_step("c05", "search_rules", {"query": "补货"}),
+    _tool_step("c06", "query_inventory", {"category": "玻璃杯"}),
+    _tool_step("c07", "update_inventory", {"category": "玻璃杯", "stock": 20}),
+    _tool_step("c08", "query_inventory", {"category": "马克杯"}),
+    _tool_step("c09", "update_inventory", {"category": "马克杯", "stock": 60}),
+    _tool_step("c10", "query_inventory", {"category": "保温壶"}),
+    _tool_step("c11", "update_inventory", {"category": "保温壶", "stock": 20}),
+    _text_step(
+        "补货核查处理完：保温杯、玻璃杯、保温壶已按目标补足；"
+        "马克杯需补 52 件超过 50 件上限，报备未获批准，未补。"
+    ),
+    _tool_step("c12", "get_task", {"task_id": "T-102"}),
+    _tool_step("c13", "query_inventory", {"category": "雨伞"}),
+    _tool_step("c14", "update_inventory", {"category": "雨伞", "stock": 13}),
+    _text_step("雨伞系统 15 件、实物 13 件，差 2 件在 3 件以内，已按实物调整库存。"),
+    _tool_step("c15", "query_inventory", {"category": "帆布包"}),
+    _tool_step("c16", "query_inventory", {"category": "围巾"}),
+    _text_step(
+        "帆布包账实相符，不用动；围巾系统 8 件、实物 2 件，差 6 件超过 3 件，"
+        "按规则挂起等人工复盘。今天的任务处理完毕。"
+    ),
+]
+
+LONG_TASK_TURNS = [
+    "今天仓库的补货核查和盘点差异，你处理一下。",
+    "等等——先查补货规则，按规矩来。",
+    "继续",
+    "继续，处理盘点差异那张单。",
+    "把剩下的处理完。",
+]
+
+
+async def case_long_task(workdir: Path) -> None:
+    """长程任务端到端（离线）：工具链叠出长会话、审批判量触发、上下文只增不减。"""
+    banner(
+        "11-long-task",
+        "长程任务：补货核查与盘点差异（离线）",
+        "五轮 19 步跑完整张任务单（ScriptedLLM，确定性）。看三样：工具链怎么"
+        "一轮轮叠出长会话；审批判量在真实流程里怎么触发（马克杯报备被拒）；"
+        "以及无轨迹时代的痛——上下文只增不减。",
+    )
+    saved = use_data_copies(workdir)
+    try:
+        h = Harness(workdir, LONG_TASK_SCRIPT)
+        approvals: list[Event] = []
+
+        async def on_required(event: Event) -> None:
+            approvals.append(event)
+            p = event.payload
+            line(
+                "系统",
+                ORANGE,
+                f"？ {p['name']} 要执行：{brief(p['arguments'])}"
+                f"（request_id={p['request_id']}，超时 {p['timeout']:g}s）",
+            )
+            await asyncio.sleep(0.05)  # 店长看了一眼
+            line("用户", YELLOW, "→ 拒绝（数量过大，本次不补）")
+            h.bus.publish(
+                Event(
+                    "user_approval",
+                    h.sid,
+                    {
+                        "request_id": p["request_id"],
+                        "approve": False,
+                        "reason": "数量过大，本次不补",
+                    },
+                ),
+                to=h.agent.agent_id,
+            )
+
+        h.bus.subscribe(Subscription("d.required", ("approval_required",), on_required))
+        for text in LONG_TASK_TURNS:
+            line("用户", YELLOW, text)
+            h.send(text)
+            await h.wait_turn()
+
+        counts = [len(ctx) for ctx in h.llm.contexts]
+        monotonic = all(b >= a for a, b in zip(counts, counts[1:]))
+        line(
+            "实测",
+            GREEN,
+            f"{len(LONG_TASK_TURNS)} 轮 {h.llm.calls} 步跑完；每步的上下文消息数 "
+            f"{counts[0]}→{counts[-1]}，单调只增不减：{monotonic}",
+        )
+        decided = [e for e in h.events if e.type == "approval_decided"]
+        line(
+            "实测",
+            GREEN,
+            f"审批恰好一次：approval_required ×{len(approvals)}，decided ×{len(decided)}"
+            f"（action={decided[0].payload.get('action') if decided else '-'}）",
+        )
+        line("系统", ORANGE, "任务单跑完后的库存副本：")
+        for ln in tools_mod._INVENTORY.read_text(encoding="utf-8").splitlines():
+            line("  ", GREY, ln)
+        await h.stop()
+        note(
+            "这就是 04 要接手的现场：纠偏只能往前追加，试错的几轮永远留在上下文里；"
+            "消息数只增不减压不下；进程一换全丢。同一张任务单的另一种命运，"
+            "轨迹解法见 04 的增量段。"
+        )
+    finally:
+        restore_data(saved)
+
+
+# ---------------------------------------------------------------- 第 12 段：真模型长任务
+
+
+async def case_live_task(workdir: Path) -> None:
+    """真模型跑缩减版长任务：T-101 整单，审批由应答通道扮演店长拒绝。"""
+    banner(
+        "12-live-task",
+        "真模型跑缩减版长任务",
+        "真模型 + 真工具，只跑补货核查那张单（T-101）。马克杯的报备由应答通道"
+        "扮演店长拒绝。不断言行为序——模型自己决定先查什么后查什么，"
+        "只看任务真的能跑完、审批真的进账。",
+    )
+    try:
+        llm = RealLLM()
+    except RuntimeError as exc:
+        line("系统", ORANGE, f"跳过真模型段：{exc}")
+        return
+
+    saved = use_data_copies(workdir)
+    try:
+        h = Harness(workdir, live=True)
+
+        async def on_required(event: Event) -> None:
+            p = event.payload
+            line(
+                "系统",
+                ORANGE,
+                f"？ {p['name']} 要执行：{brief(p['arguments'])}"
+                f"（request_id={p['request_id']}，超时 {p['timeout']:g}s）",
+            )
+            line("用户", YELLOW, "→ 拒绝（数量过大，本次不补）")
+            h.bus.publish(
+                Event(
+                    "user_approval",
+                    h.sid,
+                    {
+                        "request_id": p["request_id"],
+                        "approve": False,
+                        "reason": "数量过大，本次不补",
+                    },
+                ),
+                to=h.agent.agent_id,
+            )
+
+        async def ui_tool(event: Event) -> None:
+            line("工具", GREEN, f"← {event.payload['name']} 结果：{brief(event.payload['result'])}")
+
+        h.bus.subscribe(Subscription("d.required", ("approval_required",), on_required))
+        h.bus.subscribe(Subscription("d.tool", ("tool_result",), ui_tool, mode=OBSERVE))
+
+        async def on_decided(event: Event) -> None:
+            p = event.payload
+            line("系统", ORANGE, f"确认结果：{p['action']} by {p['by']}")
+
+        h.bus.subscribe(Subscription("d.decided", ("approval_decided",), on_decided))
+        line("用户", YELLOW, "处理一下补货核查任务单（T-101）")
+        h.send("处理一下补货核查任务单（T-101）")
+        for _ in range(4):  # 每轮最多 4 步，续几句“继续”让单子跑完
+            await asyncio.wait_for(h.ended.wait(), 180.0)
+            h.ended.clear()
+            await h.bus.drain(timeout=30.0)
+            line("用户", YELLOW, "继续")
+            h.send("继续")
+        await h.stop()
+        line("系统", ORANGE, "库存副本终态：")
+        for ln in tools_mod._INVENTORY.read_text(encoding="utf-8").splitlines():
+            line("  ", GREY, ln)
+        note(
+            "真模型的任务单实测：能不能按单逐项、报备被拒不重试，"
+            "取决于模型本身；轨迹与审批的账目是断言的基准，行为序不是。"
+        )
+    finally:
+        restore_data(saved)
+
+
 CASES = {
     "01-trajectory-shape": case_trajectory_shape,
     "02-projection": case_projection,
@@ -701,6 +1020,9 @@ CASES = {
     "07-ui-buffer": case_ui_buffer,
     "08-approval": case_approval,
     "09-steering": case_steering,
+    "10-tools": case_tools,
+    "11-long-task": case_long_task,
+    "12-live-task": case_live_task,
 }
 
 
@@ -714,7 +1036,7 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
         print(f"{GREY}没有匹配的 case：{case_ids}；可选：{', '.join(CASE_IDS)}{RESET}")
         return
 
-    print(f"{BOLD}Stage 5a：会话与真相 —— log、投影与异常恢复{RESET}")
+    print(f"{BOLD}能力升级 + 会话与真相 —— 03c / 04 配套演示{RESET}")
     if case_ids and "all" not in case_ids:
         print(f"{GREY}  （只跑：{', '.join(picked)}）{RESET}")
 
@@ -738,7 +1060,7 @@ def cli() -> None:
         stage04-demo --list               # 列 case 及其说明（不加载模型配置）
     """
     parser = argparse.ArgumentParser(
-        prog="stage04-demo", description="Stage 5a 演示：会话与真相——log、投影与异常恢复。"
+        prog="stage04-demo", description="能力升级 + 会话与真相演示（03c / 04 配套）。"
     )
     parser.add_argument("cases", nargs="*", metavar="CASE", help="要跑的 case（默认全部）")
     parser.add_argument("--list", action="store_true", help="列出所有 case 后退出")
