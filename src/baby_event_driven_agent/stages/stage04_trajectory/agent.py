@@ -43,6 +43,7 @@ from .transport.events import (
     UserMessage,
 )
 from .tools import TOOLS, Tool, build_system_prompt
+from .session.compaction import LiveSummarizer, Summarizer, maybe_compact
 from .session.store import SessionStore
 from .session.trajectory import (
     BRANCH_SUMMARY,
@@ -242,6 +243,8 @@ class Agent:
         approval_timeout: float = 30.0,
         system_prompt: str | None = None,
         tools: dict[str, Tool] | None = None,
+        summarizer: Summarizer | None = None,
+        keep_turns: int = 2,
     ) -> None:
         self.bus = bus
         self.llm = llm
@@ -250,6 +253,10 @@ class Agent:
         self.system_prompt = system_prompt or SYSTEM_PROMPT
         # 工具表：name → Tool（schema + 实现 + 判量审批声明），测试可注入替身
         self.tools = tools if tools is not None else TOOLS
+        # 手动压缩：摘要器（默认裸 chat 封顶档）+ 保留窗（最近 N 轮）
+        self._summarizer = summarizer
+        self.keep_turns = keep_turns
+        self._pending_compact: dict[str, str] = {}
         self.trajectories: dict[str, Trajectory] = {}
         self.inboxes: dict[str, asyncio.Queue[Event]] = {}
         self._steering: dict[str, list[Event]] = {}
@@ -308,6 +315,84 @@ class Agent:
         """当前上下文（投影）：demo / 测试观测用，agent 自己在 step 前现算。"""
         return self.build_context(self._traj(sid)).messages
 
+    # -------------------------------------------------- 手动压缩：第四种边界动作
+
+    def _summarizer_for(self) -> Summarizer:
+        """摘要器：外部注入优先（测试用 ScriptedSummarizer），默认裸 chat 封顶档。"""
+        return self._summarizer if self._summarizer is not None else LiveSummarizer(self.llm)
+
+    @staticmethod
+    def _prefix_view(traj: Trajectory, keep_from_id: str) -> list[dict[str, Any]]:
+        """被压段的视图消息：刀口之前的 entries，按 build_context 同一份分派规则
+        （message 1:1、branch_summary 变 <summary>、状态节点不产生消息、元数据跳过）。
+
+        前缀里没有 compaction（maybe_compact 拒绝第二刀），不走压缩分支。
+        不做 sanitize：摘要会渲染成文本喂给摘要模型，不进 chat 消息序列，
+        孤儿工具结果也读得懂。
+        """
+        entries = traj.path()
+        ki = next((i for i, e in enumerate(entries) if e.id == keep_from_id), None)
+        if ki is None:
+            return []
+        raw: list[dict[str, Any]] = []
+        for e in entries[:ki]:
+            if e.type == MESSAGE:
+                msg = dict(e.payload.get("message", {}))
+                if msg.get("role") == "system":
+                    continue  # system 是参数不是事实
+                if e.payload.get("synthetic") or e.payload.get("note"):
+                    msg["synthetic"] = bool(e.payload.get("synthetic"))
+                    msg["note"] = str(e.payload.get("note", ""))
+                raw.append(msg)
+            elif e.type == BRANCH_SUMMARY:
+                raw.append(
+                    {"role": "user", "content": f"<summary>{e.payload.get('summary', '')}</summary>"}
+                )
+        return raw
+
+    async def _compact(self, sid: str, traj: Trajectory, *, reason: str = "manual") -> None:
+        """手动压缩：step 边界处换一副更短的视图，下一次 build_context 自动生效。
+
+        只作用于视图，不改事实层：追加一个 compaction entry（摘要 + 刀口），
+        原文全在轨迹里。摘要调用失败 fail-open：留痕、不 append、不挡 turn，
+        下一个边界可重试。已有压缩时拒绝第二刀（折叠语义归 05）。
+        EventLog 记的是"什么时候、因为什么、压了多少"，与轨迹的 entry 各答各的。
+        """
+        before = len(self.build_context(traj).messages)
+        try:
+            entry = await maybe_compact(
+                traj,
+                self._summarizer_for(),
+                keep_turns=self.keep_turns,
+                reason=reason,
+                prefix_view=self._prefix_view,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail-open：压缩救不了自己时不挡 turn
+            await self._emit(
+                "context_compact_failed", sid, {"reason": reason, "error": str(exc)}
+            )
+            return
+        if entry is None:
+            await self._emit(
+                "context_compact_failed",
+                sid,
+                {"reason": reason, "error": "无可压缩段（轮数不足）或已有压缩（折叠归 05）"},
+            )
+            return
+        after = len(self.build_context(traj).messages)
+        await self._emit(
+            "context_compacted",
+            sid,
+            {
+                "entry_id": entry.id,
+                "keep_from_id": entry.payload.get("keep_from_id"),
+                "reason": reason,
+                "messages_before": before,
+                "messages_after": after,
+                "summary": str(entry.payload.get("summary", "")),
+            },
+        )
+
     # -------------------------------------------------- outbound：只有一条路
 
     async def _emit(self, type: str, sid: str, payload: dict[str, Any]) -> Any:
@@ -335,6 +420,9 @@ class Agent:
             return
         if event.type == "user_approval":
             self.on_approval(event)
+            return
+        if event.type == "compact_request":
+            self.on_compact(event)
             return
         if event.type == "user_input":
             sid = event.session_id
@@ -380,6 +468,18 @@ class Agent:
                 task.cancel()
 
     # -------------------------------------------------- 人工确认：答复怎么进来
+
+    def on_compact(self, event: Event) -> None:
+        """手动压缩命令：控制信号，不进收件箱（**同步**，无 await）。
+
+        只置标记，真正的压缩在下一个 step 边界做——流中间不换上下文，
+        在飞请求的视图不漂移（与 steering 等边界、与 interrupt 同一条纪律）。
+        agent 空闲时到的命令，下一个 turn 的第一个边界生效。
+        落空（未知 session）不留痕：什么都没发生，就没有事实可记。
+        """
+        sid = event.session_id
+        if sid in self.trajectories:
+            self._pending_compact[sid] = str(event.payload.get("reason", "manual"))
 
     def on_approval(self, event: Event) -> None:
         """人工确认的答复（**同步**，无 await）：不进收件箱，直接交给正在等它的 future。
@@ -707,9 +807,10 @@ class Agent:
             self._turn_active[sid] = False
             self._phase.pop(sid, None)
             self._pending_interrupt.pop(sid, None)
+            self._pending_compact.pop(sid, None)
 
     async def _run_steps(self, sid: str, traj: Trajectory) -> None:
-        """turn 主循环：step 边界查中断、跑一步、结算。"""
+        """turn 主循环：step 边界查中断、查压缩、跑一步、结算。"""
         for _ in range(MAX_STEPS):
             pending = self._pending_interrupt.pop(sid, None)
             if pending is not None:
@@ -728,6 +829,11 @@ class Agent:
                 await self._mark_boundary(sid)
                 await self._end_turn(sid, "interrupted")
                 return
+            compact_reason = self._pending_compact.pop(sid, None)
+            if compact_reason is not None:
+                # 第四种边界动作：换一副更短的视图，再发下一次调用。
+                # 不消耗 step 预算；摘要失败 fail-open，不挡 turn。
+                await self._compact(sid, traj, reason=compact_reason)
             await self._drain_steering(sid, traj)
             partial: dict[str, Any] = {}
             step_task = asyncio.create_task(self._run_step(sid, traj, partial))

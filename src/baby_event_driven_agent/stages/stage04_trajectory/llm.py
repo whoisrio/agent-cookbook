@@ -54,14 +54,24 @@ class RealLLM:
         )
 
     async def stream_chat(
-        self, messages: list[dict[str, Any]]
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = TOOL_SCHEMAS,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        stream = await self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            tools=TOOL_SCHEMAS,
-            stream=True,
-        )
+        """流式对话。默认带全部工具；摘要调用传 tools=None（裸 chat）+
+        max_tokens 封顶——摘要写太长，压了等于没压。"""
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        stream = await self._client.chat.completions.create(**kwargs)
         async for chunk in stream:
             if not chunk.choices:
                 continue

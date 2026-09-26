@@ -30,6 +30,9 @@
 11. **长程任务**（离线）：五轮 19 步跑完整张任务单（补货核查 + 盘点差异），
    审批判量在真实流程里触发；上下文只增不减——04 要接手的现场。
 12. **真模型长任务**：缩减版任务端到端，真工具、真审批。
+13. **长任务的轨迹解法**（离线）：同一张任务单换轨迹跑法——纠偏 =
+   rewind + 遗言；上下文长 = compact_request 在 step 边界换视图；
+   崩一刀 = resume 恢复出压缩视图、悬挂调用补占位。
 
 行首标签沿用前几章：
 
@@ -53,7 +56,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .agent import Agent
+from .agent import Agent, UNKNOWN_TOOL_RESULT, build_context
 from . import tools as tools_mod
 from .transport.bus import EventBus
 from .agent import build_context
@@ -61,8 +64,10 @@ from .transport.events import Event, Subscription, OBSERVE, STEERING, UserMessag
 from .llm import RealLLM
 from .transport.outbound import StreamConsumer
 from .transport.persistence import EventLog
+from .session.compaction import ScriptedSummarizer
 from .session.store import SessionStore, session_facts, sweep_hanging_approvals
 from .session.trajectory import (
+    COMPACTION,
     LABEL,
     MESSAGE,
     MODEL_CHANGE,
@@ -108,6 +113,7 @@ CASE_ORDER = (
     "10-tools",
     "11-long-task",
     "12-live-task",
+    "13-long-task-trajectory",
 )
 CASE_TITLES = {
     "01-trajectory-shape": "第 1 段：轨迹长什么样（离线）",
@@ -122,8 +128,9 @@ CASE_TITLES = {
     "10-tools": "第 10 段：工具层直调——任务域与判量审批（离线）",
     "11-long-task": "第 11 段：长程任务——补货核查与盘点差异（离线）",
     "12-live-task": "第 12 段：真模型跑缩减版长任务",
+    "13-long-task-trajectory": "第 13 段：长任务的轨迹解法——rewind、压缩、恢复（离线）",
 }
-ALL_TITLE = "十二段全跑（离线 1-5 / 7-11 + 真模型 6 / 12）"
+ALL_TITLE = "十三段全跑（离线 1-5 / 7-11 / 13 + 真模型 6 / 12）"
 CASE_IDS = ("all", *CASE_ORDER)
 
 
@@ -381,7 +388,7 @@ async def case_rewind(workdir: Path) -> None:
     line("实测", GREEN, f"回退后追加 = 分支：{at} 现在有两个孩子 {dup[at]}（grep parentId 的程序版）")
 
     summary = traj.branch_with_summary(
-        user1.id, "试过查保温杯库存（42 件），结论：库存充足，无需补货。"
+        user1.id, "试过查保温杯库存（3 件），结论：库存偏紧，建议按目标补货。"
     )
     line("实测", GREEN, f"branch_with_summary：摘要节点 {summary.id} 挂在 {user1.id} 下（{summary.payload['note']}）")
     line("系统", ORANGE, "现在的投影（新分支的 agent 看到的）：")
@@ -1010,6 +1017,288 @@ async def case_live_task(workdir: Path) -> None:
         restore_data(saved)
 
 
+# ---------------------------------------------------------------- 第 13 段：长任务的轨迹解法
+
+
+# 同一张任务单（第 11 段的命运），换轨迹跑法。幕与轨迹特性：
+# 幕 1-2 领任务、先干起来（保温杯 50 落库 = 副作用）；幕 3 纠偏 = rewind + 遗言；
+# 幕 4-5 规则路线 + 盘点差异（雨伞调 13）；幕 6 compact_request 边界压缩；
+# 幕 7 摘要刻意遗漏雨伞 → 模型重查一次（压缩的代价）；幕 8 崩一刀 → resume。
+LONG_TASK_TRAJ_SCRIPT = [
+    _tool_step("c01", "list_tasks", {}),
+    _tool_step("c02", "get_task", {"task_id": "T-101"}),
+    _tool_step("c03", "query_inventory", {"category": "保温杯"}),
+    _tool_step("c04", "update_inventory", {"category": "保温杯", "stock": 50}),
+    _tool_step("c05", "search_rules", {"query": "补货"}),
+    _tool_step("c06", "get_task", {"task_id": "T-101"}),
+    _tool_step("c07", "query_inventory", {"category": "保温杯"}),
+    _tool_step("c08", "query_inventory", {"category": "玻璃杯"}),
+    _tool_step("c09", "update_inventory", {"category": "玻璃杯", "stock": 20}),
+    _tool_step("c10", "query_inventory", {"category": "马克杯"}),
+    _tool_step("c11", "update_inventory", {"category": "马克杯", "stock": 60}),
+    _tool_step("c12", "query_inventory", {"category": "保温壶"}),
+    _tool_step("c13", "update_inventory", {"category": "保温壶", "stock": 20}),
+    _tool_step("c14", "get_task", {"task_id": "T-102"}),
+    _tool_step("c15", "query_inventory", {"category": "雨伞"}),
+    _tool_step("c16", "update_inventory", {"category": "雨伞", "stock": 13}),
+    _text_step(
+        "T-101 处理完：保温杯确认已补到 50 无需重做，玻璃杯补到 20，"
+        "马克杯报备被拒未补，保温壶补到 20。"
+    ),
+    _tool_step("c18", "get_task", {"task_id": "T-102"}),
+    _tool_step("c19", "query_inventory", {"category": "雨伞"}),
+    _tool_step("c20", "query_inventory", {"category": "帆布包"}),
+    _tool_step("c21", "query_inventory", {"category": "围巾"}),
+]
+
+# resume 后的新 agent 接着跑：重查围巾（悬挂修复后模型自己决定重调）→ 收尾汇报
+LONG_TASK_TRAJ_AFTER = [
+    _tool_step("c22", "query_inventory", {"category": "围巾"}),
+    _text_step(
+        "T-102 核对完：雨伞已是实物数 13，无需调整；帆布包 30 与实物一致，不动；"
+        "围巾系统 8 件、实物 2 件，差 6 件超过 3 件，按规则挂起等人工复盘。"
+        "两张单处理完毕。"
+    ),
+]
+
+# 手动压缩的摘要剧本：摘要该保住的四样（工具结论 / 规则 / 副作用 / 待办）。
+# 刻意遗漏：雨伞的“已处理”不提，保留窗里也没有——模型对不上账，重查一次。
+# 幕 3 遗言里的保温杯副作用账本被吞进来——摘要吞摘要第一次自然发生。
+COMPACT_SUMMARY = (
+    "【已完成】T-101 补货核查处理完：保温杯此前已直接补到 50（副作用，已确认无需重做）；"
+    "玻璃杯补到 20；马克杯需补 52 件超上限、报备被店长拒绝、未补；保温壶补到 20。"
+    "【关键规则】补货：单品超 50 件需先报备店长审批；"
+    "盘点差异：差 3 件以内按实物调整，超过挂起等人工复盘。"
+    "【副作用】上述库存写操作均已落库，勿重复执行。"
+    "【待办】T-102 盘点差异单处理中。"
+)
+
+
+TRAJ_TURNS = [
+    "今天仓库的补货核查和盘点差异，你处理一下。",   # T1
+    "按规矩重来：先查补货规则，再逐项处理两张单。",   # T2（rewind 后新分支）
+    "继续",                                     # T3
+    "继续",                                     # T4
+    "继续",                                     # T5
+    "继续，把盘点差异核对完。",                     # T6（边界先压缩）
+    "继续，汇报核对结果。",                         # T7（resume 后）
+]
+
+
+async def case_long_task_trajectory(workdir: Path) -> None:
+    """长任务的轨迹解法（离线）：rewind + 遗言、边界压缩、resume 恢复压缩视图。"""
+    banner(
+        "13-long-task-trajectory",
+        "长任务的轨迹解法：rewind、压缩、恢复（离线）",
+        "同一张任务单（第 11 段的命运），换轨迹跑法：纠偏 = rewind + 遗言；"
+        "上下文长 = compact_request 在 step 边界换视图；崩一刀 = resume 恢复"
+        "压缩视图、悬挂调用补占位。压缩只追加视图标记，原文一个字节不删。",
+    )
+    saved = use_data_copies(workdir)
+    try:
+        log = EventLog(str(workdir / "events"))
+        bus = EventBus(log)
+        store = SessionStore(workdir / "sessions")
+        summarizer = ScriptedSummarizer([COMPACT_SUMMARY])
+        system_prompt = "你是一个通过工具干活的通用 agent。"
+        traj = store.start(cwd=str(workdir), model="fake-model", system_prompt=system_prompt)
+        agent = Agent(
+            bus,
+            ScriptedLLM(LONG_TASK_TRAJ_SCRIPT),
+            store=store,
+            summarizer=summarizer,
+            system_prompt=system_prompt,
+        )
+        agent.attach(traj)
+        ended = asyncio.Event()
+
+        async def on_end(event: Event) -> None:
+            ended.set()
+
+        async def ui_tool(event: Event) -> None:
+            line("工具", GREEN, f"← {event.payload['name']} 结果：{brief(event.payload['result'])}")
+
+        async def on_required(event: Event) -> None:
+            p = event.payload
+            line(
+                "系统",
+                ORANGE,
+                f"？ {p['name']} 要执行：{brief(p['arguments'])}（request_id={p['request_id']}）",
+            )
+            line("用户", YELLOW, "→ 拒绝（数量过大，本次不补）")
+            bus.publish(
+                Event(
+                    "user_approval",
+                    traj.sid,
+                    {
+                        "request_id": p["request_id"],
+                        "approve": False,
+                        "reason": "数量过大，本次不补",
+                    },
+                ),
+                to=agent.agent_id,
+            )
+
+        bus.subscribe(Subscription("end", ("turn_end",), on_end, mode=OBSERVE))
+        bus.subscribe(Subscription("tool", ("tool_result",), ui_tool, mode=OBSERVE))
+        bus.subscribe(Subscription("req", ("approval_required",), on_required))
+
+        async def send_and_wait(text: str) -> None:
+            line("用户", YELLOW, text)
+            bus.publish(Event("user_input", traj.sid, {"text": text}), to=agent.agent_id)
+            await asyncio.wait_for(ended.wait(), TIMEOUT)
+            ended.clear()
+            await bus.drain(timeout=TIMEOUT)
+
+        # —— 幕 1-2：领任务、先干起来（保温杯 50 落库）——
+        await send_and_wait(TRAJ_TURNS[0])
+
+        # —— 幕 3：纠偏 = rewind + 遗言 ——
+        line("用户", YELLOW, "停——你怎么不看补货规则就动手？回到最开始重来（rewind + 遗言）")
+        user1 = next(
+            e
+            for e in traj.entries()
+            if e.type == MESSAGE and e.payload["message"]["role"] == "user"
+        )
+        path_before = traj.path()
+        abandoned = path_before[path_before.index(user1) + 1 :]
+        node = traj.branch_with_summary(
+            user1.id,
+            "试过直接补货：保温杯已从 3 补到 50（副作用已发生，勿重复处理）；"
+            "未查补货规则，被用户叫停。",
+        )
+        line(
+            "实测",
+            GREEN,
+            f"branch_with_summary：移指针 + 追加遗言节点 {node.id}（挂在 {user1.id} 下）；"
+            f"抛弃 {len(abandoned)} 条 entry（{abandoned[0].id}..{abandoned[-1].id}），"
+            f"原样躺在文件里——副作用（保温杯 50）在遗言里带账",
+        )
+
+        # —— 幕 4-5：规则路线跑到 T-102 雨伞（T4 步）——
+        for text in TRAJ_TURNS[1:5]:
+            await send_and_wait(text)
+
+        # —— 幕 6：compact_request → step 边界压缩 ——
+        line("用户", YELLOW, "上下文有点长了，压一下（compact_request，下一轮边界生效）")
+        p_before = len(build_context(traj).messages)
+        bus.publish(Event("compact_request", traj.sid, {"reason": "manual"}), to=agent.agent_id)
+        await send_and_wait(TRAJ_TURNS[5])
+        p_after = len(build_context(traj).messages)
+        comp = next(e for e in traj.entries() if e.type == COMPACTION)
+        line(
+            "实测",
+            GREEN,
+            f"边界压缩：投影 {p_before} → {p_after} 条消息；"
+            f"compaction entry {comp.id}（keep_from={comp.payload['keep_from_id']}，"
+            f"reason={comp.payload['reason']}）",
+        )
+        line("系统", ORANGE, f"摘要全文：{comp.payload['summary']}")
+        note(
+            "摘要刻意漏了雨伞的“已处理”且不带待办清单——幕 7 里模型对不上账，"
+            "重列任务单、重查雨伞（c19 那次 query 就是）：压缩的代价 = 冗余查询，"
+            "收益 = 前四轮整段窗口。幕 3 遗言里的副作用账本被这一刀吞进来——"
+            "摘要吞摘要第一次自然发生。摘要调用是裸 chat（不带工具、封顶），"
+            "离线段由 ScriptedSummarizer 保确定性。"
+        )
+
+        # —— 幕 8：崩一刀 + resume ——
+        await agent.stop()  # 进程收尾；崩溃本身不留痕——没写完的不算已发生
+        traj.append(
+            MESSAGE,
+            message_payload(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_d1",
+                            "type": "function",
+                            "function": {
+                                "name": "query_inventory",
+                                "arguments": '{"category": "围巾"}',
+                            },
+                        }
+                    ],
+                }
+            ),
+        )
+        line(
+            "系统",
+            ORANGE,
+            "进程在工具执行前被杀：assistant 要了围巾的数据，结果永远没来（悬挂调用留在轨迹里）",
+        )
+        bytes_before = traj.log.raw_bytes()
+        store2 = SessionStore(workdir / "sessions")
+        traj2 = store2.resume(traj.sid, note="crash 恢复演练")
+        agent2 = Agent(
+            bus,
+            ScriptedLLM(LONG_TASK_TRAJ_AFTER),
+            store=store2,
+            agent_id="agent-2",
+            summarizer=summarizer,
+            system_prompt=system_prompt,
+        )
+        agent2.attach(traj2)
+        ended2 = asyncio.Event()
+
+        async def on_end2(event: Event) -> None:
+            ended2.set()
+
+        bus.subscribe(Subscription("end2", ("turn_end",), on_end2, mode=OBSERVE))
+        proj = build_context(traj2)
+        n_unknown = sum(
+            1
+            for m in proj.messages
+            if m.get("role") == "tool" and "UNKNOWN" in str(m.get("content", ""))
+        )
+        line(
+            "实测",
+            GREEN,
+            f"resume 后投影 {len(proj.messages)} 条 = 压缩视图（[system, <摘要>, 保留窗…]），"
+            f"不是全量原文；悬挂调用补了 {n_unknown} 条占位：{brief(UNKNOWN_TOOL_RESULT)}",
+        )
+        line(
+            "实测",
+            GREEN,
+            f"append-only：resume 前字节是 resume 后的前缀：{traj2.log.raw_bytes().startswith(bytes_before)}",
+        )
+        await send_and_wait2(bus, traj2, agent2, ended2, TRAJ_TURNS[6])
+        await agent2.stop()
+        store2.close(traj2, reason="demo 结束")
+
+        line("系统", ORANGE, "库存副本终态：")
+        for ln in tools_mod._INVENTORY.read_text(encoding="utf-8").splitlines():
+            line("  ", GREY, ln)
+        total = len(traj2.entries())
+        on_path = len(traj2.path())
+        line(
+            "统计",
+            GREEN,
+            f"全树 {total} 条 entry（被抛弃分支 {total - on_path} 条 + compaction 原文都在）；"
+            f"当前路径 {on_path} 条；EventLog seq 1..{log.last_seq}",
+        )
+        line("系统", ORANGE, "轨迹树（尾部 10 条，分支与压缩节点都在树上）：")
+        show_trajectory(traj2, tail=10)
+        note(
+            "这就是本章的答案：纠偏不删历史（分支 + 遗言），压缩不删历史"
+            "（视图标记 + 摘要），崩溃不丢历史（resume + 投影收口）。"
+            "自动触发（水位、折叠、毒丸防御）归 05。"
+        )
+    finally:
+        restore_data(saved)
+
+
+async def send_and_wait2(
+    bus: EventBus, traj: Trajectory, agent: Agent, ended: asyncio.Event, text: str
+) -> None:
+    """resume 后新 agent 的发送：走同一台 bus，等新 agent 的 turn_end。"""
+    line("用户", YELLOW, text)
+    bus.publish(Event("user_input", traj.sid, {"text": text}), to=agent.agent_id)
+    await asyncio.wait_for(ended.wait(), TIMEOUT)
+    await bus.drain(timeout=TIMEOUT)
+
+
 CASES = {
     "01-trajectory-shape": case_trajectory_shape,
     "02-projection": case_projection,
@@ -1023,6 +1312,7 @@ CASES = {
     "10-tools": case_tools,
     "11-long-task": case_long_task,
     "12-live-task": case_live_task,
+    "13-long-task-trajectory": case_long_task_trajectory,
 }
 
 
