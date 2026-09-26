@@ -30,4 +30,5 @@ uv.lock
 .idea/
 .vscode/
 node_modules/
+.codebuddy/
 
