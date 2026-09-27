@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "books/event-driven-agent/03-interrupt.md",
+                "file": "books/event-driven-agent/04-trajectory.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "03-interrupt"
+              "title": "04-trajectory"
             }
           }
         ]
@@ -83,7 +83,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 300
+    "width": 277.5069160461426
   },
   "right": {
     "id": "d0b58ebf96ef05ed",
@@ -99,7 +99,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "books/event-driven-agent/03-interrupt.md",
+                "file": "books/event-driven-agent/04-trajectory.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -174,8 +174,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 300,
-    "collapsed": true
+    "width": 300
   },
   "left-ribbon": {
     "hiddenItems": {
@@ -190,6 +189,11 @@
   },
   "active": "1a13772e61ff5f3c",
   "lastOpenFiles": [
+    "books/event-driven-agent/03c-agent-ability-upgrade.md",
+    "books/event-driven-agent/03-interrupt.md",
+    "books/event-driven-agent/03b-message-mechanism.md",
+    "books/event-driven-agent/04-trajectory.md",
+    "books/event-driven-agent/05-compaction.md",
     "books/event-driven-agent/04-message-mechanism.md",
     "books/event-driven-agent/05a-trajectory.md"
   ]

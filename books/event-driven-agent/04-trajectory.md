@@ -1,28 +1,24 @@
 # Stage 5a：会话与真相 —— log、投影与异常恢复
 
 > 配套代码：`src/baby_event_driven_agent/stages/stage04_trajectory/`
->（与 3c 同包：工具层与长程任务场景见 3c，本章落轨迹层与手动压缩），
-> `stage04-demo` 跑演示（十三段：1-5 / 7-11 / 13 离线可反复跑；6 / 12 打真模型），
-> `stage04-test` 跑测试（**57 条：55 离线 + 2 真模型**，2026-09-26 实测）。
-> 本章机制形状参考 pi coding agent 的 session 设计（树、认父不认子、rewind
-> 移指针、投影式上下文），落盘工程沿用 3b 的长度前缀 + CRC，文末有逐项对照。
-> 压缩的语义（entry 类型 + 投影规则）与手动触发（compact_request + Summarizer）
-> 都在本章落地；自动触发策略（水位、滚动折叠）归 05。
-> 包分三层：`transport/`（3b 传输层）、`session/`（trajectory + store +
-> compaction，事实层）、`agent.py`（agent + 投影 + 压缩接线）——和"账分两层记"
-> 是同一个分法。
+
 
 前面几章，一直在处理的是用户的新增消息的输入。
-这一节，我们来给agent增加上从已有session中恢复，继续之前对话(reload)，以及在对话中跳转到指定消息的能力(rewind)；
-要支持如上的能力，必须依赖咱们一开始就在记录的会话轨迹(trajectory)，轨迹作为agent运行阶段的真实记录，还是进行用户记忆整理，agent能力评测等等功能的基础；
-咱们初始设计的轨迹太简单，这次咱们一起来改造他。
+这一节，我们来给agent增加上从已有session中恢复(reload)，以及在对话中跳转到指定消息的能力(rewind)；
+要支持如上的能力，必须依赖咱们一开始就在记录的会话轨迹(trajectory)，轨迹作为agent运行阶段的真实记录，不仅是agent会话管理的数据来源，还是进行用户记忆整理，agent能力评测等等功能的基础；
+不过咱们初始设计的轨迹还比较简单，这次咱们一起来改造他。
 
 ## Trajectory 和 messages 的关系
-在进入改造之前，我们先搞清楚trajectory和messages的关系；
+在进入改造之前，我们先搞清楚轨迹trajectory和与LLM交互的messages的关系；
 trajectory是agent操作过程中的事实记录，每一步用户和模型的动作都被原封不动的记录下来，也就是咱们一直在说的append-only；
 这些操作不光是和LLM相关的交互，也包括agent本身的一些设置，比如切换模型，切换thinking level等等；
-messages是当前会话中发给LLM的消息列表，让LLM理解当前对话的上下文，但是由于LLM上下文窗口是有限的，所以，messages实际上是当前session trajectory的子集，LLM的上下文压缩，或者用户对话进行rewind操作等等，都会导致messages和和trajectory的不一致。
-trajectory是agent 运行期间的唯一事实标准，messages是可以从trajectory还原出来的，所以当下主流的agent都设计了从trajectory到messages的投影转换。
+```bash
+/model
+/thinking
+```
+这些操作记录在trajectory中，并不需要将这些操作作为独立的messages发送给LLM，
+所以，messages是当前session trajectory的子集。
+trajectory是agent 运行期间的唯一事实标准，完整的记录了在agent运行期间影响与LLM交互的所有操作，而messages是可以从trajectory还原出来的直接与LLM交互的消息，当下主流的agent都设计了从trajectory到messages的投影转换。
 
 ### trajectory的重设计
 初始的设计里，我们的trajectory(session log)设计成了list，并且没有记录每行记录之间的关系，这样的设计仅仅只能当做日志记录，没法支撑上述咱们提到的操作。因此，我们首先要给trajectory加上其引用的parent标识，那么每一行trajectory直接的关系如下。(参考pi agent的设计，只在新增轨迹条目的记录其父节点，不做子节点记录，避免改动已有轨迹)
@@ -43,7 +39,7 @@ class Entry:
 ```
 各字段说明：
 
-- **id**：8 位短 UUID（`uuid4().hex[:8]`），会话内唯一，rewind / fork 的寻址坐标。
+- **id**：UUID（`uuid4().hex[:8]`），会话内唯一，rewind / fork 的寻址坐标。
 - **parent_id**：父 entry 的 id，根节点为 `None`。
 - **type**：即如上类型分组，投影函数按它分派。
 - **ts**：trajectory记录的时间戳。
@@ -51,40 +47,31 @@ class Entry:
 
 entry的type可选的类型大致如下，要根据type来决定是否在投影生成 message context使用该entry，
 
-| 组 | 装什么 | 谁消费它 |
-|---|---|---|
-| 进上下文 | message / branch_summary / compaction | 模型（经投影） |
-| 改状态 | model_change / prompt_change | 投影函数（不产生消息，覆盖式提取） |
-| 纯元数据 | session_started / session_resumed / session_end / label / custom | 回放的人和 UI |
+| 组    | 装什么                                                              | 谁消费它              |
+| ---- | ---------------------------------------------------------------- | ----------------- |
+| 进上下文 | message / branch_summary / compaction                            | 模型（经投影）           |
+| 改状态  | model_change / thinking_level                                    | 投影函数（不产生消息，覆盖式提取） |
+| 纯元数据 | session_started / session_resumed / session_end / label / custom | 回放的人和 UI          |
 
 
 ### messages--trajectory的投影
 
 trajectory 定下来之后，来看看如何通过轨迹来生成messages。
-**messages =f(trajectory)**。f函数落在 agent 侧，
-agent 每次 LLM 调用前根据内存中的trajectory现算一遍，不缓存：
-resume 时从文件加载，append 时落盘和更新索引同时做，trajectory终是文件的镜像。
 
-f 内部三步：
-1. **路径遍历**：从 leafId 沿 parentId 走回根，再 reverse 成根→叶顺序。被
-   rewind 抛弃的分支根本不在这条路上，自然进不了上下文。
+1. **路径遍历**：从 leafId 沿 parentId 走回根，再 reverse 成根→叶顺序。
 2. **按 type 分派**：message 转成消息，model_change 更新当前模型，
-   prompt_change 更新当前 system prompt（都是覆盖式提取），元数据跳过，
+   thinking_level 更新模型思考等级，元数据跳过，
    如果message经过压缩，那么就从压缩点记录的位置开始取entry。
 3. **sanitize**：保证发给模型的消息序列合法，处理agent异常退出时可能写入的不完整trajectory。
 
-> 从轨迹加载回上下文，有一个小设计：system prompt 总是取最新的，而不是
-> 直接采用轨迹 header 里记的那份。落地是：初始 prompt 记在 header；之后
-> 每次运行发现 agent 的 prompt 和轨迹记录不一致（比如 resume 时换了模板），
-> attach 就追加一条 `prompt_change` entry（改状态，不进消息序列）；投影
-> 覆盖式提取、路径上最后一次生效，没有变更就回落 header。
+> 从轨迹加载(reload)回上下文，有一个小设计：system prompt 总是取最新的，而不是
+> 直接采用轨迹 header 里记的那份。原始记录的system prompt，用在回放诊断的场景。
 
 
 ### 有压缩的轨迹怎么组织、怎么读
-我们看看如果messages经过压缩，应该如何添加压缩entry以及如何从trajectory中恢复messages；
+如果messages经过压缩，具体是如何添加压缩entry以及如何从trajectory中恢复messages；
 
-现在看添加压缩节点，
-压缩不删任何东西，append-only 之下，它只能是一个**追加的视图标记**：往树上多加一个 `compaction` entry，payload 装两样东西——`summary`（被压掉那段的摘要）和 `keep_from_id`（边界指针：从那条entry起原样保留，之前的由摘要代替）。
+压缩不删任何东西，触发上下文压缩时，轨迹树上会添加一个 `compaction` entry，payload 装两样东西——`summary`（被压掉掉的messages的摘要）和 `keep_from_id`（边界指针：从哪条entry起原样保留，即keep_from_id这条轨迹之前的messages，都被compaction的summary替代）。
 
 在如下轨迹样例中，压缩发生时对话已经走到 e5，compA **追加在那一刻路径的末尾**(压缩e1+e2，保留最近滑窗 e3+e4)
 
@@ -95,31 +82,25 @@ f 内部三步：
 之后继续对话：e1 e2 | e3 e4 e5 compA e6 e7 ...
                                     ↑ 新对话接在 compA 之后
 ```
-两个时刻的信息都在 entry 里：`keep_from_id=e3` 画出"e1 e2 由摘要代替、
-e3 起原样保留"的刀口；节点本身挂在压缩那一刻的 leaf 上。
 
-再说说读取。投影走到 compaction 节点时，按如下规则处理：
-1. **`keep_from_id` 之前跳过、从它起原样保留**。跳过不是删除，e1、e2
-   还在文件里，只是这一刀的视图里不出现。
-2. **摘要插在视图最前**，不是它树上所在的位置。节点追加在压缩那一刻的
-   路径末尾，但它代表的是最前面那段被压掉的历史——树上位置和视图位置
-   相反。最终顺序是 `[system, summary, e3, e4, e5, e6 ...]`：摘要开头，
-   其后全是原文。
+压缩完成后，后续messages从trajectory恢复时，
+1. **`keep_from_id` 之前的messages不再加载到对话中;
+2. **摘要插在system prompt之后**，最终顺序是 `[system, summary, e3, e4, e5, e6 ...]`
 
+>有一些agent会把summary 放到system prompt，咱们先不这样做
 ### rewind 与 fork——切换不修改历史，只创造新的"当前"
-
+下面再看看rewind操作是如何影响trajectory的，
 **rewind**（`branch(to_id)`）的实现是一行赋值：`self.leaf_id = to_id`。
-rewind后，从rewind点拉出session分支，如下所示，从4rewind到3后，新的5的parent是3.
+rewind后，从rewind点拉出session分支，如下所示，从entry4 rewind到entry3后，新的entry5的parent是3，rewind操作后，后续的轨迹内容，就继续在entry5后生长。
 
 ```text
 1 → 2 → 3 → 4          branch(3) 前的原路径
         └→ 5           branch(3) 后追加：3 有两个孩子（4 和 5）
 ```
 
-**rewind 落点与压缩视图**
-rewind 就是移指针，对 compaction 节点没有任何特殊处理，差别全在投影怎么读它。
-拿压缩后的轨迹看两个落点（压缩发生时对话走到 e5，compA 压掉 e1、e2，之后
-又聊了 e6、e7、e8）：
+再看看，如果轨迹上存在压缩节点，需要如何处理。
+
+拿压缩后的轨迹看两个落点，如下轨迹中，压缩发生时对话走到 e5，压缩entry 压掉 e1、e2，之后又新增了 e6、e7、e8 3条messages，
 
 ```text
 e1 e2 | e3 e4 e5 compA(keep_from=e3) e6 e7 e8        leaf = e8
@@ -163,8 +144,9 @@ rewind回到过去时，希望一并把当前session已经做的尝试进行summ
 当前路径（leaf = 6）：1 → 2 → 3 → S → 6
 投影：[system, 1, 2, 3, <summary>4、5 里试过 X，结论是 Y</summary>, 6…]
 ```
-这个summary是rewind操作的一种可选项，比如pi agent通过`tree`切换对话分支时，就提供了这样的能力
+这个summary是rewind操作的一种可选项，比如pi agent通过`tree`切换对话分支时，就提供了这样的能力。
 
+下面看看fork，
 **fork**（`SessionStore.fork`）把当前路径克隆进一份新会话文件（id 与
 parentId 原样保留，补一条 `session_resumed` 说明 forked_from）。新文件是
 完整合法的轨迹，可以独立继续生长；旧文件原封不动。
@@ -184,42 +166,11 @@ session_resumed {forked_from: A}        ← 生命周期标记，也是新的 le
 
 id 原样保留（不重新编号）——per-session 文件隔离，两份文件里的同名 id互不冲突。和原始路径的关系记在 `session_resumed` 的 `forked_from` 里（审计留痕，不是引用）；之后两条轨迹各自生长，一边 rewind /压缩 / 追加都影响不到另一边。
 
-### 手动压缩：把口子插上电（compact_request + Summarizer）
-
-压缩的语义钉死了，谁来按按钮？本章给手动档：一条 `compact_request` 控制事件
-（旁路，与 user_interrupt / user_approval 同一待遇，不进收件箱），agent 在
-**step 边界**处理它——与 steering（等边界拼消息）、interrupt（揸在飞）、
-redirect（揸 + 补消息）并列的第四种边界动作：换一副更短的视图，再发下一次调用。
-流中间不换上下文，在飞请求的视图不漂移：
-
-```python
-compact_reason = self._pending_compact.pop(sid, None)
-if compact_reason is not None:
-    # 不消耗 step 预算；摘要失败 fail-open，不挡 turn
-    await self._compact(sid, traj, reason=compact_reason)
-```
-
-`_compact` 做三件事：算刀口（保留最近 N 轮，刀口 = 倒数第 N 轮的第一条真实
-user entry，天然落在 turn 边界，tool 配对完整）→ 摘要（Summarizer 协议两档：
-ScriptedSummarizer 离线确定性 / LiveSummarizer 裸 chat 不带工具、max_tokens
-封顶）→ 追加 `compaction` entry（summary + keep_from_id + reason）。
-投影一字未改：下一次 build_context 自动就是新视图。
-
-两个纪律值得点名：
-
-- **摘要的输入是刀口前的投影视图**，不是原始 entry——branch_summary 的
-  <summary> 也在里面，"摘要吞摘要"在手动档就第一次发生。滚动折叠（多刀
-  互吞、投影认最后一刀）归 05，在那之前 maybe_compact 拒绝第二刀。
-- **摘要编错一句会污染之后所有轮次**。所以摘要调用是裸 chat、按四段输出
-  （已完成 / 关键事实与规则 / 副作用 / 待办）、只压缩不推理；原文可靠 rewind
-  和轨迹回查。摘要的代价也真实可感：刻意遗漏一条"已处理"，模型对不上账
-  就会重查一次——一次冗余查询换整段窗口（demo 第 13 段实测）。
-
 ### 异常恢复——三级收口
-下面，再来看看从trajectory恢复session时的异常保护；
-假如agent在运行时出现了异常导致进程挂掉，trajectory可能就会不完整，按残迹分三种。resume（store 的第二个入口：从盘上读回轨迹重建树，然后追加一条 `session_resumed`，标记"第二次运行从这里开始"）逐个处理：
+再来看看从trajectory恢复session时的异常保护；
+假如agent在运行时出现了异常导致进程挂掉，trajectory可能就会不完整，
 
-**1. 格式不完整**——死在一条记录中间，长度/CRC 对不上：
+**1. 单条轨迹的格式不完整**——死在一条记录中间
 
 ```text
 崩溃时：    e1 e2 e3 [半条记录，CRC 对不上]        ← 残尾，不是事实
@@ -227,7 +178,7 @@ resume 后： e1 e2 e3 session_resumed{torn_tail: true}
             ↑ 残尾字节裁掉（没写完的不算事实），痕迹记在 resumed 里
 ```
 
-**2. 工具调用悬挂**——死在 assistant 落盘后、工具结果落盘前：
+**2. messages不满足匹配条件**——死在 assistant 落盘后、工具结果落盘前：
 
 ```text
 崩溃时：    ... user → assistant(tool_calls c1)          ← 结果永远没来
@@ -237,8 +188,7 @@ resume 后： ... user → assistant(tool_calls c1)
             ↑ 修复只发生在投影，模型知道缺了什么、能自己重调
 ```
 
-**3. 审批悬挂**——死在 `approval_required` 落盘后、decided 前。审批住在
-EventLog 那本账上（3b 的审批流），Trajectory 不涉及：
+也可能是需要权限审批的工具调用时，没有及时拿到审批信息，agent就意外终止，导致轨迹记录的messages格式不匹配，
 
 ```text
 崩溃时（EventLog）：   ... approval_required{request_id: ap-x}    ← 没有配对的 decided
@@ -246,20 +196,21 @@ resume 后（EventLog）：... approval_required
                        → approval_decided{action: abandoned}      ← bus.record 补，幂等
 ```
 
+处理的方式，都是在从trajectory resume消息时，主动的将不完整的轨迹补充完整，并且添加上主动补充的说明。
 ## 代码改动：session 层新增，agent 侧只动三处
 
-`session/`（trajectory + store）是本章新增的，`agent.py` 是唯一被改的老文件。
-先看新增层的两个类，再看 agent 动的那三刀。
+下面看看本章代码的主要改动，
 
 ### Trajectory：一棵常驻内存的 entry 树
 
-事实层本体就两个类。`TrajectoryLog` 管单会话文件：第一行是 session header
-（type=session，带 sid / cwd / system_prompt 原文——header 不是树节点），
-其后 entry 逐行追加，框架和 3b 的 EventLog 相同：长度前缀 + CRC，崩在
-写一半时读到坏记录为止，残尾字节裁掉再续写：
+`TrajectoryLog` 管单会话文件，`Trajectory`则是文件的内存镜像，`Entry`则是具体的轨迹条目。
 
+
+`TrajectoryLog` 管单会话文件：第一行是 session header
+（type=session，带 sid / cwd / system_prompt 原文），其后 entry 逐行追加。
 ```python
-line = b"%08x %08x " % (len(data), zlib.crc32(data)) + data + b"\n"   # 长度 + CRC + json
+class TrajectoryLog:
+	
 ```
 
 `Trajectory` 是文件的内存镜像，状态有三个：`header`、全树索引 `_by_id`、
