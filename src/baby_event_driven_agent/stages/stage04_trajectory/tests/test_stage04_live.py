@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from baby_event_driven_agent.stages.stage04_trajectory import tools as tools_mod
 from baby_event_driven_agent.stages.stage04_trajectory.agent import (
     INTERRUPTED,
     STOP_CLOSER,
@@ -43,6 +44,21 @@ def workdir() -> Path:
     d = Path(tempfile.mkdtemp(prefix="stage04_live_"))
     yield d
     shutil.rmtree(d, ignore_errors=True)
+
+
+@pytest.fixture()
+def data_copies(workdir: Path) -> None:
+    """数据源换到工作目录副本：真模型可能调写工具，不许碰包自带 data/。"""
+    attrs = ("_INVENTORY", "_RULES", "_TASKS")
+    saved = {a: getattr(tools_mod, a) for a in attrs}
+    for a in attrs:
+        src: Path = saved[a]
+        dst = workdir / src.name
+        dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        setattr(tools_mod, a, dst)
+    yield
+    for a in attrs:
+        setattr(tools_mod, a, saved[a])
 
 
 class Harness:
@@ -77,7 +93,9 @@ class Harness:
         await self.agent.stop()
 
 
-def test_turn_lands_on_disk_and_projects_legally(workdir: Path) -> None:
+def test_turn_lands_on_disk_and_projects_legally(
+    workdir: Path, data_copies: None
+) -> None:
     """一轮真对话：轨迹文件里是合法序列；投影出合法 messages（含工具结果）。"""
     h = Harness(workdir)
 
@@ -115,7 +133,9 @@ def test_turn_lands_on_disk_and_projects_legally(workdir: Path) -> None:
     ]
 
 
-def test_interrupt_semantics_survive_the_trajectory_rewrite(workdir: Path) -> None:
+def test_interrupt_semantics_survive_the_trajectory_rewrite(
+    workdir: Path, data_copies: None
+) -> None:
     """回归：掐掉在飞的一步，turn 以 interrupted 收尾；合成消息进轨迹。"""
     h = Harness(workdir)
 

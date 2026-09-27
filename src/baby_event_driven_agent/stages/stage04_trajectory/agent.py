@@ -104,7 +104,8 @@ def build_context(traj: Trajectory) -> Projection:
     system prompt 全从轨迹来：初始值在 header，变更以 prompt_change entry
     追加（attach 时发现不一致就落盘），覆盖式提取、路径上最后一次生效、
     没有变更回落 header——和 model_change 同一个模式。不进消息序列，
-    只决定前置的那条 system。
+    只决定前置的那条 system。状态节点（model_change / prompt_change）
+    沿全路径提取、不参与压缩跳过：压缩只压消息，不压"当前状态"。
     纯函数：同一份轨迹文件，两次投影逐字节相同（测试钉死）。
     """
     entries = traj.path()
@@ -136,6 +137,20 @@ def build_context(traj: Trajectory) -> Projection:
     prompt: str | None = None
     raw: list[dict[str, Any]] = []
     for e in entries:
+        # 状态节点沿全路径覆盖式提取，不参与压缩跳过：被压段里发生过的
+        # model_change / prompt_change 在压缩后照样生效。压缩跳过只作用于
+        # 消息类 entry——否则刀口前的换模型 / 换 prompt 会被一起"压掉"，
+        # 压缩后视图丢失 system prompt 和当前模型。
+        if e.type == MODEL_CHANGE:
+            mid = str(e.payload.get("model_id", ""))
+            if mid:
+                model = mid  # 覆盖式提取：路径上最后一次生效
+            continue
+        if e.type == PROMPT_CHANGE:
+            p_ = str(e.payload.get("system_prompt", ""))
+            if p_:
+                prompt = p_  # 同上：prompt 变更是改状态事实
+            continue
         if kept_ids is not None:
             if e.id == comp.id:  # type: ignore[union-attr]
                 # 摘要插在最前面（pi 语义：CompactionSummaryMessage 开头），
@@ -151,14 +166,6 @@ def build_context(traj: Trajectory) -> Projection:
                 msg["synthetic"] = bool(e.payload.get("synthetic"))
                 msg["note"] = str(e.payload.get("note", ""))
             raw.append(msg)
-        elif e.type == MODEL_CHANGE:
-            mid = str(e.payload.get("model_id", ""))
-            if mid:
-                model = mid  # 覆盖式提取：路径上最后一次生效
-        elif e.type == PROMPT_CHANGE:
-            p_ = str(e.payload.get("system_prompt", ""))
-            if p_:
-                prompt = p_  # 同上：prompt 变更是改状态事实
         elif e.type == BRANCH_SUMMARY:
             raw.append(
                 {"role": "user", "content": f"<summary>{e.payload.get('summary', '')}</summary>"}

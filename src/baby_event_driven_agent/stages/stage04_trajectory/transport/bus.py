@@ -290,6 +290,24 @@ class EventBus:
             except asyncio.TimeoutError:
                 logger.warning("lane %s 在 %.1fs 内没排空", lane.name, timeout)
 
+    async def close(self) -> None:
+        """停掉两条 lane worker：取消并等它们退出（进程收尾用）。
+
+        不 close 的话，事件循环关闭时这两个还在 await queue.get() 的任务会被
+        强制取消——asyncio 会对每个没 await 到底的任务打印一条
+        "Task was destroyed but it is pending!"（无害，但吵）。
+        """
+        tasks = [lane.task for lane in self._lanes.values() if lane.task and not lane.task.done()]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        for lane in self._lanes.values():
+            lane.task = None
+
     @property
     def last_seq(self) -> int:
         return self.log.last_seq if self.log is not None else self._seq

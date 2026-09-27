@@ -30,10 +30,11 @@ from baby_event_driven_agent.stages.stage04_trajectory.agent import (
     Agent,
     build_context,
 )
-from baby_event_driven_agent.stages.stage04_trajectory.main import (
+from baby_event_driven_agent.stages.stage03c_agent.main import (
     LONG_TASK_SCRIPT,
     LONG_TASK_TURNS,
 )
+# 长任务剧本定义在 3c（04/05 骑在 3c 的场景上，见 00-outline）
 from baby_event_driven_agent.stages.stage04_trajectory.session.compaction import (
     LiveSummarizer,
     ScriptedSummarizer,

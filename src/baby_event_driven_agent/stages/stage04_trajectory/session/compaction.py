@@ -75,10 +75,12 @@ class LiveSummarizer:
 
     摘要调用不是 agent loop 的一步：它读被压段、写一段文本，不需要工具，
     也不该被工具分心。对话渲染成一段文本喂进去（不作为 chat 消息序列），
-    孤儿工具结果也读得懂。max_tokens 封顶：摘要写太长，压了等于没压。
+    孤儿工具结果也读得懂。max_tokens 封顶：摘要写太长，压了等于没压；
+    但要给足——推理型模型的思考 token 也计入 max_tokens，给太小会
+    思考完就没额度写摘要（实测 qwen3 系 512 不够，输出为空）。
     """
 
-    def __init__(self, llm: Any, *, max_tokens: int = 512) -> None:
+    def __init__(self, llm: Any, *, max_tokens: int = 4096) -> None:
         self.llm = llm
         self.max_tokens = max_tokens
 
@@ -97,15 +99,23 @@ class LiveSummarizer:
         for m in segment:
             lines.append(f"[{m.get('role')}] {_render(m)}")
         lines.append("输出摘要。")
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "\n".join(lines)},
+        ]
+        out = await self._collect(messages, self.max_tokens)
+        if not out and self.max_tokens is not None:
+            # 封顶被推理 token 吃光（思考没结束就到上限，正文一字未出）：
+            # 放开封顶重试一次，空摘要比长摘要危害大得多。
+            out = await self._collect(messages, None)
+        return out.strip()
+
+    async def _collect(self, messages: list[dict[str, Any]], max_tokens: int | None) -> str:
         out: list[str] = []
-        async for chunk in self.llm.stream_chat(
-            [{"role": "system", "content": system}, {"role": "user", "content": "\n".join(lines)}],
-            tools=None,
-            max_tokens=self.max_tokens,
-        ):
+        async for chunk in self.llm.stream_chat(messages, tools=None, max_tokens=max_tokens):
             if chunk["type"] == "text_delta":
                 out.append(chunk["text"])
-        return "".join(out).strip()
+        return "".join(out)
 
 
 def _render(m: dict[str, Any]) -> str:
@@ -164,6 +174,10 @@ async def maybe_compact(
         return None
     segment = prefix_view(traj, keep_from_id)
     summary = await summarizer.summarize(segment, previous=None)
+    if not summary.strip():
+        # 空摘要比长摘要危害大得多：append 空摘要等于把被压段从视图里抹掉。
+        # 按失败处理走 fail-open（留痕、不 append、下一边界重试）。
+        raise ValueError("摘要器返回空摘要（推理模型思考 token 吃掉输出时会发生）")
     return traj.append(
         COMPACTION,
         {"summary": summary, "keep_from_id": keep_from_id, "reason": reason},

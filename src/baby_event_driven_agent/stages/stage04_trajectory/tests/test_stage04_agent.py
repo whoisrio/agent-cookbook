@@ -498,10 +498,10 @@ def test_long_task_offline_end_to_end(workdir: Path) -> None:
     五轮 19 步跑完整张任务单：领单 → 先干起来 → 纠偏先查规则 → 规则路线
     （马克杯报备被拒）→ 换单（雨伞按实物调）→ 收尾（帆布包不动、围巾挂起）。
     """
-    from baby_event_driven_agent.stages.stage04_trajectory.main import (
+    from baby_event_driven_agent.stages.stage03c_agent.main import (
         LONG_TASK_SCRIPT,
         LONG_TASK_TURNS,
-    )
+    )  # 长任务剧本定义在 3c（04/05 骑在 3c 的场景上，见 00-outline）
 
     saved = {a: getattr(tools_mod, a) for a in ("_INVENTORY", "_RULES", "_TASKS")}
     try:

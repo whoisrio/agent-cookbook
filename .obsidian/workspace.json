@@ -83,7 +83,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 277.5069160461426
+    "width": 233.0624885559082
   },
   "right": {
     "id": "d0b58ebf96ef05ed",
@@ -189,11 +189,22 @@
   },
   "active": "1a13772e61ff5f3c",
   "lastOpenFiles": [
+    "src/baby_event_driven_agent/sessions/stage05/side-effect-not-repeated/sessions/271ef1ac6d1c492c8c0c0bf9c7f6463f.jsonl",
+    "src/baby_event_driven_agent/sessions/stage05/side-effect-not-repeated/events/index.json",
+    "src/baby_event_driven_agent/sessions/stage05/side-effect-not-repeated/events/evt-000002.log",
+    "src/baby_event_driven_agent/sessions/stage05/side-effect-not-repeated/sessions/c834174a7fb84f68b620140744112dac.jsonl",
+    "src/baby_event_driven_agent/sessions/stage05/side-effect-not-repeated/events/evt-000001.log",
+    "src/baby_event_driven_agent/sessions/stage05/side-effect-not-repeated/tasks.txt",
+    "src/baby_event_driven_agent/sessions/stage05/side-effect-not-repeated/sessions",
+    "src/baby_event_driven_agent/sessions/stage05/side-effect-not-repeated/rules.txt",
+    "src/baby_event_driven_agent/sessions/stage05/side-effect-not-repeated/inventory.txt",
+    "src/baby_event_driven_agent/sessions/stage05/side-effect-not-repeated/events",
+    "src/baby_event_driven_agent/sessions/stage05/side-effect-not-repeated",
+    "books/event-driven-agent/05-compaction.md",
+    "books/event-driven-agent/04-trajectory.md",
     "books/event-driven-agent/03c-agent-ability-upgrade.md",
     "books/event-driven-agent/03-interrupt.md",
     "books/event-driven-agent/03b-message-mechanism.md",
-    "books/event-driven-agent/04-trajectory.md",
-    "books/event-driven-agent/05-compaction.md",
     "books/event-driven-agent/04-message-mechanism.md",
     "books/event-driven-agent/05a-trajectory.md"
   ]

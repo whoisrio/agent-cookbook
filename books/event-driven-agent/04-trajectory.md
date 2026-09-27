@@ -197,24 +197,37 @@ resume 后（EventLog）：... approval_required
 ```
 
 处理的方式，都是在从trajectory resume消息时，主动的将不完整的轨迹补充完整，并且添加上主动补充的说明。
-## 代码改动：session 层新增，agent 侧只动三处
+## 代码改动：轨迹层三个类，agent 侧只动两处
 
-下面看看本章代码的主要改动，
+轨迹层就三个类，各管一层：`Entry` 是树上的节点，`Trajectory` 是轨迹文件的内存镜像，`TrajectoryLog` 管单会话文件，
 
-### Trajectory：一棵常驻内存的 entry 树
+### Entry：树上的节点
 
-`TrajectoryLog` 管单会话文件，`Trajectory`则是文件的内存镜像，`Entry`则是具体的轨迹条目。
-
-
-`TrajectoryLog` 管单会话文件：第一行是 session header
-（type=session，带 sid / cwd / system_prompt 原文），其后 entry 逐行追加。
 ```python
-class TrajectoryLog:
-	
+@dataclass(frozen=True)
+class Entry:
+    id: str
+    parent_id: str | None
+    type: str
+    ts: str
+    payload: dict[str, Any]
 ```
 
-`Trajectory` 是文件的内存镜像，状态有三个：`header`、全树索引 `_by_id`、
-一个指针 `leaf_id`。所有操作围绕这三个状态，核心是 append：
+它是 frozen 的，不允许修改。`type` 就是前面那张三分组表里的 10 种；`to_dict() / from_dict()` 负责与落盘行的互转。
+
+### TrajectoryLog：单会话轨迹文件
+
+轨迹文件按照 `<sid>.jsonl`命名，第一行是 session header（type=session，带 sid / cwd / system_prompt 原文，注意 header 不是树节点），其后 entry 逐行追加。
+提供三个关键方法
+
+- `append(record)`：一行落盘（单线程下原子）；
+- `read()`：读全文件，返回 `(header, entries, torn)`，撞上残尾停在最后一条完好处；
+- `truncate_torn()`：把残尾字节裁掉——没写完的不算事实。
+
+
+### Trajectory：文件的内存镜像（一棵 entry 树）
+
+状态只有三样：`header`、全树索引 `_by_id`、一个指针 `leaf_id`。所有操作围绕这三个状态，核心是 append 和 path：
 
 ```python
 def append(self, etype: str, payload: dict[str, Any]) -> Entry:
@@ -231,46 +244,24 @@ def append(self, etype: str, payload: dict[str, Any]) -> Entry:
     self._index(entry)
     return entry
 
-def _index(self, entry: Entry) -> None:
-    if entry.id in self._by_id:
-        raise ValueError(f"entry id 冲突：{entry.id}")
-    if entry.parent_id is not None and entry.parent_id not in self._by_id:
-        raise ValueError(f"entry {entry.id} 的父节点不存在：{entry.parent_id}")
-    self._by_id[entry.id] = entry
-    self.leaf_id = entry.id                # 追加即移动 leaf：树末端永远指向最新事实
-```
-
-`_index` 同时是数据合法性的检查点：id 冲突、父节点不存在都直接抛错，
-"认父不认子"和 id 唯一由它保证。投影要的当前路径来自 `path()`：
-
-```python
 def path(self) -> list[Entry]:
     """当前路径：leaf 沿 parentId 走回根，再 reverse 成根→叶顺序。
-
     只有这条线上的 entry 会进投影——其他分支的数据不是"被过滤"，
     是遍历根本不经过它们。
     """
-    out: list[Entry] = []
-    cur = self.leaf
-    while cur is not None:
-        out.append(cur)
-        cur = self._by_id.get(cur.parent_id) if cur.parent_id else None
-    out.reverse()
-    return out
 ```
 
-branch / branch_with_summary / fork 都是"移指针 + append"的组合（见前面
-几节）；观测另有 `entries()`（全树、按文件顺序）和 `branch_points()`（同父
-多子的分叉点，grep parentId 的程序版）。
+- **append**：认父不认子（新节点只带 parent_id），先落盘后动内存；`_index` 顺带做合法性检查（id 冲突、父节点不存在直接抛错）。
+- **path()**：投影要的当前路径就从这来。
+- **branch(to_id)**：rewind 的全部实现就一行 `self.leaf_id = to_id`，没有任何节点被删除。
+- **branch_with_summary(keep_from, summary)**：移指针 + 追加一条 `branch_summary` 遗言节点。
+- **fork(new_log, sid=…)**：把当前路径原样克隆进新文件（id / parentId 不改），补一条 `session_resumed` 留痕。
 
-### agent 侧：只动三处
+### agent 侧：只动两处
 
-这正是把机制放在轨迹层上的意义：
+agent侧实现从轨迹到messages的投影，
 
-1. `self.history: dict[sid, list]` → `self.trajectories: dict[sid, Trajectory]`：
-   所有 `history.append(...)` 换成 `traj.append(MESSAGE, message_payload(...))`
-   ——消息进 append-only 的 entry 树，而不是内存 list。sid 的唯一入口是
-   `attach`：登记 store.start/resume 的产物，顺手处理 prompt 变更留痕——
+**1. 消息存储的映射：按照sid(sessionid)管理轨迹，
 
 ```python
 def attach(self, traj: Trajectory) -> str:
@@ -284,75 +275,181 @@ def attach(self, traj: Trajectory) -> str:
     return traj.sid
 ```
 
-   没 attach 过的 sid 来了直接报错——宁可炸也不静默开一段新历史（3b
-   结尾那个困境的结构性解法）：
+没 attach 过的 sid 来了直接报错（`_traj`）。`_step` 的上下文从内存 list 换成投影：每次 LLM 调用前 `build_context(traj)` 现算，不缓存，rewind / 压缩之后，下一次调用自动就是新视图。
+
+**2. system prompt 的替换：prompt 是参数，变更要留痕。**
+reload session时，system prompt 不直接从轨迹中恢复，但它**存在轨迹文件里**：初始值记在 header（第一行，不是树节点），变更以 `prompt_change` entry 追加进轨迹树。这样"这个会话当时用的是哪个 prompt"随时查得到，否则重放核对不了。做法与 model_change 同一个模式：
+
+- 初始值记在 header（`TrajectoryLog` 的第一行）；
+- 变更以 `prompt_change` entry 追加——`attach` 发现本次运行的 prompt 与轨迹记录的不一致（比如 resume 时换了模板），就补一条留痕，新 prompt 从此生效；
+- 投影时**覆盖式提取**：沿当前路径走，取最后一次 `prompt_change`；没有变更回落 header。
 
 ```python
-def _traj(self, sid: str) -> Trajectory:
-    traj = self.trajectories.get(sid)
-    if traj is None:
-        raise KeyError(f"未知 session：{sid!r}——sid 由 SessionStore 分配（start/resume），"
-                       "再用 agent.attach(traj) 登记")
-    return traj
+elif e.type == PROMPT_CHANGE:
+    p_ = str(e.payload.get("system_prompt", ""))
+    if p_:
+        prompt = p_  # 覆盖式提取：路径上最后一次生效
+...
+if prompt is None:
+    prompt = str(traj.header.get("system_prompt", ""))  # 没变更过：回落 header
 ```
 
-2. `_step` 的上下文从内存 list 换成投影——每次 LLM 调用前从轨迹现算，
-   不缓存；rewind / 压缩之后，下一次调用自动就是新视图：
+其余一切照旧：合成消息（中断标记、assistant 占位、纠正 user）同样进轨迹。
 
-```python
-def build_context(self, traj: Trajectory) -> Projection:
-    return build_context(traj)   # 路径遍历 → 按类型分派 → sanitize；纯函数，逐字节可复现
-```
-
-3. 合成消息（中断标记、assistant 占位、纠正 user）照旧进事实层
-   （`synthetic: true` + note），只是落点从 history 变成轨迹——否则
-   "history 是 log 的投影"在合成消息这条路上断掉。
-
-中断 / steering / redirect 的逻辑一字未动：被掐的 step 不留半截消息这条
-Stage 3 纪律，在树上同样成立——append 只发生在 step 成功结算之后。
-bus / events / persistence / outbound / subscribers 与 3b 一字未改；
-工具层与数据源见 3c（tools.py + data/）。
-
-4. 手动压缩接线：`compact_request` 控制事件走旁路（与 interrupt 同待遇，
-   同步置标记），`_run_steps` 在 step 边界检查并调 `_compact`——算刀口 →
-   摘要 → 追加 compaction entry → 发 `context_compacted`（EventLog 答
-   "什么时候、压了多少"，轨迹 entry 答"刀口在哪、摘要是什么"）。
-   摘要失败 fail-open：留痕（`context_compact_failed`）、不 append、
-   不挡 turn，下一个边界可重试。投影零改动。
 
 ## demo
-### 实测（demo 第 3 段）
+
+先认识一下跑 demo 的 agent。之前它只有四件套工具——查库存（query_inventory）、查规则（search_rules）、改库存（update_inventory）、改规则（update_rules）。现在给它加了一个任务域：list_tasks 列出今天的任务单，get_task 取单上的完整条目，扩成六件套（4 读 + 2 写）；写操作的审批也从"每个写都问人"升级为按量判——小补货直接放行，超过 50 件才要店长审批。于是它第一次能"领单 → 逐项处理 → 汇报"地跑长任务，来支持演示咱们的轨迹记录的演示。
+
+下面从六个 demo看一下各种操作之后的轨迹长什么样，按"写 → 恢复 → 压缩 → 回退 → 分叉 → 崩溃恢复"的顺序把轨迹层的每个能力过一遍。
+六个 demo 全部打真实模型（读仓库根 `.env` 的 OpenAI 兼容端点，本地 ollama 也行；没配 key 的段整段跳过）。
+entry id 每次运行随机生成，模型输出每次也会不同，下面的引用是一次真实运行。
+
+### demo 1 · 写轨迹：写好的 entry 长什么样（01-trajectory-shape）
+
+先说这个 case 里 agent 在干什么：**用户问保温杯库存 → LLM 发起工具调用 query_inventory → agent 执行工具 → LLM 拿到结果回复**。四步对话各记一条 message entry，加上开头记录的 session_started（会话开始）和 model_change（模型选择），正好 6 条 entry。
 
 ```text
-[实测] branch(07df5b83)：文件里还是 6 条 entry（6 → 6，一条没删），字节未变：True
-[实测] 回退后投影只剩 2 条消息（system + 那条 user）
-[实测] 回退后追加 = 分支：07df5b83 现在有两个孩子 ['e2e7b5b7', '3a546b41']
-       （grep parentId 的程序版）
-[实测] branch_with_summary：摘要节点 4ab442a6 挂在 07df5b83 下（抛弃了 1 个 entry）
-[系统] 现在的投影（新分支的 agent 看到的）：
-  system    你是一个通过工具干活的通用 agent。
-  user      保温杯还有库存吗
-  user      <summary>试过查保温杯库存（3 件），结论：库存偏紧，建议按目标补货。</summary>
-       说明 │ 被抛弃的分支原样躺在文件里——想回头随时能回（branch 回去即可）。
+[用户] 保温杯还有库存吗
+[entry] cce21772 ← ∅  session_started  {"by": "store"}
+[entry] c3220530 ← cce21772  model_change
+       {"model_id": "modelscope.cn/unsloth/Qwen3.5-4B-GGUF:Q4_K_M", "by": "store"}
+[entry] 80d4ac1f ← c3220530  message
+       {"message": {"role": "user", "content": "保温杯还有库存吗"}, "synthetic": false, "note": ""}
+[entry] f950df0c ← 80d4ac1f  message
+       {"message": {"role": "assistant", "content": null, "tool_calls": [{"id": "call_z7xvdqpf",
+        "type": "function", "function": {"name": "query_inventory", "arguments": "{\"category\":\"保温杯\"}"}}]},
+        "synthetic": false, "note": ""}
+[entry] c9617b5d ← f950df0c  message
+       {"message": {"role": "tool", "tool_call_id": "call_z7xvdqpf",
+        "content": "保温杯：库存 3 件；316L 不锈钢内胆，500ml，杯身磨砂黑。"}, "synthetic": false, "note": ""}
+[entry] 76953da3 ← c9617b5d  message
+       {"message": {"role": "assistant", "content": "保温杯还有库存，目前有 3 件：材质 316L 不锈钢内胆、
+        容量 500ml、外观杯身磨砂黑"}, "synthetic": false, "note": ""}
+[统计] 文件 6 条 entry + 1 条 header（不是节点，type=session）；
+       message 里 1 user / 2 assistant / 1 tool；残尾=False
+[系统] 文件头原文：{"type": "session", "version": 1, "id": "992b5c5e…",
+       "cwd": "…/sessions/stage04/trajectory-shape", "created": "2026-09-27T07:31:50.685+00:00",
+       "note": "", "system_prompt": "你是一个通过工具干活的通用 agent。"}
+[实测] 分叉点：无
+       说明 │ 每条 entry 都是落盘记录的原样形状：五件套（id ← parentId、type、payload），
+             payload 按 type 原样 JSON，不做美化——文件里长什么样，打出来就是什么样。
+       说明 │ header 是文件的第一行（type=session）：sid、工作目录、创建时间、
+             system_prompt 原文——回答"这个会话是谁、用什么开的"。它不是树节点，
+             不占 entry、不进投影，审计/回放时才用。
 ```
 
-### session 切换（demo 第 5 段实测）
+### demo 2 · 从正常轨迹恢复（02-resume-normal）
+
+先说这个 case 里 agent 在干什么：**和 demo 1 一样跑一轮"问库存 → 工具 → 回复"，写下轨迹后关掉会话；进程重启后，新 agent 拿着 sid resume 这张轨迹；用户接着问"刚才查的是哪个品类？"，agent 凭恢复的历史答出保温杯**。轨迹的变化：6 条 entry 上先落一笔 session_end，resume 时再补一笔 session_resumed 留痕，8 条。
 
 ```text
-[系统] store 里的会话：['5a7b8f59…', 'a6c8b997…']
-[实测] 原会话 5a7b8f59…：7 条 entry，最后一条 user = 旧会话的下一句
-[实测] 分叉 a6c8b997…：8 条 entry，最后一条 user = 新会话的下一句
-[实测] 分叉的生命周期事实：{"type": "session_resumed", "forked_from": "5a7b8f59…"}
+[用户] 保温杯还有库存吗
+[entry] 1937b045 ← ∅  session_started  {"by": "store"}
+[entry] 4f12847a ← 1937b045  model_change
+       {"model_id": "modelscope.cn/unsloth/Qwen3.5-4B-GGUF:Q4_K_M", "by": "store"}
+[entry] 4b3809d0 ← 4f12847a  message
+       {"message": {"role": "user", "content": "保温杯还有库存吗"}, …}
+[entry] 2e7dee48 ← 4b3809d0  message
+       {"message": {"role": "assistant", "content": null, "tool_calls": [
+        {"id": "call_i1vxc0tz", "function": {"name": "query_inventory",
+         "arguments": "{\"category\":\"保温杯\"}"}}]}, …}
+[entry] 399284bc ← 2e7dee48  message
+       {"message": {"role": "tool", "tool_call_id": "call_i1vxc0tz",
+        "content": "保温杯：库存 3 件；316L 不锈钢内胆，500ml，杯身磨砂黑。"}, …}
+[entry] c96b8357 ← 399284bc  message
+       {"message": {"role": "assistant", "content": "有库存，目前有 3 件。…"}, …}
+[实测] 6 条 entry + 1 条 header——和 demo 1 的那张轨迹对得上
+[实测] 关闭时：投影 5 条消息；进程到此结束，内存里什么都可以扔了
+[实测] resume 重建树：8 条 entry（原 6 条 + resumed 留痕）；投影与关闭前逐字节相同：True
+[entry] c650414a ← c96b8357  session_end      {"reason": "第一段对话结束"}
+[entry] d38077d4 ← c650414a  session_resumed  {"torn_tail": false, "note": "进程重启后恢复"}
+[用户] 刚才查的是哪个品类？
+[实测] 继续对话：上下文 7 条（system + 恢复的历史 + 新一轮），
+       回答：刚才查询的品类是保温杯。
+       说明 │ 恢复没有秘密：读文件重建树 + attach 登记。上下文不是从内存拿的——
+             每次 LLM 调用前从轨迹投影现算，内存丢了，对话丢不了。
+```
+
+### demo 3 · 触发压缩之后的操作（03-compact）
+
+先说这个 case 里 agent 在干什么：**用户连问三轮（保温杯 → 玻璃杯 → 汇总），agent 每轮都发起工具调用、一轮轮把上下文堆长；用户喊压一下，agent 在下一个 step 边界把前两轮压成一份摘要**——追加一个 compaction entry（摘要 + 刀口 keep_from_id），原文一个字节不删；之后的"继续"，模型看到的就是 [system, <摘要>, 保留窗] 的短视图。压缩了哪些，三样东西摆在一起看：compaction entry 原文、被压进摘要的消息清单、压缩后的投影。
+
+```text
+[用户] 保温杯还有库存吗 / 玻璃杯呢 / 帮我汇总一下
+[用户] 上下文有点长了，压一下（compact_request，下一个边界生效）
+[用户] 继续
+[实测] 边界压缩：投影 11 → 13 条消息；compaction entry 6edb5431
+       （keep_from=2b46d2c5，reason=manual）——被压的原文一个字节没动：全树 24 条 entry 都在
+[entry] {"type": "compaction", "id": "6edb5431", "parentId": "2b46d2c5", …,
+       "payload": {"summary": "【已完成】已查询并汇总保温杯与玻璃杯的当前库存信息。
+                    【关键事实与规则】保温杯：库存 3 件（316L 不锈钢内胆，500ml，磨砂黑）；
+                    玻璃杯：库存 17 件（高硼硅玻璃，400ml，可进微波炉）。…",
+                   "keep_from_id": "2b46d2c5", "reason": "manual"}}
+[系统] 被压进摘要的消息（keep_from 之前，原文仍在轨迹里）：
+  user      保温杯还有库存吗
+  assistant → toolCall(query_inventory)
+  tool      保温杯：库存 3 件；316L 不锈钢内胆，500ml，杯身磨砂黑。
+  assistant 保温杯目前有 3 件的库存。规格：316L 不锈钢内胆，500ml，杯身磨砂黑
+  user      玻璃杯呢
+  assistant → toolCall(query_inventory)
+  tool      玻璃杯：库存 17 件；高硼硅玻璃，400ml，可进微波炉。
+  assistant 玻璃杯目前有 17 件的库存。规格：高硼硅玻璃，400ml，可进微波炉
+  user      帮我汇总一下
+  assistant 库存汇总报告：保温杯 3 件、玻璃杯 17 件…
+[系统] 压缩后的投影（模型实际看到的）：
+  system    你是一个通过工具干活的通用 agent。
+  user      <summary>【已完成】已查询并汇总保温杯与玻璃杯的当前库存信息…</summary>
+  user      继续
+  …         （保留窗：最后一轮的原文，tool 配对完整）
+       说明 │ 压缩只追加视图标记：compaction 的 payload = summary + keep_from_id
+             （从哪条起原样保留）。投影遇到它：刀口之前跳过、摘要插在 system 之后、
+             只认当前路径上第一条（折叠语义归 05）。
+       说明 │ 这轮保留窗（最后一轮）比被压段还长，条数没降反升——压缩的收益
+             取决于被压段和保留窗的实际长度，机制本身不变。
+```
+
+### demo 4 · 压缩之后再 rewind，然后继续对话（04-rewind-after-compact）
+
+先说这个 case 里 agent 在干什么：**用户领了 T-101 任务单，agent 跑三轮（定方案 → 逐项核对）后边界压缩；用户说"换个思路重来"，agent 把指针 rewind 回第一条 user——压缩随之"消失"，旧消息逐字回来，模型从零重新开始；再 branch 回压缩节点，又能回到压缩刚做完那一刻**。同一个文件，两个落点两种视图。
+
+```text
+[用户] 开始处理 T-101，先定个方案 / 继续 / 继续
+[实测] 压缩完成：compaction entry de949a3f（keep_from=71900475）；投影 14 条 = [system, <摘要>, 保留窗…]
+[实测] 落点一 branch(e9c8ac63)：文件字节未变：True；投影 2 条 = [system, 那条 user]
+       ——compaction 不在路径上，旧消息逐字回来
+  system    你是一个通过工具干活的通用 agent。
+  user      开始处理 T-101，先定个方案
+[用户] 换个思路重来：先查规则再动手
+[实测] 回退后继续对话 = 分支：e9c8ac63 现在有两个孩子 ['f6fd78af', 'd97fce44']
+[实测] 落点二 branch(de949a3f)：投影 14 条 = 回到压缩刚做完那一刻：[system, <摘要>, 保留窗…]
+  system    你是一个通过工具干活的通用 agent。
+  user      <summary>【已完成】已处理任务 T-101…因人工确认超时，马克杯暂未补…</summary>
+  user      继续
+  …         （保留窗原文）
+       说明 │ 两个落点，文件都一个字节没动；差别只在 leaf 指针走到哪、
+             投影因此算出什么。被抛弃的分支原样躺在文件里，随时能 branch 回去。
+```
+
+### demo 5 · fork（05-fork）
+
+先说这个 case 里 agent 在干什么：**agent 跑完一轮"问库存 → 工具 → 回复"后，把当前路径克隆进一份新会话文件；之后旧会话续一句、新会话也续一句，两条轨迹各自生长，互不可见**——fork 出来的新文件 id 与 parentId 原样保留，是完整合法的轨迹，旧文件原封不动。
+
+```text
+[系统] store 里的会话：['2675d6a5…', '62ca1dba…']
+[实测] 原会话 2675d6a5…：7 条 entry，最后一条 user = 旧会话的下一句
+[实测] 分叉 62ca1dba…：9 条 entry，最后一条 user = 新会话的下一句
+[实测] 分叉的生命周期事实：{"type": "session_resumed", "forked_from": "2675d6a5…"}
        说明 │ session 切换不修改历史，只创造新的"当前"：模型切换是树上的
              新节点，会话切换是新文件——都是追加，都不是改写。
 ```
 
+### demo 6 · 从有问题的轨迹 resume（06-resume-broken）
 
-
-### 实测（demo 第 4 段）
+先说这个 case 里 agent 在干什么，三个"崩了再回来"的现场：**① agent 正常跑完一轮，文件被砍掉 11 字节（模拟崩在写一半），resume 时停在最后一条完好记录、裁掉残尾续写；② 轨迹里躺着一条"assistant 要了工具结果但结果永远没来"的悬挂调用（崩在工具执行前），resume 后投影补一条自描述占位，模型知道缺了什么；③ EventLog 里剩一个没人答复的审批请求（进程被硬杀），resume 时按未授权闭合**。三个现场全部以"轨迹是唯一真相"为基准。
 
 ```text
-[实测] 残尾：完好 6 条 → 砍 11 字节后读到 5 条（停在坏记录之前，torn=True）
+[实测] 残尾：完好 4 条 → 砍 11 字节后读到 3 条（停在坏记录之前，torn=True）
        → resume 裁掉残尾续写，resumed 事件留痕 torn_tail=True
 [实测] 悬挂调用·补占位：投影补了 1 条占位
        → [UNKNOWN: 会话在工具执行前中断，结果缺失]；原文件字节未变：True
@@ -363,73 +460,6 @@ bus / events / persistence / outbound / subscribers 与 3b 一字未改；
 ```
 
 
-
-## 与 pi 的对照
-
-| | pi（coding-agent） | 本章（stage04_trajectory） |
-|---|---|---|
-| 事实层 | entry 树，裸 jsonl 行 | entry 树，长度前缀 + CRC（残尾可判定） |
-| entry 类型 | 9 种，按对 LLM 调用的影响分三组 | 10 种：9 种同构（lifecycle 换成 session_* 三个）+ `prompt_change`（pi 的 prompt 在 harness 不落盘） |
-| 追加 | appendEntry：认父 + 移 leafId | 同 |
-| rewind | `branch()`：leafId = to_id；`branchWithSummary`（切分支时总结被弃分支，摘要由模型生成） | 同；摘要是收的文本，模型生成与否归宿主 |
-| 上下文 | buildSessionContext：路径遍历 + 分派 | build_context：同构 + sanitize 补占位收口 |
-| 压缩 | CompactionEntry + firstKeptEntryId；/compact 手动 + auto 水位 | 同语义，本书叫 `keep_from_id`（"从它开始保留"）；手动触发本章落地（compact_request + Summarizer 两档），自动策略归 05 |
-| 恢复 | transformMessages 收口（drop） | sanitize 补占位 + CRC 残尾 + 悬挂审批闭合 |
-| session 切换 | `_rewriteFile` 克隆当前路径 | `fork()` 克隆路径 + 新 sid |
-
-## 跑一下
-
-```text
-── 第 6 段：真跑一轮，两层事实各自记账 ──
-       说明 │ 真模型 + 真工具。EventLog 记传输层的事件账（token 流、治理、
-             生命周期），轨迹记会话的结构账（消息树、投影）。两层坐标不同。
-[用户] 保温杯还有库存吗
-[工具] ← query_inventory 结果：保温杯：库存 3 件；316L 不锈钢内胆，500ml，杯身磨砂黑。
-[系统] 轨迹（尾部 6 条）：
-  8c71520b ← a6b61df9  prompt_change    {"system_prompt": "…可用工具：query_inventory、…"}
-  fe11fdbd ← 8c71520b  message          user: 保温杯还有库存吗
-  f89418e1 ← fe11fdbd  message          assistant → toolCall(query_inventory)
-  697e79f0 ← f89418e1  message          tool: 保温杯：库存 3 件；316L 不锈钢内胆…
-  e3e9bf05 ← 697e79f0  message          assistant: 有的，保温杯目前还有库存，共3件…
-  12d7ef0e ← e3e9bf05  session_end      {"reason": "demo 结束"}
-[统计] EventLog：seq 1..141（传输层事件账）；轨迹：8 条 entry（会话结构账）；
-       投影出 5 条消息，model=live
-```
-
-同一轮对话：EventLog 141 条（token 增量 + 生命周期 + 治理），轨迹 8 条
-entry。**账分两层记，各答各的问题**：传输层答"事件怎么流的、谁批的"，
-会话层答"模型看到了什么、从哪能回退"。
-
-```text
-── 第 13 段：长任务的轨迹解法（离线，一镜到底） ──
-       说明 │ 同一张任务单（第 11 段的命运），换轨迹跑法。
-[实测] branch_with_summary：移指针 + 追加遗言节点 720a9e41（挂在 cdc6d013 下）；
-       抛弃 8 条 entry，原样躺在文件里——副作用（保温杯 50）在遗言里带账
-[实测] 边界压缩：投影 32 → 13 条消息；compaction entry 677cd0a2
-       （keep_from=ca80f7a2，reason=manual）
-[系统] 摘要全文：【已完成】T-101 补货核查处理完：保温杯此前已直接补到 50
-       （副作用，已确认无需重做）；玻璃杯补到 20；马克杯需补 52 件超上限、
-       报备被店长拒绝、未补；保温壶补到 20。【关键规则】…【副作用】…【待办】…
-[工具] ← query_inventory 结果：雨伞：库存 13 件。   ← 摘要漏了它，模型对不上账重查
-[系统] 进程在工具执行前被杀：assistant 要了围巾的数据，结果永远没来
-[实测] resume 后投影 15 条 = 压缩视图（[system, <摘要>, 保留窗…]），不是全量原文；
-       悬挂调用补了 1 条占位：[UNKNOWN: 会话在工具执行前中断，结果缺失]
-[实测] append-only：resume 前字节是 resume 后的前缀：True
-[统计] 全树 58 条 entry（被抛弃分支 8 条 + compaction 原文都在）；
-       当前路径 50 条；EventLog seq 1..105
-```
-
-一个摘要吞另一份摘要（幕 3 遗言进了压缩摘要）、一次冗余查询（刻意遗漏的
-代价）、一次不丢历史的崩溃——三个场景，同一个纪律：修复只作用于视图，
-事实层只追加。
-
 ## 总结
 
-会话立住了、也能从崩溃里重建了，纠偏、压缩、恢复三个场景都跑通了。
-但手动压缩有个天生的局限：它靠人眼判断"上下文太长了"——等你看出来，
-窗口可能已经爆了；而且第二次压缩怎么办（新摘要怎么吞旧摘要、投影认哪
-一刀）语义还没定义。05（压缩与上下文）接手：压缩是事件
-（`context_compacted {…}` 进 EventLog）、自动触发按水位检测、滚动折叠
-补全多次压缩的语义、不变式是"给定 (log, 参数版本) → 唯一 messages"。
-本章留下的口子刚好够它用：`compaction` entry、`keep_from_id` 投影语义、
-`maybe_compact` 的 reason 参数——自动档只是换一个触发者，机制一字不改。
+如上就是关于trajectory的内容，为了便于演示压缩后的trajectory，本章agent也增加了基础的上下文压缩能力，下一章再详细讨论。
