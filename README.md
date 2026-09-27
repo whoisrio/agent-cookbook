@@ -58,6 +58,11 @@ agent-cookbook/
 | [01 接收事件](books/event-driven-agent/01-receive-events.md) | 事件、总线、订阅分发、append-only session log |
 | [02 收件箱与 Steering](books/event-driven-agent/02-inbox-steering.md) | 收件箱 + 常驻 worker，steering / followup |
 | [03 用户中断](books/event-driven-agent/03-interrupt.md) | 中断正在飞的那一步，loop 仍存活 |
+| [03b 消息机制](books/event-driven-agent/03b-message-mechanism.md) | 上行洪峰、QoS、事件信封、落盘与位点 |
+| [03c 能力升级](books/event-driven-agent/03c-agent-ability-upgrade.md) | 从四件套到一张真正的任务单（长程任务场景） |
+| [04 会话与真相](books/event-driven-agent/04-trajectory.md) | log、投影与异常恢复；rewind / fork / 手动压缩 |
+| [05 上下文压缩](books/event-driven-agent/05-compaction.md) | 有损变换的纪律：水位、滚动折叠、cap+blob、兜底阶梯（设计稿，真模型用例与 demo 已先行落地） |
+| [06 rubric 和 eval](books/event-driven-agent/06-rubric.md) | 重放录制好的会话打分（待写，文件暂为空） |
 
 ### Python 基础
 
@@ -132,9 +137,13 @@ Notebook 的公共依赖（`model` / `openai_client` / `config` / `stream_json`�
 事件驱动系列每个 stage 自成包，`pyproject.toml` 里已注册 demo / test 脚本：
 
 ```bash
-uv run stage01-demo   # stage01 真模型演示    uv run stage01-test   # stage01 离线测试
-uv run stage02-demo   # stage02 收件箱/steering
-uv run stage03-demo   # stage03 中断
+uv run stage01-demo   # stage01 真模型演示      uv run stage01-test
+uv run stage02-demo   # stage02 收件箱/steering  uv run stage02-test
+uv run stage03-demo   # stage03 中断            uv run stage03-test
+uv run stage03b-demo  # stage03b 消息机制/落盘   uv run stage03b-test
+uv run stage03c-demo  # stage03c 长程任务场景
+uv run stage04-demo   # stage04 轨迹层六段       uv run stage04-test（含真模型段）
+uv run stage05-demo   # stage05 压缩三段         uv run stage05-test（全真模型）
 ```
 
 ### TypeScript 示例
@@ -174,5 +183,7 @@ uv run python -m baby_agent                      # 默认模型
 uv run python -m baby_agent --model gpt-4o-mini  # 指定模型
 ```
 
-> 注意：调用真实模型的 Notebook（02 / 03 / 04 / 07）和 `stage0x-demo` 必须先完成第 2 步的 `.env`；
-> 01 / 05 / 06 以及各 `stage0x-test` 不需要 Key（测试使用 Fake / Scripted LLM）。
+> 注意：调用真实模型的 Notebook（02 / 03 / 04 / 07）和各 `stage0x-demo` 必须先完成第 2 步的 `.env`；
+> 离线单元测试（各 `stage0x-test` 的大多数用例，Fake / Scripted LLM）不需要 Key——
+> 例外：`stage04-test` 的 live 段与 `stage05-test` 全部打真模型，也需要 `.env`
+> （本地 ollama 即可，压缩相关用例建议 `num_ctx ≥ 32k` 的派生模型，见 05 章）。
