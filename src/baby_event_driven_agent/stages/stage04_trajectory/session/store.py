@@ -14,7 +14,8 @@ Stage 4 结束时的困境（04 章末尾的预告）：事件留下来了、也
 resume 的两条恢复路径（都以"轨迹是唯一真相"为基准）：
 
 1. 字节级：撞残尾就停在最后一条完好 entry（CRC 判定，TrajectoryLog 负责），
-   resumed 事件里带 torn_tail 标记留痕；
+   resumed 事件里带 torn_tail 标记留痕，并直接补一条 synthetic assistant
+   占位 entry 进轨迹——content 自述"回复已丢弃"，synthetic 标记区分主动补充；
 2. 语义级：崩在半路的轨迹尾部可能是"悬挂的工具调用"（assistant 要了结果没等到）
    ——修复发生在投影层（trajectory._sanitize），原始 entry 原封不动。
 """
@@ -27,7 +28,21 @@ from typing import Any
 
 from ..transport.bus import EventBus
 from ..transport.events import Event
-from .trajectory import MODEL_CHANGE, SESSION_END, SESSION_RESUMED, SESSION_STARTED, Trajectory, TrajectoryLog
+from .trajectory import (
+    MESSAGE,
+    MODEL_CHANGE,
+    SESSION_END,
+    SESSION_RESUMED,
+    SESSION_STARTED,
+    Trajectory,
+    TrajectoryLog,
+    message_payload,
+)
+
+# 残尾回复的占位：崩溃时上一条 assistant 回复写到一半、被裁掉（torn_tail），
+# resume 时直接补进轨迹（synthetic=true + note 标注主动补充）。
+# 对 pi 的有意偏离：pi 原子写入杜绝残尾、读到坏数据 fail-fast；本项目容错修复、修必留痕。
+TORN_REPLY_LOST = "[UNKNOWN: 会话崩溃在回复写到一半，该回复已丢弃]"
 
 
 class SessionStore:
@@ -60,7 +75,19 @@ class SessionStore:
         if not path.exists():
             raise KeyError(f"store 里没有这个 session：{sid!r}（{path}）")
         traj = Trajectory.load(TrajectoryLog(path))
-        traj.append(SESSION_RESUMED, {"torn_tail": traj.torn, "note": note})
+        torn = traj.torn  # append 会触发 truncate_torn 并把 torn 复位，先记下
+        traj.append(SESSION_RESUMED, {"torn_tail": torn, "note": note})
+        if torn:
+            # 主动修复：被裁掉的是一条没写完的 assistant 回复，直接补一条
+            # 占位进轨迹（synthetic=true + note 区分主动补充，不是伪造当时说过话）
+            traj.append(
+                MESSAGE,
+                message_payload(
+                    {"role": "assistant", "content": TORN_REPLY_LOST},
+                    synthetic=True,
+                    note="主动补充的占位：崩溃时写到一半的回复已被裁掉",
+                ),
+            )
         return traj
 
     def close(self, traj: Trajectory, *, reason: str = "") -> None:

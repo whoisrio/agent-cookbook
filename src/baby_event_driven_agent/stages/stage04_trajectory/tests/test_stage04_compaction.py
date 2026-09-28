@@ -197,6 +197,7 @@ def test_live_summarizer_bare_chat_and_cap() -> None:
     assert call["tools"] is None  # 裸 chat：不带工具
     assert call["max_tokens"] == 256  # 封顶
     rendered = call["messages"][-1]["content"]
+    assert "<conversation>" in rendered  # 对话以资料形态进摘要输入（标签包裹，防接话）
     assert "query_inventory" in rendered  # 工具调用发起可见
     assert "[user] 查一下保温杯" in rendered
 

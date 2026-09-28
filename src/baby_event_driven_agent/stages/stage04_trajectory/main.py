@@ -17,8 +17,8 @@
    继续对话 = 开分支；branch 到 compaction 节点 = 回到压缩刚做完那一刻。
 5. **session 切换（fork）**：fork 出一份新会话文件，两条轨迹分道扬镳，
    各自独立生长。
-6. **从有问题的轨迹 resume**：残尾（砍字节 → resume 停在完好处）、悬挂的
-   工具调用（投影层补占位，原文件字节不变）、悬挂审批闭合（一问必有一答）。
+6. **从有问题的轨迹 resume**：主动构造两份不完整的轨迹——残尾（砍字节 →
+   resume 停在完好处）、悬挂的工具调用（投影层补占位，原文件字节不变）。
 
 行首标签沿用前几章：
 
@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -46,7 +47,7 @@ from .transport.bus import EventBus
 from .transport.events import Event, Subscription, OBSERVE
 from .transport.persistence import EventLog
 from .session.compaction import Summarizer, maybe_compact
-from .session.store import SessionStore, session_facts, sweep_hanging_approvals
+from .session.store import SessionStore, session_facts
 from .session.trajectory import (
     COMPACTION,
     MESSAGE,
@@ -82,7 +83,7 @@ CASE_TITLES = {
     "03-compact": "demo 3：触发压缩——compaction entry + 投影换视图",
     "04-rewind-after-compact": "demo 4：压缩之后 rewind，然后继续对话",
     "05-fork": "demo 5：session 切换——fork",
-    "06-resume-broken": "demo 6：从有问题的轨迹 resume——残尾、悬挂调用、悬挂审批",
+    "06-resume-broken": "demo 6：从有问题的轨迹 resume——残尾、悬挂调用",
 }
 ALL_TITLE = "六段全跑（全部真模型）"
 CASE_IDS = ("all", *CASE_ORDER)
@@ -540,12 +541,13 @@ async def case_fork(workdir: Path) -> None:
 
 
 async def case_resume_broken(workdir: Path) -> None:
+    """主动构造不完整的轨迹：每个现场先摆坏轨迹原文，再摆修复结果。"""
     banner(
         "06-resume-broken",
-        "异常恢复：残尾、悬挂调用、悬挂审批",
-        "三个恢复现场，全部以“轨迹是唯一真相”为基准：崩在写一半的字节（CRC 判定）；"
-        "崩在工具执行前的语义残尾（投影层补占位，原文件字节不变）；"
-        "进程被硬杀留下的孤立审批请求（resume 时按未授权闭合）。",
+        "异常恢复：残尾、悬挂调用",
+        "主动构造两份不完整的轨迹，各自先看坏成什么样、再看修成什么样："
+        "崩在写一半的字节（CRC 判定，resume 裁掉残尾续写）；"
+        "崩在工具执行前的语义残尾（投影层补占位，原文件字节不变）。",
     )
     try:
         h1 = Harness(workdir / "torn", isolated=True)
@@ -560,16 +562,55 @@ async def case_resume_broken(workdir: Path) -> None:
     path1 = h1.store.path_of(h1.sid)
     intact = len(TrajectoryLog(path1).read()[1])
     raw = path1.read_bytes()
-    path1.write_bytes(raw[:-11])  # 砍掉最后 11 字节 = 崩在写一半
-    _, after_cut, torn_before = TrajectoryLog(path1).read()  # resume 之前先记账
+    # 主动构造：崩在写一半——不只砍掉信封尾巴，直接断进 message 正文中间
+    syn = raw.rfind(b'"synthetic"')  # 信封字段在正文之后，从它往前再砍 20 字节
+    cut = len(raw) - syn + 20
+    path1.write_bytes(raw[:-cut])
+    torn_size = path1.stat().st_size
+    broken = Trajectory.load(TrajectoryLog(path1))
+    torn_raw = path1.read_bytes()
+    torn_line = torn_raw[torn_raw.rfind(b"\n") + 1 :].decode("utf-8", errors="replace")
+    parts = torn_line.split(" ", 2)
+    declared, actual = int(parts[0], 16), len(parts[2].encode("utf-8"))
+    tid = re.search(r'"id": "([0-9a-f]+)"', parts[2])
+    tparent = re.search(r'"parentId": "([0-9a-f]+)"', parts[2])
+    ttype = re.search(r'"type": "(\w+)"', parts[2])
+    line(
+        "实测",
+        RED,
+        f"坏轨迹：第 6 条记录断在 message 正文中间——行格式和完好记录一模一样（长度 CRC json），"
+        f"但头部自报 {declared} 字节、实际只剩 {actual} 字节（差 {declared - actual}），CRC 对不上 → 整条拒收：",
+    )
+    line(
+        "残尾",
+        RED,
+        f"{tid.group(1) if tid else '?'} ← {tparent.group(1) if tparent else '?'}  "
+        f"{(ttype.group(1) if ttype else '?'):<16} {brief(parts[2], 100)}",
+    )
+    show_trajectory(broken)
+    line(
+        "实测",
+        RED,
+        f"完好 {intact} 条 → 只读到 {len(broken.entries())} 条（停在坏记录之前，torn={broken.torn}）。"
+        f"残尾声明的父节点就是上面最后一条 entry——它是没出生的第 6 条，没写完的不算已发生",
+    )
     resumed = h1.store.resume(h1.sid, note="crash 恢复演练")
     line(
         "实测",
         GREEN,
-        f"残尾：完好 {intact} 条 → 砍 11 字节后读到 {len(after_cut)} 条"
-        f"（停在坏记录之前，torn={torn_before}）→ resume 裁掉残尾续写，"
+        f"修好之后：resume 先把残尾字节物理裁掉（文件 {torn_size} → {len(resumed.log.raw_bytes())} 字节），"
+        "补 session_resumed 留痕 + 主动补一条 assistant 占位进轨迹，轨迹尾部三条：",
+    )
+    show_trajectory(resumed, tail=3)
+    line(
+        "实测",
+        GREEN,
         f"resumed 事件留痕 torn_tail={session_facts(resumed)[-1]['payload']['torn_tail']}",
     )
+    fixed1 = build_context(resumed)
+    line("实测", GREEN, "修好之后的投影（模型实际看到的）——占位已在轨迹里，投影照常透传：")
+    for m in fixed1.messages:
+        line("  ", GREEN, f"{m['role']:<9} {brief(m.get('content') or '')}")
 
     # —— 现场二：悬挂的工具调用（崩在工具执行前） ——
     h2 = Harness(workdir / "dangling", isolated=True)
@@ -591,38 +632,24 @@ async def case_resume_broken(workdir: Path) -> None:
             }
         ),
     )
-    # 进程到这里被硬杀：assistant 要了工具结果，结果永远没来
+    # 主动构造：assistant 要了工具结果，结果永远没来
+    line("实测", RED, "坏轨迹：末尾是 assistant 的 toolCall，底下没有 tool 回执：")
+    show_trajectory(traj)
     before_bytes = traj.log.raw_bytes()
     fixed = build_context(traj)  # 补自描述占位；system prompt 从 header 提取
-    tail = [m for m in fixed.messages if m.get("role") == "tool"]
+    line("实测", GREEN, "修好之后的投影（模型实际看到的）：")
+    for m in fixed.messages:
+        line("  ", GREEN, f"{m['role']:<9} {brief(m.get('content') or '')}")
     line(
         "实测",
         GREEN,
-        f"悬挂调用·补占位：投影补了 {len(tail)} 条占位 → {tail[0]['content'] if tail else '-'}；"
-        f"原文件字节未变：{traj.log.raw_bytes() == before_bytes}",
-    )
-    # —— 现场三：孤立的审批请求 ——
-    h3 = Harness(workdir / "approval", isolated=True)
-    h3.bus.record(
-        Event(
-            "approval_required",
-            h3.sid,
-            {"request_id": "ap-deadbeef", "name": "update_inventory", "arguments": "{}"},
-        )
-    )
-    closed = sweep_hanging_approvals(h3.bus, h3.sid)
-    again = sweep_hanging_approvals(h3.bus, h3.sid)
-    line(
-        "实测",
-        GREEN,
-        f"悬挂审批：孤立请求 ap-deadbeef → 闭合 {closed}；再扫一遍：{again}（幂等，闭合过的不再碰）",
+        f"占位只补在投影里，原文件字节未变：{traj.log.raw_bytes() == before_bytes}",
     )
     note(
-        "三处的共同纪律：没写完的不算已发生（字节级）；修复只作用于喂给模型的"
-        "投影（语义级）；补的裁决走 record 留痕，不伪造“当时批过”（审批）。"
+        "两处的共同纪律：修复只作用于喂给模型的投影（语义级），"
+        "轨迹文件一个字节不动——轨迹是唯一真相，坏的地方用视图补。"
     )
     await h2.stop()
-    await h3.stop()
 
 
 CASES = {

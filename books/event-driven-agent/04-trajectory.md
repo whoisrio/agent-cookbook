@@ -224,6 +224,8 @@ class Entry:
 - `read()`：读全文件，返回 `(header, entries, torn)`，撞上残尾停在最后一条完好处；
 - `truncate_torn()`：把残尾字节裁掉——没写完的不算事实。
 
+这里的容错策略是对 pi 的有意偏离：pi 用"临时文件 + 原子重命名"从源头杜绝残尾，读到坏行直接抛错（fail-fast），悬挂调用整条 drop；本项目反过来——容忍残尾、裁掉留痕、投影补占位，理由见 demo 6：修复要可审计，模型要知道缺了什么。
+
 
 ### Trajectory：文件的内存镜像（一棵 entry 树）
 
@@ -331,12 +333,6 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 [系统] 文件头原文：{"type": "session", "version": 1, "id": "992b5c5e…",
        "cwd": "…/sessions/stage04/trajectory-shape", "created": "2026-09-27T07:31:50.685+00:00",
        "note": "", "system_prompt": "你是一个通过工具干活的通用 agent。"}
-[实测] 分叉点：无
-       说明 │ 每条 entry 都是落盘记录的原样形状：五件套（id ← parentId、type、payload），
-             payload 按 type 原样 JSON，不做美化——文件里长什么样，打出来就是什么样。
-       说明 │ header 是文件的第一行（type=session）：sid、工作目录、创建时间、
-             system_prompt 原文——回答"这个会话是谁、用什么开的"。它不是树节点，
-             不占 entry、不进投影，审计/回放时才用。
 ```
 
 ### demo 2 · 从正常轨迹恢复（02-resume-normal）
@@ -367,7 +363,7 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 [用户] 刚才查的是哪个品类？
 [实测] 继续对话：上下文 7 条（system + 恢复的历史 + 新一轮），
        回答：刚才查询的品类是保温杯。
-       说明 │ 恢复没有秘密：读文件重建树 + attach 登记。上下文不是从内存拿的——
+       说明 │ 读文件重建树 + attach 登记。上下文不是从内存拿的——
              每次 LLM 调用前从轨迹投影现算，内存丢了，对话丢不了。
 ```
 
@@ -399,7 +395,7 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
   assistant 库存汇总报告：保温杯 3 件、玻璃杯 17 件…
 [系统] 压缩后的投影（模型实际看到的）：
   system    你是一个通过工具干活的通用 agent。
-  user      <summary>【已完成】已查询并汇总保温杯与玻璃杯的当前库存信息…</summary>
+  user      <summary>【已完成】已执行两类产品（保温杯、玻璃杯）的库存查询，并汇总了结果反馈给用户。\n\n【关键事实与规则】保温杯：3 件（316L 内胆/500ml/磨砂黑）；玻璃杯：17 件（高硼硅/400ml/可微波）。\n\n【副作用】无。\n\n【待办】无明确后续任务，等待用户进一步指令或查询需求。</summary>
   user      继续
   …         （保留窗：最后一轮的原文，tool 配对完整）
        说明 │ 压缩只追加视图标记：compaction 的 payload = summary + keep_from_id
@@ -411,7 +407,10 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 
 ### demo 4 · 压缩之后再 rewind，然后继续对话（04-rewind-after-compact）
 
-先说这个 case 里 agent 在干什么：**用户领了 T-101 任务单，agent 跑三轮（定方案 → 逐项核对）后边界压缩；用户说"换个思路重来"，agent 把指针 rewind 回第一条 user——压缩随之"消失"，旧消息逐字回来，模型从零重新开始；再 branch 回压缩节点，又能回到压缩刚做完那一刻**。同一个文件，两个落点两种视图。
+先说这个 case 里 agent 在干什么：
+用户领了 T-101 任务单，agent 跑三轮（定方案 → 逐项核对）后边界压缩；
+用户希望"换个思路重来"，agent 把指针 rewind 回第一条 user message；
+再 branch 回压缩节点，又能回到压缩刚做完那一刻。同一个文件，两个落点两种视图。
 
 ```text
 [用户] 开始处理 T-101，先定个方案 / 继续 / 继续
@@ -446,17 +445,55 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 
 ### demo 6 · 从有问题的轨迹 resume（06-resume-broken）
 
-先说这个 case 里 agent 在干什么，三个"崩了再回来"的现场：**① agent 正常跑完一轮，文件被砍掉 11 字节（模拟崩在写一半），resume 时停在最后一条完好记录、裁掉残尾续写；② 轨迹里躺着一条"assistant 要了工具结果但结果永远没来"的悬挂调用（崩在工具执行前），resume 后投影补一条自描述占位，模型知道缺了什么；③ EventLog 里剩一个没人答复的审批请求（进程被硬杀），resume 时按未授权闭合**。三个现场全部以"轨迹是唯一真相"为基准。
+先说这个 case 里 agent 在干什么：**demo 主动构造两份不完整的轨迹，各自先摆"坏轨迹"原文、再摆"修好之后"的样子**——
+1. 轨迹1最后一条entry因为agent运行时异常导致没有被完整记录，resume这个session时，删除掉不完整的信息，补上 session_resumed 留痕，并直接补一条 assistant 占位 entry 进轨迹（synthetic 标记区分主动补充）；
+2. 轨迹里躺着一条"assistant 要了工具结果但结果永远没来"的悬挂调用（崩在工具执行前），投影补一条自描述占位，模型知道缺了什么，原文件字节不变。两个现场全部以"轨迹是唯一真相"为基准。
 
 ```text
-[实测] 残尾：完好 4 条 → 砍 11 字节后读到 3 条（停在坏记录之前，torn=True）
-       → resume 裁掉残尾续写，resumed 事件留痕 torn_tail=True
-[实测] 悬挂调用·补占位：投影补了 1 条占位
-       → [UNKNOWN: 会话在工具执行前中断，结果缺失]；原文件字节未变：True
-[实测] 悬挂审批：孤立请求 ap-deadbeef → 闭合 ['ap-deadbeef']；再扫一遍：[]
-       （幂等，闭合过的不再碰）
-       说明 │ 共同纪律：没写完的不算已发生（字节级）；修复只作用于喂给模型
-             的投影（语义级）；补的裁决走 record 留痕，不伪造"当时批过"（审批）。
+# 轨迹1
+[entry] fee3b7b9 ← ∅         session_started  {"by": "store"}
+[entry] 2627956d ← fee3b7b9  model_change     {"model_id": "qwen3.5:4b-32k", …}
+[entry] 856fbbf6 ← 2627956d  message          user 保温杯还有库存吗
+[entry] 89ecc191 ← 856fbbf6  message          assistant → toolCall(query_inventory)
+[entry] 09409dbf ← 89ecc191  message          tool 保温杯：库存 3 件；316L 不锈钢内胆，500ml，杯身磨砂黑。
+[entry] b3648adf ← 09409dbf  message           {"type": "message", "id": "b3648adf",
+       "parentId": "09409dbf", …, "content": "保温杯现在还有库存，现有库存为3件，
+       具体规格是316L不锈钢内胆，容量500ml，杯�                       ← 正文说到一半戛然而止
+[实测] 完好 6 条 → 只读到 5 条（停在坏记录之前，torn=True）。
+       残尾声明的父节点就是上面最后一条 entry——它是没出生的第 6 条，没写完的不算已发生
+[实测] 修好之后：resume 先把残尾字节物理裁掉（文件 1873 → 2155 字节），补 session_resumed 留痕
+       + 主动补一条 assistant 占位 entry 进轨迹，轨迹尾部三条：
+[entry] 09409dbf ← 89ecc191  message          tool（原样还在）
+[entry] 0c81bb4b ← 09409dbf  session_resumed  {"torn_tail": true, "note": "crash 恢复演练"}
+[entry] 19364757 ← 0c81bb4b  message          assistant [UNKNOWN: 会话崩溃在回复写到一半，该回复已丢弃]
+       （"synthetic": true, "note": "主动补充的占位：崩溃时写到一半的回复已被裁掉"）
+[实测] 修好之后的投影（模型实际看到的）——占位已在轨迹里，投影照常透传：
+  system    你是一个通过工具干活的通用 agent。
+  user      保温杯还有库存吗
+  assistant （content=null，等工具结果）
+  tool      保温杯：库存 3 件；316L 不锈钢内胆，500ml，杯身磨砂黑。
+  assistant [UNKNOWN: 会话崩溃在回复写到一半，该回复已丢弃]
+       说明 │ 占位是主动修复，直接进事实层：content 自述"回复已丢弃"，
+             synthetic 标记区分主动补充——模型知道上一条回复没说完，
+             而不是以为对话天然停在 tool 结果。
+
+# 轨迹2
+[实测] 现场二坏轨迹：末尾是 assistant 的 toolCall，底下没有 tool 回执：
+[entry] f8ae067f ← 6dfd8cf6  message          user 把库存改成 45 件
+[entry] 5b1b5674 ← f8ae067f  message          assistant → toolCall(update_inventory)
+[实测] 修好之后的投影（模型实际看到的）：
+  system    你是一个通过工具干活的通用 agent。
+  user      把库存改成 45 件
+  assistant （content=null，等工具结果）
+  tool      [UNKNOWN: 会话在工具执行前中断，结果缺失]
+[实测] 占位只补在投影里，原文件字节未变：True
+       说明 │ 两处的修复分级：现场一是字节级修复（残尾没写完、从来不是事实，
+             物理裁掉重写）；现场二是语义级修复（悬挂调用是已发生的事实，
+             文件一个字节不动，只改投影）。占位都自描述、修复都留痕——
+             轨迹是唯一真相，坏的地方用视图补，修的过程可审计。
+       说明 │ 与 pi 的分歧：pi 原子写入让残尾不可能出现，读到坏数据就抛错、
+             悬挂调用整条 drop；本项目选择容错修复路线——能修就修、
+             修必留痕、模型必须知道缺了什么。是设计选择，不是疏漏。
 ```
 
 

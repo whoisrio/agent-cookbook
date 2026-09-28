@@ -70,6 +70,36 @@ class ScriptedSummarizer:
         return self.texts[idx]
 
 
+COMPRESSION_SYSTEM = (
+    "你是会话压缩器。把给到的对话压成一份摘要，供 agent 之后继续任务用。"
+    "只压缩、不推理、不补没发生过的事。按四段输出："
+    "【已完成】【关键事实与规则】【副作用】【待办】。"
+)
+
+# 摘要调用的 user 消息模板：对话序列化成一段文本，<conversation> 标签包裹
+# ——声明"这是资料，不是对话"，防止模型接话（对齐 pi 的 serializeConversation
+# + 标签包裹）。资料在前、指令收尾，模型最后读到的是"输出摘要"。
+COMPRESSION_USER = """\
+<conversation>
+{conversation}
+</conversation>
+
+输出摘要。"""
+
+# 滚动折叠档：上一刀的摘要以 <previous-summary> 标签跟在对话之后、指令之前
+# （pi 的顺序），指令要求把新内容并入既有摘要（对应 pi 的 UPDATE_SUMMARIZATION_PROMPT）。
+COMPRESSION_USER_UPDATE = """\
+<conversation>
+{conversation}
+</conversation>
+
+<previous-summary>
+{previous_summary}
+</previous-summary>
+
+输出摘要：把 <conversation> 里的新内容并入 <previous-summary>，只输出合并后的完整摘要。"""
+
+
 class LiveSummarizer:
     """真模型摘要：裸 chat——不带工具、max_tokens 封顶。
 
@@ -87,21 +117,16 @@ class LiveSummarizer:
     async def summarize(
         self, segment: list[dict[str, Any]], previous: str | None = None
     ) -> str:
-        system = (
-            "你是会话压缩器。把给到的对话压成一份摘要，供 agent 之后继续任务用。"
-            "只压缩、不推理、不补没发生过的事。按四段输出："
-            "【已完成】【关键事实与规则】【副作用】【待办】。"
-        )
-        lines = []
+        conversation = "\n".join(f"[{m.get('role')}] {_render(m)}" for m in segment)
         if previous:
-            lines.append(f"上一刀的摘要（新摘要要吞掉它）：\n{previous}")
-        lines.append("被压缩的对话：")
-        for m in segment:
-            lines.append(f"[{m.get('role')}] {_render(m)}")
-        lines.append("输出摘要。")
+            user_content = COMPRESSION_USER_UPDATE.format(
+                conversation=conversation, previous_summary=previous
+            )
+        else:
+            user_content = COMPRESSION_USER.format(conversation=conversation)
         messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": "\n".join(lines)},
+            {"role": "system", "content": COMPRESSION_SYSTEM},
+            {"role": "user", "content": user_content},
         ]
         out = await self._collect(messages, self.max_tokens)
         if not out and self.max_tokens is not None:
