@@ -1,16 +1,17 @@
 """Stage 5 压缩策略演示（[project.scripts] 入口：stage05-demo）。
 
-与 05 章 demo 对应。实现与 04 共享一份（import 指向 stage04_trajectory，
-见包 docstring），本章增量（水位自动触发、cap+blob、滚动折叠、分页与
-批次句柄）落地后，依赖它们的段落原地回填：
+与 05 章 demo 对应。实现与 04 共享一份（import 指向 stage04_trajectory），
+压缩机制（水位计量、step 刀口、滚动折叠）已落地，本文件五段：
 
-已可演（真模型，数据落工作目录副本）：
-  01-compact-before-after    压缩前后对照：entry、摘要全文、投影换视图
-  02-compact-fail-open       摘要失败 fail-open：留痕、不 append、下一边界重试
+  01-compact-before-after     压缩前后对照：entry、摘要全文、投影换视图
+  02-compact-fail-open        摘要失败 fail-open：留痕、不 append、下一边界重试
   03-side-effect-not-repeated 副作用不重做：写被压掉之后恰好一次真实写
+  04-watermark-trigger        触发策略对照：token 计量决定“压不压”（demo 1）
+  05-fold-twice               二次折叠：新摘要吞旧摘要、投影认最后一切（demo 4）
 
-待实现回填：触发策略对照（水位计量）、补货任务单（分页 + 批次句柄 +
-水位自动压缩）、cap + blob、二次折叠（投影认最后一刀）。
+“其他影响上下文的一些策略”一章的段落（分页与批次句柄、cap + blob）
+不在本书 demo 范围内，对应章节原计划的 demo 2 / 3 不实现。
+全部真模型（读仓库根 .env，本地 ollama 也行），数据落工作目录副本。
 """
 
 from __future__ import annotations
@@ -25,8 +26,10 @@ from baby_event_driven_agent.stages.stage04_trajectory import tools as tools_mod
 from baby_event_driven_agent.stages.stage04_trajectory.agent import Agent, build_context
 from baby_event_driven_agent.stages.stage04_trajectory.llm import RealLLM
 from baby_event_driven_agent.stages.stage04_trajectory.session.compaction import (
+    CompactionPolicy,
     LiveSummarizer,
     Summarizer,
+    trigger_tokens,
 )
 from baby_event_driven_agent.stages.stage04_trajectory.session.store import SessionStore
 from baby_event_driven_agent.stages.stage04_trajectory.session.trajectory import (
@@ -108,6 +111,20 @@ class EmptyOnceSummarizer:
         return await self.inner.summarize(segment, previous=previous)
 
 
+class RecordingSummarizer:
+    """透传包装：记下每次传入的 previous（上一刀摘要）——观测滚动折叠用。"""
+
+    def __init__(self, inner: Summarizer) -> None:
+        self.inner = inner
+        self.previous: list[str | None] = []
+
+    async def summarize(
+        self, segment: list[dict[str, Any]], previous: str | None = None
+    ) -> str:
+        self.previous.append(previous)
+        return await self.inner.summarize(segment, previous=previous)
+
+
 class Harness:
     """demo 台子：bus + EventLog + store + agent（真模型），外加压缩入口。"""
 
@@ -116,7 +133,7 @@ class Harness:
         workdir: Path,
         *,
         summarizer: Summarizer | None = None,
-        keep_turns: int = 1,
+        policy: CompactionPolicy | None = None,
         llm: Any = None,
     ) -> None:
         self.log = EventLog(str(workdir / "events"))
@@ -125,13 +142,14 @@ class Harness:
         self.system_prompt = "你是一个通过工具干活的通用 agent。"
         self.llm = llm or RealLLM()
         self.timeout = 180.0  # 真模型段放宽等待
+        self.policy = policy or CompactionPolicy(keep_steps=1)
         self.agent = Agent(
             self.bus,
             self.llm,
             store=self.store,
             system_prompt=self.system_prompt,
             summarizer=summarizer,
-            keep_turns=keep_turns,
+            compaction_policy=self.policy,
         )
         # 数据隔离：写操作落工作目录副本，包自带 data/ 一个字节不动
         self._saved_data = use_data_copies(workdir)
@@ -208,7 +226,7 @@ async def case_compact_before_after(workdir: Path) -> None:
         "原文一个字节没删。",
     )
     try:
-        h = Harness(workdir, keep_turns=1)
+        h = Harness(workdir)
     except RuntimeError as exc:
         line("系统", ORANGE, f"跳过真模型段：{exc}")
         return
@@ -264,7 +282,7 @@ async def case_compact_fail_open(workdir: Path) -> None:
     except RuntimeError as exc:
         line("系统", ORANGE, f"跳过真模型段：{exc}")
         return
-    h = Harness(workdir, keep_turns=1, llm=llm, summarizer=EmptyOnceSummarizer(LiveSummarizer(llm)))
+    h = Harness(workdir, llm=llm, summarizer=EmptyOnceSummarizer(LiveSummarizer(llm)))
     for text in ("保温杯还有库存吗", "好的"):
         line("用户", YELLOW, text)
         h.send(text)
@@ -316,7 +334,7 @@ async def case_side_effect_not_repeated(workdir: Path) -> None:
         "全程恰好一次真实 update_inventory。",
     )
     try:
-        h = Harness(workdir, keep_turns=1)
+        h = Harness(workdir)
     except RuntimeError as exc:
         line("系统", ORANGE, f"跳过真模型段：{exc}")
         return
@@ -356,26 +374,178 @@ async def case_side_effect_not_repeated(workdir: Path) -> None:
     note("写操作原文在轨迹和 blob 里随时可查；摘要只负责'别重复做'，不负责事实查询。")
 
 
+# ---------------------------------------------------------------- demo 4：触发策略对照
+
+
+async def case_watermark_trigger(workdir: Path) -> None:
+    """同样跑 4 轮：大结果会话 token 越水位自动压缩，闲聊会话全程不压。
+
+    两个会话都用同一套组合策略（ratio 水位 + step 刀口）：触发看 token
+    （计量 = 真实 usage 锚点 + 轨迹增量估算），下刀看 step（保留窗 tool 配对
+    完整）。纯按步数会把闲聊也误压；纯按 token 会切在消息中间。
+    """
+    try:
+        llm = RealLLM()
+    except RuntimeError as exc:
+        line("系统", ORANGE, f"跳过真模型段：{exc}")
+        return
+    # 真实 usage 为锚（含 system prompt 的基线 ~800 token）：阈值要落在基线
+    # 之上、数轮工具往返能到的地方——纯闲聊到不了，工具会话几轮就越线
+    policy = CompactionPolicy(mode="ratio", window_tokens=2200, watermark=0.7, keep_steps=2)
+    trigger = trigger_tokens(policy)
+
+    # —— 会话 A：多品类查询（每轮并行多个工具往返，token 涨得快）——
+    print(f"\n{BOLD}会话 A：工具往返的查询会话（触发线 {trigger} token）{RESET}")
+    hA = Harness(workdir / "big", llm=llm, policy=policy)
+    compacted_at = None
+    for i, text in enumerate(
+        (
+            "保温杯和玻璃杯的库存都查一下",
+            "马克杯和雨伞呢",
+            "帆布包和围巾呢",
+            "保温壶和不锈钢碗呢",
+            "再把陶瓷餐具查一下",
+        ),
+        1,
+    ):
+        line("用户", YELLOW, text)
+        hA.send(text)
+        await hA.wait_turn()
+        est = hA.agent._meter(hA.sid).estimate(hA.traj)
+        line("计量", BLUE, f"第 {i} 轮后估算 {est} token（触发线 {trigger}）")
+        if hA.compact_events("context_compacted"):
+            compacted_at = i
+            evt = hA.compact_events("context_compacted")[-1]
+            line(
+                "自动压缩",
+                GREEN,
+                f"水位越线，reason={evt.payload['reason']}，"
+                f"消息 {evt.payload['messages_before']} → {evt.payload['messages_after']} 条",
+            )
+            break
+    await hA.stop()
+    if compacted_at is None:
+        line("实测", RED, "未触发（真模型回答偏短，可重跑或调低 window_tokens）")
+
+    # —— 会话 B：闲聊（同样轮数，token 低）——
+    print(f"\n{BOLD}会话 B：闲聊会话（同样的轮数）{RESET}")
+    hB = Harness(workdir / "chat", llm=llm, policy=policy)
+    for text in ("你好呀", "今天店里忙吗", "好的谢谢你"):
+        line("用户", YELLOW, text)
+        hB.send(text)
+        await hB.wait_turn()
+        est = hB.agent._meter(hB.sid).estimate(hB.traj)
+        line("计量", BLUE, f"估算 {est} token（触发线 {trigger}）")
+    await hB.stop()
+    compacted_b = hB.compact_events("context_compacted")
+    b_est = hB.agent._meter(hB.sid).estimate(hB.traj)
+    line(
+        "实测",
+        GREEN if not compacted_b else RED,
+        f"闲聊会话全程未压缩（{'正确' if not compacted_b else '误压了'}，"
+        f"最终估算 {b_est} < 触发线 {trigger}）："
+        "token 计量分辨了大小会话，不会像纯按步数那样误压闲聊",
+    )
+    note(
+        "触发与下刀是两步：token 越水位才触发；触发后刀口落在倒数第 N 个 step "
+        "起点，保留窗 tool 配对完整。两步组合替代了纯步数（误压闲聊）与 "
+        "纯 token（截断消息）两种单一策略。"
+    )
+
+
+# ---------------------------------------------------------------- demo 5：二次折叠
+
+
+async def case_fold_twice(workdir: Path) -> None:
+    """两刀折叠：摘要 B 的输入 = 摘要 A + 增量 step（previous 传递），
+    投影认最后一切——视图里只剩摘要 B，摘要 A 被吞（原文仍在轨迹）。"""
+    try:
+        llm = RealLLM()
+    except RuntimeError as exc:
+        line("系统", ORANGE, f"跳过真模型段：{exc}")
+        return
+    recorder = RecordingSummarizer(LiveSummarizer(llm))
+    h = Harness(workdir, llm=llm, summarizer=recorder, policy=CompactionPolicy(keep_steps=1))
+    for text in ("保温杯还有库存吗", "玻璃杯呢"):
+        line("用户", YELLOW, text)
+        h.send(text)
+        await h.wait_turn()
+
+    line("用户", YELLOW, "（第一刀）上下文有点长了，压一下")
+    h.compact("manual-1")
+    h.send("继续")
+    await h.wait_turn()
+    comps = [e for e in h.traj.entries() if e.type == COMPACTION]
+    if not comps:
+        line("实测", RED, "第一刀未成功（真模型波动，重跑）")
+        await h.stop()
+        return
+    summary_a = str(comps[0].payload["summary"])
+    line("第一刀", GREEN, f"compaction {comps[0].id}，摘要开头：{brief(summary_a, 90)}")
+
+    for text in ("马克杯还有吗", "雨伞呢"):
+        line("用户", YELLOW, text)
+        h.send(text)
+        await h.wait_turn()
+
+    line("用户", YELLOW, "（第二刀）再压一次")
+    h.compact("manual-2")
+    h.send("继续")
+    await h.wait_turn()
+    await h.stop()
+
+    comps = [e for e in h.traj.entries() if e.type == COMPACTION]
+    if len(comps) < 2:
+        line("实测", RED, f"第二刀未成功（共 {len(comps)} 刀，真模型波动，重跑）")
+        return
+    summary_b = str(comps[1].payload["summary"])
+    line("第二刀", GREEN, f"compaction {comps[1].id}，摘要开头：{brief(summary_b, 90)}")
+    folded = recorder.previous[-1] == summary_a if recorder.previous else False
+    line(
+        "折叠",
+        GREEN if folded else RED,
+        f"摘要 B 的输入带着上一刀摘要（previous=摘要A）：{folded}——"
+        "旧摘要被吞，原始全文一次都不重读",
+    )
+    proj = build_context(h.traj)
+    heads = [str(m.get("content", ""))[:30] for m in proj.messages[:2]]
+    only_b = summary_a not in str([m.get("content") for m in proj.messages])
+    line(
+        "投影",
+        BLUE if only_b else RED,
+        f"视图头部：{heads}；视图里只剩摘要 B：{only_b}（认最后一切）",
+    )
+    note(
+        f"全树 {len(h.traj.entries())} 条 entry、两刀 compaction 都在轨迹里："
+        "branch 回第一刀还能回到摘要 A 的视图；投影只认当前路径上最后一刀。"
+    )
+
+
 CASE_ORDER = (
     "01-compact-before-after",
     "02-compact-fail-open",
     "03-side-effect-not-repeated",
+    "04-watermark-trigger",
+    "05-fold-twice",
 )
 CASE_TITLES = {
     "01-compact-before-after": "压缩前后对照：entry + 摘要全文 + 投影换视图",
     "02-compact-fail-open": "摘要失败 fail-open：留痕、不 append、重试成功",
     "03-side-effect-not-repeated": "副作用不重做：写被压掉之后恰好一次真实写",
+    "04-watermark-trigger": "触发策略对照：token 计量决定压不压，闲聊不误压",
+    "05-fold-twice": "二次折叠：新摘要吞旧摘要，投影认最后一切",
 }
 PENDING_NOTE = (
-    "以下段落依赖 05 增量，落地后回填：触发策略对照（水位计量）、"
-    "补货任务单（分页 + 批次句柄 + 水位自动压缩）、cap + blob、"
-    "二次折叠（投影认最后一刀）。"
+    "“其他影响上下文的一些策略”一章的配套段落（分页与批次句柄、cap + blob）"
+    "不在本书 demo 范围内，不实现。"
 )
 
 CASES = {
     "01-compact-before-after": case_compact_before_after,
     "02-compact-fail-open": case_compact_fail_open,
     "03-side-effect-not-repeated": case_side_effect_not_repeated,
+    "04-watermark-trigger": case_watermark_trigger,
+    "05-fold-twice": case_fold_twice,
 }
 
 
@@ -389,7 +559,7 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
         print(f"{GREY}没有匹配的 case：{case_ids}；可选：all, {', '.join(CASE_ORDER)}{RESET}")
         return
 
-    print(f"{BOLD}Stage 05 压缩策略演示 —— 与 05 章 demo 对应（真模型，增量段落待回填）{RESET}")
+    print(f"{BOLD}Stage 05 压缩策略演示 —— 与 05 章 demo 对应（真模型）{RESET}")
     if case_ids and "all" not in case_ids:
         print(f"{GREY}  （只跑：{', '.join(picked)}）{RESET}")
 
@@ -409,7 +579,7 @@ async def main(case_ids: list[str] | None = None, sessions_dir: Path | None = No
 def cli() -> None:
     """[project.scripts] 入口：stage05-demo。
 
-        stage05-demo                       # 三段全跑（全部真模型）
+        stage05-demo                       # 五段全跑（全部真模型）
         stage05-demo 02-compact-fail-open  # 只跑指定段
         stage05-demo --list                # 列 case 及其说明
     """
@@ -421,7 +591,7 @@ def cli() -> None:
     parser.add_argument("--sessions-dir", default=None, help="轨迹落点")
     args = parser.parse_args()
     if args.list:
-        print("all\t三段全跑（全部真模型）")
+        print("all\t五段全跑（全部真模型）")
         for cid in CASE_ORDER:
             print(f"{cid}\t{CASE_TITLES[cid]}")
         return

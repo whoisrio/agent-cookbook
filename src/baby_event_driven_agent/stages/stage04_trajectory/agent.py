@@ -43,7 +43,15 @@ from .transport.events import (
     UserMessage,
 )
 from .tools import TOOLS, Tool, build_system_prompt
-from .session.compaction import LiveSummarizer, Summarizer, maybe_compact
+from .session.compaction import (
+    CompactionPolicy,
+    LiveSummarizer,
+    Summarizer,
+    TokenMeter,
+    maybe_compact,
+    segment_view,
+    trigger_tokens,
+)
 from .session.store import SessionStore
 from .session.trajectory import (
     BRANCH_SUMMARY,
@@ -58,7 +66,9 @@ from .session.trajectory import (
 
 logger = logging.getLogger(__name__)
 
-MAX_STEPS = 4
+# turn 主循环的 step 预算默认值：提为可配置（Agent(max_steps=...)）——长任务
+# 的一 turn 轻松超过十几个 step，写死小数会把任务拦腰截断成多 turn。
+DEFAULT_MAX_STEPS = 20
 
 # 中断收尾用的占位（同 stage03，自描述是硬要求）。
 # 收尾一律补 assistant 占位，只有文本随尾部角色变：
@@ -111,13 +121,14 @@ def build_context(traj: Trajectory) -> Projection:
     entries = traj.path()
     stats = {"path": len(entries), "skipped": 0, "repaired": 0}
 
-    # 压缩口子：路径上的 compaction 决定"摘要 + 跳过区间"。
+    # 压缩口子：路径上的 compaction 决定"摘要 + 跳过区间"。滚动折叠（05）
+    # 之后投影**认最后一切**：新摘要吞掉旧摘要——更早的 compaction 节点
+    # 在最后一切 keep_from 之前，随被压段一起从视图里消失。
     # 切割点不在路径上（比如被 rewind 掉）时，压缩节点当没发生过——
     # 压缩是当前路径上的视图，不是对数据的手术。
-    # 只认第一条：多条的折叠语义归 5b（新摘要吞旧摘要、投影取最后一刀），
-    # 在那之前不要触发第二次压缩——后序 compaction 的摘要会被跳过。
     # 完整语义见 session/trajectory.py 模块 docstring 的"压缩视图"一节。
-    comp = next((e for e in entries if e.type == COMPACTION), None)
+    comps = [e for e in entries if e.type == COMPACTION]
+    comp = comps[-1] if comps else None
     summary_msg: dict[str, Any] | None = None
     kept_ids: set[str] | None = None
     if comp is not None:
@@ -251,7 +262,8 @@ class Agent:
         system_prompt: str | None = None,
         tools: dict[str, Tool] | None = None,
         summarizer: Summarizer | None = None,
-        keep_turns: int = 2,
+        compaction_policy: CompactionPolicy | None = None,
+        max_steps: int = DEFAULT_MAX_STEPS,
     ) -> None:
         self.bus = bus
         self.llm = llm
@@ -260,9 +272,15 @@ class Agent:
         self.system_prompt = system_prompt or SYSTEM_PROMPT
         # 工具表：name → Tool（schema + 实现 + 判量审批声明），测试可注入替身
         self.tools = tools if tools is not None else TOOLS
-        # 手动压缩：摘要器（默认裸 chat 封顶档）+ 保留窗（最近 N 轮）
+        # 压缩：摘要器（默认裸 chat 封顶档）+ 策略（水位 / 保留窗；
+        # 默认窗口为 0 = 只手动压缩）+ step 边界自动触发的计量器（每会话一个）
         self._summarizer = summarizer
-        self.keep_turns = keep_turns
+        self.compaction_policy = compaction_policy or CompactionPolicy()
+        self._meters: dict[str, TokenMeter] = {}
+        # 水位自动压缩的去重标记：上次尝试时的 leaf——没有新 entry 就不重复尝试
+        # （复检不过的会话每个边界都会越线，不能每个边界都白打一次摘要调用）
+        self._auto_compact_tried: dict[str, str] = {}
+        self.max_steps = max_steps
         self._pending_compact: dict[str, str] = {}
         self.trajectories: dict[str, Trajectory] = {}
         self.inboxes: dict[str, asyncio.Queue[Event]] = {}
@@ -290,6 +308,7 @@ class Agent:
         留痕：prompt 变更是事实，不落盘审计就有洞。
         """
         self.trajectories[traj.sid] = traj
+        self._meters.setdefault(traj.sid, TokenMeter())
         recorded = str(traj.header.get("system_prompt", ""))
         for e in traj.path():
             if e.type == PROMPT_CHANGE and e.payload.get("system_prompt"):
@@ -322,7 +341,10 @@ class Agent:
         """当前上下文（投影）：demo / 测试观测用，agent 自己在 step 前现算。"""
         return self.build_context(self._traj(sid)).messages
 
-    # -------------------------------------------------- 手动压缩：第四种边界动作
+    # -------------------------------------------------- 压缩：手动 + 水位自动
+
+    def _meter(self, sid: str) -> TokenMeter:
+        return self._meters.setdefault(sid, TokenMeter())
 
     def _summarizer_for(self) -> Summarizer:
         """摘要器：外部注入优先（测试用 ScriptedSummarizer），默认裸 chat 封顶档。"""
@@ -330,61 +352,44 @@ class Agent:
 
     @staticmethod
     def _prefix_view(traj: Trajectory, keep_from_id: str) -> list[dict[str, Any]]:
-        """被压段的视图消息：刀口之前的 entries，按 build_context 同一份分派规则
-        （message 1:1、branch_summary 变 <summary>、状态节点不产生消息、元数据跳过）。
-
-        前缀里没有 compaction（maybe_compact 拒绝第二刀），不走压缩分支。
-        不做 sanitize：摘要会渲染成文本喂给摘要模型，不进 chat 消息序列，
-        孤儿工具结果也读得懂。
+        """被压段的视图消息（demo / 观测用）——实现在 compaction.segment_view：
+        刀口之前的 entries 按同一份分派规则渲染（message 1:1、branch_summary 变
+        <summary>、状态节点不产生消息、元数据与更早的 compaction 跳过）。
         """
-        entries = traj.path()
-        ki = next((i for i, e in enumerate(entries) if e.id == keep_from_id), None)
-        if ki is None:
-            return []
-        raw: list[dict[str, Any]] = []
-        for e in entries[:ki]:
-            if e.type == MESSAGE:
-                msg = dict(e.payload.get("message", {}))
-                if msg.get("role") == "system":
-                    continue  # system 是参数不是事实
-                if e.payload.get("synthetic") or e.payload.get("note"):
-                    msg["synthetic"] = bool(e.payload.get("synthetic"))
-                    msg["note"] = str(e.payload.get("note", ""))
-                raw.append(msg)
-            elif e.type == BRANCH_SUMMARY:
-                raw.append(
-                    {"role": "user", "content": f"<summary>{e.payload.get('summary', '')}</summary>"}
-                )
-        return raw
+        return segment_view(traj, keep_from_id)
 
     async def _compact(self, sid: str, traj: Trajectory, *, reason: str = "manual") -> None:
-        """手动压缩：step 边界处换一副更短的视图，下一次 build_context 自动生效。
+        """压缩（手动命令或水位自动）：step 边界处换一副更短的视图。
 
         只作用于视图，不改事实层：追加一个 compaction entry（摘要 + 刀口），
         原文全在轨迹里。摘要调用失败 fail-open：留痕、不 append、不挡 turn，
-        下一个边界可重试。已有压缩时拒绝第二刀（折叠语义归 05）。
+        下一个边界可重试。已有压缩时滚动折叠（第二刀吞掉第一刀）。
         EventLog 记的是"什么时候、因为什么、压了多少"，与轨迹的 entry 各答各的。
         """
         before = len(self.build_context(traj).messages)
         try:
             entry = await maybe_compact(
                 traj,
+                self.compaction_policy,
                 self._summarizer_for(),
-                keep_turns=self.keep_turns,
                 reason=reason,
-                prefix_view=self._prefix_view,
+                tokens_now=self._meter(sid).estimate(traj),
             )
         except Exception as exc:  # noqa: BLE001 - fail-open：压缩救不了自己时不挡 turn
             await self._emit(
                 "context_compact_failed", sid, {"reason": reason, "error": str(exc)}
             )
             return
+        finally:
+            # 无论成败都记下这次尝试的 leaf：失败后没有新 entry 就不重复尝试
+            self._auto_compact_tried[sid] = traj.leaf_id or ""
         if entry is None:
-            await self._emit(
-                "context_compact_failed",
-                sid,
-                {"reason": reason, "error": "无可压缩段（轮数不足）或已有压缩（折叠归 05）"},
-            )
+            if reason != "watermark":
+                await self._emit(
+                    "context_compact_failed",
+                    sid,
+                    {"reason": reason, "error": "无可压缩段（保留窗已覆盖全部 step / 纯聊天轮数不足）"},
+                )
             return
         after = len(self.build_context(traj).messages)
         await self._emit(
@@ -394,11 +399,27 @@ class Agent:
                 "entry_id": entry.id,
                 "keep_from_id": entry.payload.get("keep_from_id"),
                 "reason": reason,
+                "policy_version": entry.payload.get("policy_version"),
                 "messages_before": before,
                 "messages_after": after,
                 "summary": str(entry.payload.get("summary", "")),
             },
         )
+
+    async def _auto_compact(self, sid: str, traj: Trajectory) -> None:
+        """水位自动压缩：step 边界计量（锚点 + 轨迹增量），越线则 maybe_compact。
+
+        同一个 leaf 上只尝试一次：复检不过的会话每个边界都会越线，没有新
+        entry（没有新信息）时重复尝试只会白打摘要调用。
+        """
+        trigger = trigger_tokens(self.compaction_policy)
+        if trigger is None:
+            return
+        if self._auto_compact_tried.get(sid) == (traj.leaf_id or ""):
+            return
+        if self._meter(sid).estimate(traj) <= trigger:
+            return
+        await self._compact(sid, traj, reason="watermark")
 
     # -------------------------------------------------- outbound：只有一条路
 
@@ -621,6 +642,9 @@ class Agent:
                 if chunk.get("name"):
                     tc["name"] = chunk["name"]
                 tc["args"] += chunk.get("args_delta", "")
+            elif chunk["type"] == "usage":
+                # 尾部 usage 块（include_usage）：计量锚点的来源
+                partial["usage"] = chunk
         if tool_calls:
             return {
                 "role": "assistant",
@@ -646,6 +670,7 @@ class Agent:
         """
         partial["text_parts"] = []
         partial["tool_calls"] = {}
+        partial["usage"] = None
         self._phase[sid] = "stream"
         context = self.build_context(traj).messages
         msg = await self._step(sid, context, partial)
@@ -817,8 +842,8 @@ class Agent:
             self._pending_compact.pop(sid, None)
 
     async def _run_steps(self, sid: str, traj: Trajectory) -> None:
-        """turn 主循环：step 边界查中断、查压缩、跑一步、结算。"""
-        for _ in range(MAX_STEPS):
+        """turn 主循环：step 边界查中断 → 计量（越线则压缩）→ drain steering → 跑一步。"""
+        for _ in range(self.max_steps):
             pending = self._pending_interrupt.pop(sid, None)
             if pending is not None:
                 if pending.get("text"):
@@ -841,8 +866,13 @@ class Agent:
                 # 第四种边界动作：换一副更短的视图，再发下一次调用。
                 # 不消耗 step 预算；摘要失败 fail-open，不挡 turn。
                 await self._compact(sid, traj, reason=compact_reason)
+            else:
+                # 水位自动压缩：计量（锚点 + 轨迹增量）越线才动手，
+                # 手动命令与自动检测同一个通道（_compact）。
+                await self._auto_compact(sid, traj)
             await self._drain_steering(sid, traj)
             partial: dict[str, Any] = {}
+            call_leaf = traj.leaf_id  # 本次调用发出时的轨迹末端：usage 锚点落在这里
             step_task = asyncio.create_task(self._run_step(sid, traj, partial))
             self._inflight[sid] = step_task
             try:
@@ -866,6 +896,12 @@ class Agent:
                     self._inflight[sid] = None
             # append 只发生在 step 成功结算之后：被掐的 step 不留半截消息
             traj.append(MESSAGE, message_payload(msg))
+            # usage 锚定：真实 prompt_tokens 记在"发起调用时"的 leaf 上，
+            # 之后的轨迹增量用字符估算（见 compaction.TokenMeter）。
+            # 最终答复步（无工具结果）也在此处锚定——它往往是上下文最长的一次调用。
+            usage = partial.get("usage")
+            if usage and usage.get("prompt_tokens"):
+                self._meter(sid).anchor(call_leaf, int(usage["prompt_tokens"]))
             if not tool_results:
                 await self._end_turn(sid, "turn end")
                 return

@@ -3,9 +3,9 @@
 压缩的投影语义（刀口前跳过、摘要插最前、认第一刀）在 5a 已测
 （test_stage04_trajectory.py）；这里测的是机制层：
 
-- cut_before_turn：刀口落在倒数第 N 轮的第一条真实 user entry；合成 user 不算开轮；
-  轮数不足返回 None
-- maybe_compact：已有压缩拒绝第二刀（折叠归 05）；摘要输入 = 刀口前视图
+- cut_before_turn：纯聊天退路的刀口，落在倒数第 N 轮的第一条真实 user entry；
+  合成 user 不算开轮；轮数不足返回 None（step 刀口在 test_stage05_mechanism.py）
+- maybe_compact：第二刀滚动折叠（新摘要吞旧摘要，不再拒绝）；摘要输入 = 刀口前视图
   （含 branch_summary 的 <summary>——"摘要吞摘要"）
 - LiveSummarizer：裸 chat（tools=None）+ max_tokens 封顶，渲染含工具调用发起
 - agent 端到端：compact_request → step 边界压缩 → 下一次调用就是新视图
@@ -36,6 +36,7 @@ from baby_event_driven_agent.stages.stage03c_agent.main import (
 )
 # 长任务剧本定义在 3c（04/05 骑在 3c 的场景上，见 00-outline）
 from baby_event_driven_agent.stages.stage04_trajectory.session.compaction import (
+    CompactionPolicy,
     LiveSummarizer,
     ScriptedSummarizer,
     cut_before_turn,
@@ -111,25 +112,37 @@ def test_cut_before_turn_ignores_synthetic_user(workdir: Path) -> None:
 # ------------------------------------------------------------------ maybe_compact
 
 
-def test_maybe_compact_refuses_second_cut(workdir: Path) -> None:
+def test_maybe_compact_second_cut_folds(workdir: Path) -> None:
+    """第二刀滚动折叠：不再拒绝，新摘要吞掉旧摘要，投影认最后一切。"""
     traj = _hand_traj(workdir, "c.jsonl")
-    summarizer = ScriptedSummarizer(["摘要一"])
-    entry = asyncio.run(
-        maybe_compact(traj, summarizer, keep_turns=1, prefix_view=Agent._prefix_view)
-    )
+    summarizer = ScriptedSummarizer(["摘要一", "摘要二"])
+    policy = CompactionPolicy(keep_steps=1)
+    entry = asyncio.run(maybe_compact(traj, policy, summarizer, reason="manual"))
     assert entry is not None
-    second = asyncio.run(
-        maybe_compact(traj, summarizer, keep_turns=1, prefix_view=Agent._prefix_view)
-    )
-    assert second is None  # 拒绝第二刀：折叠语义归 05
-    assert [e.type for e in traj.entries()].count(COMPACTION) == 1
+    # 增量：再补两轮（第一刀后保留窗里只有一轮，可压段必须在新增量里）
+    _user_entry(traj, "第四轮")
+    traj.append(MESSAGE, message_payload({"role": "assistant", "content": "答四"}))
+    _user_entry(traj, "第五轮")
+    traj.append(MESSAGE, message_payload({"role": "assistant", "content": "答五"}))
+    second = asyncio.run(maybe_compact(traj, policy, summarizer, reason="manual"))
+    assert second is not None  # 第二刀成功（旧语义是拒绝）
+    assert summarizer.previous[-1] == "摘要一"  # 上一刀摘要作为 previous 传入
+    assert [e.type for e in traj.entries()].count(COMPACTION) == 2
+    # 投影认最后一切：视图里只剩摘要二
+    from baby_event_driven_agent.stages.stage04_trajectory.agent import build_context
+
+    proj = build_context(traj)
+    assert "摘要二" in str(proj.messages[0]["content"])
+    assert not any("摘要一" in str(m.get("content")) for m in proj.messages)
 
 
 def test_maybe_compact_nothing_to_compress(workdir: Path) -> None:
     traj = _new_traj(workdir, "d.jsonl")
     _user_entry(traj, "唯一一轮")
     entry = asyncio.run(
-        maybe_compact(traj, ScriptedSummarizer(["x"]), keep_turns=2, prefix_view=Agent._prefix_view)
+        maybe_compact(
+            traj, CompactionPolicy(keep_steps=2), ScriptedSummarizer(["x"]), reason="manual"
+        )
     )
     assert entry is None
 
@@ -144,7 +157,7 @@ def test_maybe_compact_segment_includes_branch_summary(workdir: Path) -> None:
     _user_entry(traj, "重来的第二轮")
     summarizer = ScriptedSummarizer(["摘要"])
     entry = asyncio.run(
-        maybe_compact(traj, summarizer, keep_turns=1, prefix_view=Agent._prefix_view)
+        maybe_compact(traj, CompactionPolicy(keep_steps=1), summarizer, reason="manual")
     )
     assert entry is not None
     seg_texts = [str(m.get("content")) for m in summarizer.segments[0]]
@@ -338,14 +351,13 @@ def test_manual_compaction_end_to_end(workdir: Path, data_copies: None) -> None:
         assert len(comps) == 1
         assert comps[0].payload["summary"].startswith("【已完成】")
         assert comps[0].payload["reason"] == "manual"
-        real_users = [
+        # 刀口 = 倒数第 keep_steps(默认 3) 个 step 起点（step = 带 tool_calls 的 assistant）
+        step_starts = [
             e
             for e in traj.path()
-            if e.type == MESSAGE
-            and e.payload["message"]["role"] == "user"
-            and not e.payload.get("synthetic")
+            if e.type == MESSAGE and e.payload["message"].get("tool_calls")
         ]
-        assert comps[0].payload["keep_from_id"] == real_users[-2].id
+        assert comps[0].payload["keep_from_id"] == step_starts[-3].id
         # 事件：恰好一次成功，消息数下降
         compacted = [e for e in events if e.type == "context_compacted"]
         failed = [e for e in events if e.type == "context_compact_failed"]
@@ -378,7 +390,7 @@ def test_resume_after_compaction_restores_compacted_view(workdir: Path) -> None:
     traj.append(MESSAGE, message_payload({"role": "assistant", "content": "答二"}))
     _user_entry(traj, "第三轮：核对围巾")
     entry = asyncio.run(
-        maybe_compact(traj, summarizer, keep_turns=1, reason="manual", prefix_view=Agent._prefix_view)
+        maybe_compact(traj, CompactionPolicy(keep_steps=1), summarizer, reason="manual")
     )
     assert entry is not None
     # 崩在工具执行前：assistant 要了围巾的数据，结果永远没来

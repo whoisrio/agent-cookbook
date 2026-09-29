@@ -46,7 +46,7 @@ from .llm import RealLLM
 from .transport.bus import EventBus
 from .transport.events import Event, Subscription, OBSERVE
 from .transport.persistence import EventLog
-from .session.compaction import Summarizer, maybe_compact
+from .session.compaction import CompactionPolicy, Summarizer, maybe_compact
 from .session.store import SessionStore, session_facts
 from .session.trajectory import (
     COMPACTION,
@@ -142,7 +142,7 @@ class Harness:
         workdir: Path,
         *,
         summarizer: Summarizer | None = None,
-        keep_turns: int = 2,
+        policy: CompactionPolicy | None = None,
         isolated: bool = False,
     ) -> None:
         self.log = EventLog(str(workdir / "events"))
@@ -157,7 +157,7 @@ class Harness:
             store=self.store,
             system_prompt=self.system_prompt,
             summarizer=summarizer,
-            keep_turns=keep_turns,
+            compaction_policy=policy,
         )
         # 数据隔离：写操作落工作目录副本，包自带 data/ 一个字节不动（真模型自主决策，可能写）
         self._saved_data: dict[str, Path] | None = use_data_copies(workdir) if isolated else None
@@ -368,7 +368,7 @@ async def case_compact(workdir: Path) -> None:
         "原文一个字节不删；之后的投影自动变成 [system, <摘要>, 保留窗…]。",
     )
     try:
-        h = Harness(workdir, keep_turns=1, isolated=True)
+        h = Harness(workdir, policy=CompactionPolicy(keep_steps=1), isolated=True)
     except RuntimeError as exc:
         line("系统", ORANGE, f"跳过真模型段：{exc}")
         return
@@ -377,19 +377,21 @@ async def case_compact(workdir: Path) -> None:
         h.send(text)
         await h.wait_turn()
 
-    p_before = len(build_context(h.traj).messages)
     line("用户", YELLOW, "上下文有点长了，压一下（compact_request，下一个边界生效）")
     h.bus.publish(Event("compact_request", h.sid, {"reason": "manual"}), to=h.agent.agent_id)
     line("用户", YELLOW, "继续")
     h.send("继续")
     await h.wait_turn()
 
-    p_after = len(build_context(h.traj).messages)
+    # 报账口径用 context_compacted 事件（agent 在 append 前后各量一次，同一切口）；
+    # 不能隔着"继续"那个 turn 量前后——那会把新 turn 的消息混进对比里。
+    compacted = next(e for e in h.events if e.type == "context_compacted")
     comp = next(e for e in h.traj.entries() if e.type == COMPACTION)
     line(
         "实测",
         GREEN,
-        f"边界压缩：投影 {p_before} → {p_after} 条消息；compaction entry {comp.id}"
+        f"边界压缩：投影 {compacted.payload['messages_before']} → "
+        f"{compacted.payload['messages_after']} 条消息；compaction entry {comp.id}"
         f"（keep_from={comp.payload['keep_from_id']}，reason={comp.payload['reason']}）——"
         f"被压的原文一个字节没动：全树 {len(h.traj.entries())} 条 entry 都在",
     )
@@ -406,8 +408,8 @@ async def case_compact(workdir: Path) -> None:
     await h.stop()
     note(
         "压缩只追加视图标记：compaction 的 payload = summary + keep_from_id"
-        "（从哪条起原样保留）。投影遇到它：刀口之前跳过、摘要插在 system 之后、"
-        "只认当前路径上第一条（折叠语义归 05）。"
+        "（从哪条起原样保留，step 起点）。投影遇到它：刀口之前跳过、摘要插在"
+        "system 之后、认最后一切（05 滚动折叠：再压一刀时新摘要吞掉旧的）。"
     )
 
 
@@ -425,7 +427,7 @@ async def case_rewind_after_compact(workdir: Path) -> None:
         "回到压缩刚做完那一刻的视图。",
     )
     try:
-        h = Harness(workdir, keep_turns=1, isolated=True)
+        h = Harness(workdir, policy=CompactionPolicy(keep_steps=1), isolated=True)
     except RuntimeError as exc:
         line("系统", ORANGE, f"跳过真模型段：{exc}")
         return
@@ -437,10 +439,9 @@ async def case_rewind_after_compact(workdir: Path) -> None:
     # —— 边界压缩（触发机制见 demo 3，这里直接在边界做一刀，聚焦 rewind）——
     comp = await maybe_compact(
         h.traj,
+        CompactionPolicy(keep_steps=1),
         h.agent._summarizer_for(),
-        keep_turns=1,
         reason="manual",
-        prefix_view=Agent._prefix_view,
     )
     assert comp is not None
     line(

@@ -44,12 +44,13 @@ prompt_change 是本项目对 pi 的偏离（pi 的 system prompt 在 harness，
      但它代表的是最前面那段被压掉的历史——树上位置和视图位置相反，
      `insert(0)` 修正这一点，最终顺序是 [summary, 保留段...]；
   3. **keep_from_id 必须在当前路径上**，不在（比如被 rewind 掉）则压缩
-     节点按元数据跳过；且切割点要选在**序列合法的边界**（一轮的开头）——
-     选在 turn 中间，保留段以孤儿 tool 结果开头，会被 sanitize 丢弃；
-  4. **多次压缩：当前只认路径上第一条**，其后 compaction 的摘要被跳过
-     （保留段原文都在，不丢信息，只是该压的没压掉）。折叠语义——新摘要
-     必须吞掉旧摘要、投影取最后一刀——归 5b 定义，在此之前不要触发
-     第二次压缩。
+     节点按元数据跳过；且切割点要选在**序列合法的边界**（step 起点 /
+     turn 起点）——选在序列中间，保留段以孤儿 tool 结果开头，会被
+     sanitize 丢弃；
+  4. **多次压缩：投影认最后一切（05 滚动折叠）**。新摘要吞掉旧摘要：
+     最后一切的 keep_from 之前的全部 entry（含更早的 compaction 节点）
+     从视图消失，新摘要插最前。被吞掉的旧摘要随时可以 branch 回去——
+     它还在轨迹里。
 """
 
 from __future__ import annotations
@@ -67,7 +68,7 @@ from typing import Any
 # 第一组：进上下文（最终变成 messages 里的一项）
 MESSAGE = "message"  # user / assistant / tool；一条 assistant 是一个节点
 BRANCH_SUMMARY = "branch_summary"  # 被抛弃分支的摘要：遗言，不是真实对话
-COMPACTION = "compaction"  # 压缩摘要 + 切割点（触发逻辑归 5b，这里留口子）
+COMPACTION = "compaction"  # 压缩摘要 + 切割点（投影语义见模块 docstring 的"压缩视图"）
 
 # 第二组：改状态（不产生消息，覆盖式提取）
 MODEL_CHANGE = "model_change"

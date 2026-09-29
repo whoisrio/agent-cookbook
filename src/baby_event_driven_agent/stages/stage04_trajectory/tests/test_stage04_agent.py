@@ -533,7 +533,9 @@ def test_long_task_offline_end_to_end(workdir: Path) -> None:
             return [len(ctx) for ctx in h.agent.llm.contexts]
 
         counts = run(go())
-        assert h.agent.llm.calls == len(LONG_TASK_SCRIPT)  # 19 步全部跑完
+        # 19 步全部跑完：max_steps 默认 20 后，一 turn 能跑完整张单（前 3 轮耗尽
+        # 剧本，后两轮重放末条剧本收尾）——不再被旧的 4 步上限拦腰截断
+        assert h.agent.llm.calls >= len(LONG_TASK_SCRIPT)
         decided = [e for e in h.events if e.type == "approval_decided"]
         assert [e.payload.get("action") for e in decided] == ["deny"]  # 审批恰好一次且被拒
         assert all(b >= a for a, b in zip(counts, counts[1:]))  # 上下文单调只增不减

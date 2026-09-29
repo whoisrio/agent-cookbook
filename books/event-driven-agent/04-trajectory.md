@@ -369,40 +369,31 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 
 ### demo 3 · 触发压缩之后的操作（03-compact）
 
-先说这个 case 里 agent 在干什么：**用户连问三轮（保温杯 → 玻璃杯 → 汇总），agent 每轮都发起工具调用、一轮轮把上下文堆长；用户喊压一下，agent 在下一个 step 边界把前两轮压成一份摘要**——追加一个 compaction entry（摘要 + 刀口 keep_from_id），原文一个字节不删；之后的"继续"，模型看到的就是 [system, <摘要>, 保留窗] 的短视图。压缩了哪些，三样东西摆在一起看：compaction entry 原文、被压进摘要的消息清单、压缩后的投影。
+先说这个 case 里 agent 在干什么：**用户连问三轮（保温杯 → 玻璃杯 → 汇总），agent 每轮都发起工具调用、一轮轮把上下文堆长；用户喊压一下，agent 在下一个 step 边界把刀口之前的历史压成一份摘要**——追加一个 compaction entry（摘要 + 刀口 keep_from_id），原文一个字节不删；之后的"继续"，模型看到的就是 [system, <摘要>, 保留窗] 的短视图。压缩了哪些，三样东西摆在一起看：compaction entry 原文、被压进摘要的消息清单、压缩后的投影。
 
 ```text
 [用户] 保温杯还有库存吗 / 玻璃杯呢 / 帮我汇总一下
 [用户] 上下文有点长了，压一下（compact_request，下一个边界生效）
 [用户] 继续
-[实测] 边界压缩：投影 11 → 13 条消息；compaction entry 6edb5431
-       （keep_from=2b46d2c5，reason=manual）——被压的原文一个字节没动：全树 24 条 entry 都在
-[entry] {"type": "compaction", "id": "6edb5431", "parentId": "2b46d2c5", …,
-       "payload": {"summary": "【已完成】已查询并汇总保温杯与玻璃杯的当前库存信息。
-                    【关键事实与规则】保温杯：库存 3 件（316L 不锈钢内胆，500ml，磨砂黑）；
-                    玻璃杯：库存 17 件（高硼硅玻璃，400ml，可进微波炉）。…",
-                   "keep_from_id": "2b46d2c5", "reason": "manual"}}
+[实测] 边界压缩：投影 12 → 8 条消息；compaction entry 85c7d9c7
+       （keep_from=7230db7a，reason=manual）——被压的原文一个字节没动：全树 17 条 entry 都在
+[entry] {"type": "compaction", "id": "85c7d9c7", "parentId": "31f1116a", …,
+       "payload": {"summary": "已完成：保温杯库存查询执行完成，已确认库存数据。
+                    关键事实与数据：query_inventory({"category": "保温杯"}) →
+                    库存 3 件（316L 不锈钢内胆，500ml，杯身磨砂黑）；副作用：无；
+                    待办：用户已请求查询"玻璃杯"库存信息，但对应工具调用未在
+                    历史中出现，需保留该需求以待后续处理。",
+                   "keep_from_id": "7230db7a", "reason": "manual"}}
 [系统] 被压进摘要的消息（keep_from 之前，原文仍在轨迹里）：
   user      保温杯还有库存吗
   assistant → toolCall(query_inventory)
   tool      保温杯：库存 3 件；316L 不锈钢内胆，500ml，杯身磨砂黑。
-  assistant 保温杯目前有 3 件的库存。规格：316L 不锈钢内胆，500ml，杯身磨砂黑
+  assistant 保温杯现在还有库存，共 **3 件**（316L 不锈钢内胆，500ml，磨砂黑）
   user      玻璃杯呢
-  assistant → toolCall(query_inventory)
-  tool      玻璃杯：库存 17 件；高硼硅玻璃，400ml，可进微波炉。
-  assistant 玻璃杯目前有 17 件的库存。规格：高硼硅玻璃，400ml，可进微波炉
-  user      帮我汇总一下
-  assistant 库存汇总报告：保温杯 3 件、玻璃杯 17 件…
 [系统] 压缩后的投影（模型实际看到的）：
   system    你是一个通过工具干活的通用 agent。
-  user      <summary>【已完成】已执行两类产品（保温杯、玻璃杯）的库存查询，并汇总了结果反馈给用户。\n\n【关键事实与规则】保温杯：3 件（316L 内胆/500ml/磨砂黑）；玻璃杯：17 件（高硼硅/400ml/可微波）。\n\n【副作用】无。\n\n【待办】无明确后续任务，等待用户进一步指令或查询需求。</summary>
-  user      继续
-  …         （保留窗：最后一轮的原文，tool 配对完整）
-       说明 │ 压缩只追加视图标记：compaction 的 payload = summary + keep_from_id
-             （从哪条起原样保留）。投影遇到它：刀口之前跳过、摘要插在 system 之后、
-             只认当前路径上第一条（折叠语义归 05）。
-       说明 │ 这轮保留窗（最后一轮）比被压段还长，条数没降反升——压缩的收益
-             取决于被压段和保留窗的实际长度，机制本身不变。
+  user      <summary>已完成：保温杯库存查询执行完成…（全文见 entry）</summary>
+  …         保留的用户消息
 ```
 
 ### demo 4 · 压缩之后再 rewind，然后继续对话（04-rewind-after-compact）

@@ -33,6 +33,7 @@ import pytest
 from baby_event_driven_agent.stages.stage04_trajectory import tools as tools_mod
 from baby_event_driven_agent.stages.stage04_trajectory.agent import Agent, build_context
 from baby_event_driven_agent.stages.stage04_trajectory.llm import RealLLM
+from baby_event_driven_agent.stages.stage04_trajectory.session.compaction import CompactionPolicy
 from baby_event_driven_agent.stages.stage04_trajectory.session.store import SessionStore
 from baby_event_driven_agent.stages.stage04_trajectory.session.trajectory import COMPACTION
 from baby_event_driven_agent.stages.stage04_trajectory.transport.bus import EventBus
@@ -43,10 +44,11 @@ from baby_event_driven_agent.stages.stage04_trajectory.transport.events import (
 )
 from baby_event_driven_agent.stages.stage04_trajectory.transport.persistence import EventLog
 
-# 单个 turn 的等待上限：真模型 + 压缩调用（摘要可能重试一次）都比普通 turn 慢
-TIMEOUT = 240.0
+# 单个 turn 的等待上限：真模型 + 压缩调用（摘要可能重试一次）都比普通 turn 慢。
+# 本地思考型模型（qwen3.5 系）单次摘要 thinking 可达 1~2 分钟，重试翻倍，给足余量。
+TIMEOUT = 420.0
 # 一个用例的整体上限
-TOTAL_TIMEOUT = 1200.0
+TOTAL_TIMEOUT = 1800.0
 
 
 @pytest.fixture()
@@ -83,11 +85,17 @@ def real_llm() -> Any:
 class Harness:
     """真模型 agent + 事件观测：turn_end / tool_result / agent_reply / 压缩事件。"""
 
-    def __init__(self, workdir: Path, llm: Any, *, keep_turns: int = 1) -> None:
+    def __init__(self, workdir: Path, llm: Any, *, policy: Any | None = None) -> None:
         self.log = EventLog(str(workdir / "events"))
         self.bus = EventBus(self.log)
         self.store = SessionStore(workdir / "sessions")
-        self.agent = Agent(self.bus, llm, store=self.store, keep_turns=keep_turns)
+        # 默认 keep_steps=1：保留窗最小，压缩收益看得见
+        self.agent = Agent(
+            self.bus,
+            llm,
+            store=self.store,
+            compaction_policy=policy or CompactionPolicy(keep_steps=1),
+        )
         self.traj = self.store.start(cwd=str(workdir))
         self.sid = self.agent.attach(self.traj)
         self.ended = asyncio.Event()
@@ -287,7 +295,7 @@ def test_compacted_write_is_not_repeated(
     断言：全程恰好一次真实 update_inventory；落库值正确（设值语义）；
     压缩确实发生（写操作落在被压段）。
     """
-    h = Harness(workdir, real_llm, keep_turns=1)
+    h = Harness(workdir, real_llm)
 
     async def go() -> None:
         await h.run_turns(["把保温杯的库存改成 10 件", "玻璃杯还有多少", "好的，先这样"])

@@ -61,11 +61,17 @@ class RealLLM:
         max_tokens: int | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """流式对话。默认带全部工具；摘要调用传 tools=None（裸 chat）+
-        max_tokens 封顶——摘要写太长，压了等于没压。"""
+        max_tokens 封顶——摘要写太长，压了等于没压。
+
+        include_usage：请求尾部多一个 choices 为空的 usage 块，归一化成
+        {"type": "usage"} 吐出——压缩计量以这个真实 prompt_tokens 为锚
+        （见 session/compaction.py 的 TokenMeter）。
+        """
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if tools:
             kwargs["tools"] = tools
@@ -73,6 +79,14 @@ class RealLLM:
             kwargs["max_tokens"] = max_tokens
         stream = await self._client.chat.completions.create(**kwargs)
         async for chunk in stream:
+            # usage 块 choices 为空，先于 choices 守卫检查，否则会被跳过
+            usage = getattr(chunk, "usage", None)
+            if usage is not None and getattr(usage, "prompt_tokens", None):
+                yield {
+                    "type": "usage",
+                    "prompt_tokens": int(usage.prompt_tokens),
+                    "completion_tokens": int(usage.completion_tokens or 0),
+                }
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
