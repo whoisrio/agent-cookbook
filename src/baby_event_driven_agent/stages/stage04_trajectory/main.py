@@ -47,7 +47,7 @@ from .transport.bus import EventBus
 from .transport.events import Event, Subscription, OBSERVE
 from .transport.persistence import EventLog
 from .session.compaction import CompactionPolicy, Summarizer, maybe_compact
-from .session.store import SessionStore, session_facts
+from .session.store import SessionStore
 from .session.trajectory import (
     COMPACTION,
     MESSAGE,
@@ -246,8 +246,8 @@ async def case_trajectory_shape(workdir: Path) -> None:
     note(
         "这一轮的 agent loop：用户问库存 → LLM 发起工具调用 → agent 执行工具 → "
         "LLM 拿到结果回复，四步各记一条 message entry；加上开头的 "
-        "session_started（会话开始）与 model_change（模型选择），"
-        f"就是上面的 {len(entries)} 条 entry。"
+        "model_change（模型选择），就是上面的 "
+        f"{len(entries)} 条 entry。"
     )
     line("系统", ORANGE, f"文件头原文：{json.dumps(header, ensure_ascii=False)}")
     note(
@@ -297,34 +297,35 @@ async def case_resume_normal(workdir: Path) -> None:
     )
 
     sid = h.sid
-    h.store.close(h.traj, reason="第一段对话结束")
     before = build_context(h.traj)
+    bytes_before = h.traj.log.raw_bytes()
     line(
         "实测",
         GREEN,
-        f"关闭时：投影 {len(before.messages)} 条消息；进程到此结束，内存里什么都可以扔了",
+        f"第一段结束：投影 {len(before.messages)} 条消息；进程到此结束，内存里什么都可以扔了",
     )
 
     # —— 进程重启：新 store / 新 agent，手里只有 sid ——
     store2 = SessionStore(workdir / "sessions")
-    traj2 = store2.resume(sid, note="进程重启后恢复")
+    traj2 = store2.resume(sid)
+    line(
+        "实测",
+        GREEN,
+        f"resume 重建树：{len(traj2.entries())} 条 entry（原 {n_entries} 条；"
+        f"正常 resume 一个 entry 都不追加、文件字节不变："
+        f"{traj2.log.raw_bytes() == bytes_before}）",
+    )
     agent2 = Agent(h.bus, h.llm, agent_id="agent-2", store=store2, system_prompt=h.system_prompt)
     agent2.attach(traj2)
     after = build_context(traj2)
     line(
         "实测",
         GREEN,
-        f"resume 重建树：{len(traj2.entries())} 条 entry（原 {n_entries} 条 + resumed 留痕）；"
         f"投影与关闭前逐字节相同："
         f"{json.dumps(after.messages, ensure_ascii=False) == json.dumps(before.messages, ensure_ascii=False)}",
     )
-    line("系统", ORANGE, "重建出的轨迹（尾部 2 条：原轨迹末尾 + resumed 留痕）：")
-    show_trajectory(traj2, tail=2)
-    line(
-        "实测",
-        GREEN,
-        f"生命周期留痕：{json.dumps(session_facts(traj2)[-1], ensure_ascii=False)}",
-    )
+    line("系统", ORANGE, "重建出的轨迹（尾部 1 条：与关闭前的最后一条一致）：")
+    show_trajectory(traj2, tail=1)
 
     # —— 继续对话：模型带着恢复的历史接着答 ——
     ended2 = asyncio.Event()
@@ -530,7 +531,12 @@ async def case_fork(workdir: Path) -> None:
         p = build_context(t)
         last_user = [m for m in p.messages if m.get("role") == "user"][-1]["content"]
         line("实测", GREEN, f"{name} {t.sid[:8]}…：{len(t.entries())} 条 entry，最后一条 user = {brief(last_user)}")
-    line("实测", GREEN, f"分叉的生命周期事实：{json.dumps(session_facts(forked)[-1], ensure_ascii=False)}")
+    line(
+        "实测",
+        GREEN,
+        f"分叉的血缘记在新 header 里：parent_session = {forked.header.get('parent_session', '')[:8]}…"
+        f"（完整 sid：{forked.header.get('parent_session')}）",
+    )
     note(
         "session 切换不修改历史，只创造新的“当前”：模型切换是树上的新节点，"
         "会话切换是新文件——都是追加，都不是改写。"
@@ -579,7 +585,7 @@ async def case_resume_broken(workdir: Path) -> None:
     line(
         "实测",
         RED,
-        f"坏轨迹：第 6 条记录断在 message 正文中间——行格式和完好记录一模一样（长度 CRC json），"
+        f"坏轨迹：最后一条记录断在 message 正文中间——行格式和完好记录一模一样（长度 CRC json），"
         f"但头部自报 {declared} 字节、实际只剩 {actual} 字节（差 {declared - actual}），CRC 对不上 → 整条拒收：",
     )
     line(
@@ -593,21 +599,16 @@ async def case_resume_broken(workdir: Path) -> None:
         "实测",
         RED,
         f"完好 {intact} 条 → 只读到 {len(broken.entries())} 条（停在坏记录之前，torn={broken.torn}）。"
-        f"残尾声明的父节点就是上面最后一条 entry——它是没出生的第 6 条，没写完的不算已发生",
+        f"残尾声明的父节点就是上面最后一条 entry——它是没出生的下一条，没写完的不算已发生",
     )
-    resumed = h1.store.resume(h1.sid, note="crash 恢复演练")
+    resumed = h1.store.resume(h1.sid)
     line(
         "实测",
         GREEN,
         f"修好之后：resume 先把残尾字节物理裁掉（文件 {torn_size} → {len(resumed.log.raw_bytes())} 字节），"
-        "补 session_resumed 留痕 + 主动补一条 assistant 占位进轨迹，轨迹尾部三条：",
+        "再主动补一条 assistant 占位进轨迹（synthetic + note 自述残尾），轨迹尾部两条：",
     )
-    show_trajectory(resumed, tail=3)
-    line(
-        "实测",
-        GREEN,
-        f"resumed 事件留痕 torn_tail={session_facts(resumed)[-1]['payload']['torn_tail']}",
-    )
+    show_trajectory(resumed, tail=2)
     fixed1 = build_context(resumed)
     line("实测", GREEN, "修好之后的投影（模型实际看到的）——占位已在轨迹里，投影照常透传：")
     for m in fixed1.messages:

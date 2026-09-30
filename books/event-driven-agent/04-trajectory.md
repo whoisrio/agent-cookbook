@@ -51,7 +51,8 @@ entry的type可选的类型大致如下，要根据type来决定是否在投影�
 | ---- | ---------------------------------------------------------------- | ----------------- |
 | 进上下文 | message / branch_summary / compaction                            | 模型（经投影）           |
 | 改状态  | model_change / thinking_level                                    | 投影函数（不产生消息，覆盖式提取） |
-| 纯元数据 | session_started / session_resumed / session_end / label / custom | 回放的人和 UI          |
+
+没有第三组：每个 entry 类型要么进上下文、要么改状态，没有第三种消费方式。session 的开始/恢复/结束不落 entry——header 即开始，追加即活着，文件本身就是生命周期的账（pi 同款）。
 
 
 ### messages--trajectory的投影
@@ -60,7 +61,7 @@ trajectory 定下来之后，来看看如何通过轨迹来生成messages。
 
 1. **路径遍历**：从 leafId 沿 parentId 走回根，再 reverse 成根→叶顺序。
 2. **按 type 分派**：message 转成消息，model_change 更新当前模型，
-   thinking_level 更新模型思考等级，元数据跳过，
+   thinking_level 更新模型思考等级，
    如果message经过压缩，那么就从压缩点记录的位置开始取entry。
 3. **sanitize**：保证发给模型的消息序列合法，处理agent异常退出时可能写入的不完整trajectory。
 
@@ -149,7 +150,7 @@ rewind回到过去时，希望一并把当前session已经做的尝试进行summ
 
 下面看看fork，
 **fork**（`SessionStore.fork`）把当前路径克隆进一份新会话文件（id 与
-parentId 原样保留，补一条 `session_resumed` 说明 forked_from）。新文件是
+parentId 原样保留）。新文件是
 完整合法的轨迹，可以独立继续生长；旧文件原封不动。
 
 "从哪里开始 fork"没有专门参数——fork 克隆的就是**当前路径**，想从更早的
@@ -160,12 +161,11 @@ parentId 原样保留，补一条 `session_resumed` 说明 forked_from）。新�
 原文件（A，原封不动）：  e1 e2 e3 e4 e5      ← leaf 不动，继续用就是原会话
 
 新文件（B）：
-header {type: session, id: B, note: "forked from A"}
+header {type: session, id: B, note: "forked from A", parent_session: A}
 e1 e2 e3 e4 e5                          ← 原样克隆：id / parentId 不改
-session_resumed {forked_from: A}        ← 生命周期标记，也是新的 leaf
 ```
 
-id 原样保留（不重新编号）——per-session 文件隔离，两份文件里的同名 id互不冲突。和原始路径的关系记在 `session_resumed` 的 `forked_from` 里（审计留痕，不是引用）；之后两条轨迹各自生长，一边 rewind /压缩 / 追加都影响不到另一边。
+id 原样保留（不重新编号）——per-session 文件隔离，两份文件里的同名 id互不冲突。和原始路径的关系记在新 header 的 `parent_session` 里（审计留痕，不是引用）；之后两条轨迹各自生长，一边 rewind /压缩 / 追加都影响不到另一边。
 
 ### 异常恢复——三级收口
 再来看看从trajectory恢复session时的异常保护；
@@ -175,16 +175,15 @@ id 原样保留（不重新编号）——per-session 文件隔离，两份文�
 
 ```text
 崩溃时：    e1 e2 e3 [半条记录，CRC 对不上]        ← 残尾，不是事实
-resume 后： e1 e2 e3 session_resumed{torn_tail: true}
-            ↑ 残尾字节裁掉（没写完的不算事实），痕迹记在 resumed 里
+resume 后： e1 e2 e3 [assistant 占位，synthetic=true]
+            ↑ 残尾字节裁掉（没写完的不算事实），主动补的占位自述"回复已丢弃"
 ```
 
 **2. messages不满足匹配条件**——死在 assistant 落盘后、工具结果落盘前：
 
 ```text
 崩溃时：    ... user → assistant(tool_calls c1)          ← 结果永远没来
-resume 后： ... user → assistant(tool_calls c1)
-                     → session_resumed → user("继续")     ← 文件里永远悬挂
+resume 后： ... user → assistant(tool_calls c1)           ← 文件里永远悬挂
 投影时才补：assistant → tool[UNKNOWN: 会话在工具执行前中断，结果缺失]
             ↑ 修复只发生在投影，模型知道缺了什么、能自己重调
 ```
@@ -214,7 +213,7 @@ class Entry:
     payload: dict[str, Any]
 ```
 
-它是 frozen 的，不允许修改。`type` 就是前面那张三分组表里的 10 种；`to_dict() / from_dict()` 负责与落盘行的互转。
+它是 frozen 的，不允许修改。`type` 就是前面那张分组表里的 5 种；`to_dict() / from_dict()` 负责与落盘行的互转。
 
 ### TrajectoryLog：单会话轨迹文件
 
@@ -258,7 +257,7 @@ def path(self) -> list[Entry]:
 - **path()**：投影要的当前路径就从这来。
 - **branch(to_id)**：rewind 的全部实现就一行 `self.leaf_id = to_id`，没有任何节点被删除。
 - **branch_with_summary(keep_from, summary)**：移指针 + 追加一条 `branch_summary` 遗言节点。
-- **fork(new_log, sid=…)**：把当前路径原样克隆进新文件（id / parentId 不改），补一条 `session_resumed` 留痕。
+- **fork(new_log, sid=…)**：把当前路径原样克隆进新文件（id / parentId 不改），血缘记在新 header 的 `parent_session` 里。
 
 ### agent 侧：只动两处
 
@@ -310,62 +309,59 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 
 ### demo 1 · 写轨迹：写好的 entry 长什么样（01-trajectory-shape）
 
-先说这个 case 里 agent 在干什么：**用户问保温杯库存 → LLM 发起工具调用 query_inventory → agent 执行工具 → LLM 拿到结果回复**。四步对话各记一条 message entry，加上开头记录的 session_started（会话开始）和 model_change（模型选择），正好 6 条 entry。
+先说这个 case 里 agent 在干什么：**用户问保温杯库存 → LLM 发起工具调用 query_inventory → agent 执行工具 → LLM 拿到结果回复**。四步对话各记一条 message entry，加上开头记录的 model_change（模型选择），正好 5 条 entry。
 
 ```text
 [用户] 保温杯还有库存吗
-[entry] cce21772 ← ∅  session_started  {"by": "store"}
-[entry] c3220530 ← cce21772  model_change
-       {"model_id": "modelscope.cn/unsloth/Qwen3.5-4B-GGUF:Q4_K_M", "by": "store"}
-[entry] 80d4ac1f ← c3220530  message
+[entry] ee3f5699 ← ∅  model_change
+       {"model_id": "qwen3.5:4b-32k", "by": "store"}
+[entry] 99628cdf ← ee3f5699  message
        {"message": {"role": "user", "content": "保温杯还有库存吗"}, "synthetic": false, "note": ""}
-[entry] f950df0c ← 80d4ac1f  message
-       {"message": {"role": "assistant", "content": null, "tool_calls": [{"id": "call_z7xvdqpf",
+[entry] 10f9a3b0 ← 99628cdf  message
+       {"message": {"role": "assistant", "content": null, "tool_calls": [{"id": "call_dgnhzjg5",
         "type": "function", "function": {"name": "query_inventory", "arguments": "{\"category\":\"保温杯\"}"}}]},
         "synthetic": false, "note": ""}
-[entry] c9617b5d ← f950df0c  message
-       {"message": {"role": "tool", "tool_call_id": "call_z7xvdqpf",
+[entry] a4e919f1 ← 10f9a3b0  message
+       {"message": {"role": "tool", "tool_call_id": "call_dgnhzjg5",
         "content": "保温杯：库存 3 件；316L 不锈钢内胆，500ml，杯身磨砂黑。"}, "synthetic": false, "note": ""}
-[entry] 76953da3 ← c9617b5d  message
-       {"message": {"role": "assistant", "content": "保温杯还有库存，目前有 3 件：材质 316L 不锈钢内胆、
-        容量 500ml、外观杯身磨砂黑"}, "synthetic": false, "note": ""}
-[统计] 文件 6 条 entry + 1 条 header（不是节点，type=session）；
+[entry] e68d406e ← a4e919f1  message
+       {"message": {"role": "assistant", "content": "根据系统记录，目前保温杯还有库存 **3 件**，
+        规格为：316L 不锈钢内胆、容量 500ml、外观杯身磨砂黑"}, "synthetic": false, "note": ""}
+[统计] 文件 5 条 entry + 1 条 header（不是节点，type=session）；
        message 里 1 user / 2 assistant / 1 tool；残尾=False
-[系统] 文件头原文：{"type": "session", "version": 1, "id": "992b5c5e…",
-       "cwd": "…/sessions/stage04/trajectory-shape", "created": "2026-09-27T07:31:50.685+00:00",
+[系统] 文件头原文：{"type": "session", "version": 1, "id": "f90564ae…",
+       "cwd": "…/sessions/stage04/trajectory-shape", "created": "2026-09-30T04:40:30.201+00:00",
        "note": "", "system_prompt": "你是一个通过工具干活的通用 agent。"}
 ```
 
 ### demo 2 · 从正常轨迹恢复（02-resume-normal）
 
-先说这个 case 里 agent 在干什么：**和 demo 1 一样跑一轮"问库存 → 工具 → 回复"，写下轨迹后关掉会话；进程重启后，新 agent 拿着 sid resume 这张轨迹；用户接着问"刚才查的是哪个品类？"，agent 凭恢复的历史答出保温杯**。轨迹的变化：6 条 entry 上先落一笔 session_end，resume 时再补一笔 session_resumed 留痕，8 条。
+先说这个 case 里 agent 在干什么：**和 demo 1 一样跑一轮"问库存 → 工具 → 回复"，写下轨迹后关掉会话；进程重启后，新 agent 拿着 sid resume 这张轨迹；用户接着问"刚才查的是哪个品类？"，agent 凭恢复的历史答出保温杯**。轨迹的变化：resume 一个 entry 都不追加——5 条 entry 原样重建，文件字节不变。
 
 ```text
 [用户] 保温杯还有库存吗
-[entry] 1937b045 ← ∅  session_started  {"by": "store"}
-[entry] 4f12847a ← 1937b045  model_change
-       {"model_id": "modelscope.cn/unsloth/Qwen3.5-4B-GGUF:Q4_K_M", "by": "store"}
-[entry] 4b3809d0 ← 4f12847a  message
+[entry] 8d52b6c8 ← ∅  model_change
+       {"model_id": "qwen3.5:4b-32k", "by": "store"}
+[entry] 45e9c56d ← 8d52b6c8  message
        {"message": {"role": "user", "content": "保温杯还有库存吗"}, …}
-[entry] 2e7dee48 ← 4b3809d0  message
+[entry] 264c716e ← 45e9c56d  message
        {"message": {"role": "assistant", "content": null, "tool_calls": [
-        {"id": "call_i1vxc0tz", "function": {"name": "query_inventory",
+        {"id": "call_j2fje2mr", "function": {"name": "query_inventory",
          "arguments": "{\"category\":\"保温杯\"}"}}]}, …}
-[entry] 399284bc ← 2e7dee48  message
-       {"message": {"role": "tool", "tool_call_id": "call_i1vxc0tz",
+[entry] cbcac80d ← 264c716e  message
+       {"message": {"role": "tool", "tool_call_id": "call_j2fje2mr",
         "content": "保温杯：库存 3 件；316L 不锈钢内胆，500ml，杯身磨砂黑。"}, …}
-[entry] c96b8357 ← 399284bc  message
-       {"message": {"role": "assistant", "content": "有库存，目前有 3 件。…"}, …}
-[实测] 6 条 entry + 1 条 header——和 demo 1 的那张轨迹对得上
-[实测] 关闭时：投影 5 条消息；进程到此结束，内存里什么都可以扔了
-[实测] resume 重建树：8 条 entry（原 6 条 + resumed 留痕）；投影与关闭前逐字节相同：True
-[entry] c650414a ← c96b8357  session_end      {"reason": "第一段对话结束"}
-[entry] d38077d4 ← c650414a  session_resumed  {"torn_tail": false, "note": "进程重启后恢复"}
+[entry] 3d151c4c ← cbcac80d  message
+       {"message": {"role": "assistant", "content": "保温杯目前还有 **3件** 库存。…"}, …}
+[实测] 5 条 entry + 1 条 header——和 demo 1 的那张轨迹对得上
+[实测] 第一段结束：投影 5 条消息；进程到此结束，内存里什么都可以扔了
+[实测] resume 重建树：5 条 entry（原 5 条；正常 resume 一个 entry 都不追加、文件字节不变：True）
+[实测] 投影与关闭前逐字节相同：True
 [用户] 刚才查的是哪个品类？
 [实测] 继续对话：上下文 7 条（system + 恢复的历史 + 新一轮），
-       回答：刚才查询的品类是保温杯。
+       回答：我刚才查询的是一个 "保温杯" 的品类库存，目前有 3件在库存中。
        说明 │ 读文件重建树 + attach 登记。上下文不是从内存拿的——
-             每次 LLM 调用前从轨迹投影现算，内存丢了，对话丢不了。
+             每次 LLM 调用前从轨迹投影现算，同一份文件谁来做投影结果都一样。
 ```
 
 ### demo 3 · 触发压缩之后的操作（03-compact）
@@ -376,25 +372,27 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 [用户] 保温杯还有库存吗 / 玻璃杯呢 / 帮我汇总一下
 [用户] 上下文有点长了，压一下（compact_request，下一个边界生效）
 [用户] 继续
-[实测] 边界压缩：投影 12 → 8 条消息；compaction entry 85c7d9c7
-       （keep_from=7230db7a，reason=manual）——被压的原文一个字节没动：全树 17 条 entry 都在
-[entry] {"type": "compaction", "id": "85c7d9c7", "parentId": "31f1116a", …,
-       "payload": {"summary": "已完成：保温杯库存查询执行完成，已确认库存数据。
-                    关键事实与数据：query_inventory({"category": "保温杯"}) →
-                    库存 3 件（316L 不锈钢内胆，500ml，杯身磨砂黑）；副作用：无；
-                    待办：用户已请求查询"玻璃杯"库存信息，但对应工具调用未在
-                    历史中出现，需保留该需求以待后续处理。",
-                   "keep_from_id": "7230db7a", "reason": "manual"}}
+[实测] 边界压缩：投影 12 → 8 条消息；compaction entry f50a9e2e
+       （keep_from=19aec42b，reason=manual）——被压的原文一个字节没动：全树 25 条 entry 都在
+[entry] {"type": "compaction", "id": "f50a9e2e", "parentId": "236c6a08", …,
+       "payload": {"summary": "已完成
+                    - 执行工具：query_inventory({\"category\":\"保温杯\"})
+                    - 结论：获取查询成功，返回库存及规格信息。
+                    关键事实与数据：保温杯库存数量 3 件；316L 不锈钢内胆、
+                    500ml 容量、杯身磨砂黑。副作用：无。
+                    待办：用户请求检查"玻璃杯"库存（尚未触发工具调用）。",
+                   "keep_from_id": "19aec42b", "reason": "manual"}}
 [系统] 被压进摘要的消息（keep_from 之前，原文仍在轨迹里）：
   user      保温杯还有库存吗
   assistant → toolCall(query_inventory)
   tool      保温杯：库存 3 件；316L 不锈钢内胆，500ml，杯身磨砂黑。
-  assistant 保温杯现在还有库存，共 **3 件**（316L 不锈钢内胆，500ml，磨砂黑）
+  assistant 是的，保温杯还有一定库存：共有 3 件，规格为 316L 不锈钢内胆、500ml、磨砂黑杯身。
   user      玻璃杯呢
 [系统] 压缩后的投影（模型实际看到的）：
   system    你是一个通过工具干活的通用 agent。
-  user      <summary>已完成：保温杯库存查询执行完成…（全文见 entry）</summary>
-  …         保留的用户消息
+  user      <summary>已完成 - 执行工具：query_inventory({"category":"保温杯"})…
+            （全文见 entry）</summary>
+  …         保留窗原文（"帮我汇总一下"一轮的汇总等）
 ```
 
 ### demo 4 · 压缩之后再 rewind，然后继续对话（04-rewind-after-compact）
@@ -406,17 +404,16 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 
 ```text
 [用户] 开始处理 T-101，先定个方案 / 继续 / 继续
-[实测] 压缩完成：compaction entry de949a3f（keep_from=71900475）；投影 14 条 = [system, <摘要>, 保留窗…]
-[实测] 落点一 branch(e9c8ac63)：文件字节未变：True；投影 2 条 = [system, 那条 user]
+[实测] 压缩完成：compaction entry 8eff9816（keep_from=bcf051a4）；投影 6 条 = [system, <摘要>, 保留窗…]
+[实测] 落点一 branch(7342ccb8)：文件字节未变：True；投影 2 条 = [system, 那条 user]
        ——compaction 不在路径上，旧消息逐字回来
   system    你是一个通过工具干活的通用 agent。
   user      开始处理 T-101，先定个方案
 [用户] 换个思路重来：先查规则再动手
-[实测] 回退后继续对话 = 分支：e9c8ac63 现在有两个孩子 ['f6fd78af', 'd97fce44']
-[实测] 落点二 branch(de949a3f)：投影 14 条 = 回到压缩刚做完那一刻：[system, <摘要>, 保留窗…]
+[实测] 回退后继续对话 = 分支：7342ccb8 现在有两个孩子 ['556e17c9', 'e023db3a']
+[实测] 落点二 branch(8eff9816)：投影 6 条 = 回到压缩刚做完那一刻：[system, <摘要>, 保留窗…]
   system    你是一个通过工具干活的通用 agent。
-  user      <summary>【已完成】已处理任务 T-101…因人工确认超时，马克杯暂未补…</summary>
-  user      继续
+  user      <summary>…马克杯补货因"人工确认超时"未授权执行，任务处于挂起状态…</summary>
   …         （保留窗原文）
        说明 │ 两个落点，文件都一个字节没动；差别只在 leaf 指针走到哪、
              投影因此算出什么。被抛弃的分支原样躺在文件里，随时能 branch 回去。
@@ -427,10 +424,10 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 先说这个 case 里 agent 在干什么：**agent 跑完一轮"问库存 → 工具 → 回复"后，把当前路径克隆进一份新会话文件；之后旧会话续一句、新会话也续一句，两条轨迹各自生长，互不可见**——fork 出来的新文件 id 与 parentId 原样保留，是完整合法的轨迹，旧文件原封不动。
 
 ```text
-[系统] store 里的会话：['2675d6a5…', '62ca1dba…']
-[实测] 原会话 2675d6a5…：7 条 entry，最后一条 user = 旧会话的下一句
-[实测] 分叉 62ca1dba…：9 条 entry，最后一条 user = 新会话的下一句
-[实测] 分叉的生命周期事实：{"type": "session_resumed", "forked_from": "2675d6a5…"}
+[系统] store 里的会话：['47dbec70…', 'ecc7c658…']
+[实测] 原会话 47dbec70…：6 条 entry，最后一条 user = 旧会话的下一句
+[实测] 分叉 ecc7c658…：7 条 entry，最后一条 user = 新会话的下一句
+[实测] 分叉的血缘记在新 header 里：parent_session = 47dbec70…（完整 sid：47dbec707bba43159fff5ac111a1b445）
        说明 │ session 切换不修改历史，只创造新的"当前"：模型切换是树上的
              新节点，会话切换是新文件——都是追加，都不是改写。
 ```
@@ -438,26 +435,27 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 ### demo 6 · 从有问题的轨迹 resume（06-resume-broken）
 
 先说这个 case 里 agent 在干什么：**demo 主动构造两份不完整的轨迹，各自先摆"坏轨迹"原文、再摆"修好之后"的样子**——
-1. 轨迹1最后一条entry因为agent运行时异常导致没有被完整记录，resume这个session时，删除掉不完整的信息，补上 session_resumed 留痕，并直接补一条 assistant 占位 entry 进轨迹（synthetic 标记区分主动补充）；
+1. 轨迹1最后一条entry因为agent运行时异常导致没有被完整记录，resume这个session时，删除掉不完整的信息，并直接补一条 assistant 占位 entry 进轨迹（synthetic + note 自述残尾，标记区分主动补充）；
 2. 轨迹里躺着一条"assistant 要了工具结果但结果永远没来"的悬挂调用（崩在工具执行前），投影补一条自描述占位，模型知道缺了什么，原文件字节不变。两个现场全部以"轨迹是唯一真相"为基准。
 
 ```text
 # 轨迹1
-[entry] fee3b7b9 ← ∅         session_started  {"by": "store"}
-[entry] 2627956d ← fee3b7b9  model_change     {"model_id": "qwen3.5:4b-32k", …}
-[entry] 856fbbf6 ← 2627956d  message          user 保温杯还有库存吗
-[entry] 89ecc191 ← 856fbbf6  message          assistant → toolCall(query_inventory)
-[entry] 09409dbf ← 89ecc191  message          tool 保温杯：库存 3 件；316L 不锈钢内胆，500ml，杯身磨砂黑。
-[entry] b3648adf ← 09409dbf  message           {"type": "message", "id": "b3648adf",
-       "parentId": "09409dbf", …, "content": "保温杯现在还有库存，现有库存为3件，
-       具体规格是316L不锈钢内胆，容量500ml，杯�                       ← 正文说到一半戛然而止
-[实测] 完好 6 条 → 只读到 5 条（停在坏记录之前，torn=True）。
-       残尾声明的父节点就是上面最后一条 entry——它是没出生的第 6 条，没写完的不算已发生
-[实测] 修好之后：resume 先把残尾字节物理裁掉（文件 1873 → 2155 字节），补 session_resumed 留痕
-       + 主动补一条 assistant 占位 entry 进轨迹，轨迹尾部三条：
-[entry] 09409dbf ← 89ecc191  message          tool（原样还在）
-[entry] 0c81bb4b ← 09409dbf  session_resumed  {"torn_tail": true, "note": "crash 恢复演练"}
-[entry] 19364757 ← 0c81bb4b  message          assistant [UNKNOWN: 会话崩溃在回复写到一半，该回复已丢弃]
+[实测] 坏轨迹：最后一条记录断在 message 正文中间——行格式和完好记录一模一样
+       （长度 CRC json），但头部自报 328 字节、实际只剩 277 字节（差 51），
+       CRC 对不上 → 整条拒收：
+[entry] ddbfa68d ← ∅  model_change  {"model_id": "qwen3.5:4b-32k", …}
+[entry] 9c5bcee5 ← ddbfa68d  message  user 保温杯还有库存吗
+[entry] 3a0bb71b ← 9c5bcee5  message  assistant → toolCall(query_inventory)
+[entry] 04cc862e ← 3a0bb71b  message  tool 保温杯：库存 3 件；316L 不锈钢内胆，500ml，杯身磨砂黑。
+[残尾] 6512c360 ← 04cc862e  message  {"type": "message", "id": "6512c360",
+       "parentId": "04cc862e", …, "content": "保温杯现在还有库存，现有库存为3件，
+       具体规格是316L不锈钢内胆，容量500ml…                ← 正文说到一半戛然而止
+[实测] 完好 5 条 → 只读到 4 条（停在坏记录之前，torn=True）。
+       残尾声明的父节点就是上面最后一条 entry——它是没出生的下一条，没写完的不算已发生
+[实测] 修好之后：resume 先把残尾字节物理裁掉（文件 1741 → 1797 字节），
+       再主动补一条 assistant 占位进轨迹（synthetic + note 自述残尾），轨迹尾部两条：
+[entry] 04cc862e ← 3a0bb71b  message  tool（原样还在）
+[entry] 8754fc12 ← 04cc862e  message  assistant [UNKNOWN: 会话崩溃在回复写到一半，该回复已丢弃]
        （"synthetic": true, "note": "主动补充的占位：崩溃时写到一半的回复已被裁掉"）
 [实测] 修好之后的投影（模型实际看到的）——占位已在轨迹里，投影照常透传：
   system    你是一个通过工具干活的通用 agent。
@@ -470,9 +468,9 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
              而不是以为对话天然停在 tool 结果。
 
 # 轨迹2
-[实测] 现场二坏轨迹：末尾是 assistant 的 toolCall，底下没有 tool 回执：
-[entry] f8ae067f ← 6dfd8cf6  message          user 把库存改成 45 件
-[entry] 5b1b5674 ← f8ae067f  message          assistant → toolCall(update_inventory)
+[实测] 坏轨迹：末尾是 assistant 的 toolCall，底下没有 tool 回执：
+[entry] 9f0dfb90 ← add3f678  message  user 把库存改成 45 件
+[entry] 30b40653 ← 9f0dfb90  message  assistant → toolCall(update_inventory)
 [实测] 修好之后的投影（模型实际看到的）：
   system    你是一个通过工具干活的通用 agent。
   user      把库存改成 45 件

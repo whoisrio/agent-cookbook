@@ -3,7 +3,7 @@
 覆盖：
 - 树操作：append O(1)、认父不认子、线性轨迹无分叉点、id 唯一
 - 投影：路径遍历 + 类型分派 + sanitize；确定性（同文件同参数逐字节相同）；
-  model_change 覆盖式提取；元数据跳过
+  model_change 覆盖式提取；未知类型兜底跳过
 - 压缩口子：keep_from 之前的跳过、摘要插在最前；rewind 到压缩之前旧消息原样回来
 - rewind：只移指针，被抛弃分支留在文件里；回退后追加 = 分支
 - branch_summary：遗言不是对话（<summary> 视图，被抛弃分支不进上下文）
@@ -24,7 +24,6 @@ import pytest
 from baby_event_driven_agent.stages.stage04_trajectory.agent import build_context
 from baby_event_driven_agent.stages.stage04_trajectory.session.trajectory import (
     COMPACTION,
-    LABEL,
     MESSAGE,
     MODEL_CHANGE,
     PROMPT_CHANGE,
@@ -107,12 +106,12 @@ def test_path_traversal_root_to_leaf(workdir: Path) -> None:
 
 
 def test_projection_dispatch_and_determinism(workdir: Path) -> None:
-    """消息进 messages、model_change 覆盖、元数据跳过；两次投影逐字节相同。"""
+    """消息进 messages、model_change 覆盖、未知类型兜底跳过；两次投影逐字节相同。"""
     traj = new_traj(workdir)
     traj.append(MODEL_CHANGE, {"model_id": "m1"})
     user(traj, "问")
     assistant(traj, "答")
-    traj.append(LABEL, {"text": "书签"})  # 纯元数据：进轨迹不进上下文
+    traj.append("custom", {"text": "未知类型"})  # 轨迹里出现没见过的类型：兜底跳过
     user(traj, "换个问法")
 
     p1 = build_context(traj)
@@ -120,7 +119,7 @@ def test_projection_dispatch_and_determinism(workdir: Path) -> None:
     assert json.dumps(p1.messages) == json.dumps(p2.messages)
     assert p1.model == "m1"  # 覆盖式提取：路径上最后一次生效
     assert [m["role"] for m in p1.messages] == ["system", "user", "assistant", "user"]
-    assert p1.stats["skipped"] == 1  # label 被跳过（model_change 是状态提取，不算 skip）
+    assert p1.stats["skipped"] == 1  # 未知类型被兜底跳过（model_change 是状态提取，不算 skip）
 
 
 def test_projection_model_from_facts_only(workdir: Path) -> None:
@@ -301,9 +300,9 @@ def test_fork_produces_independent_session(workdir: Path) -> None:
     forked = traj.fork(TrajectoryLog(workdir / "f.jsonl"), sid="f" * 32)
 
     reloaded = Trajectory.load(TrajectoryLog(workdir / "f.jsonl"))
-    # fork 会补一条 session_resumed（元数据），所以文件里是 3 条；路径上前两条同源
-    assert [e.id for e in reloaded.entries()][:2] == [u.id, traj.entries()[1].id]
-    assert reloaded.entries()[-1].type == "session_resumed"
+    # 克隆只克隆当前路径：文件里就两条，与原路径同源；血缘记在 header
+    assert [e.id for e in reloaded.entries()] == [u.id, traj.entries()[1].id]
+    assert reloaded.header["parent_session"] == "s" * 32
     assert build_context(reloaded).messages[-1]["content"] == "a1"
 
     traj.append(MESSAGE, message_payload({"role": "user", "content": "旧会话继续"}))

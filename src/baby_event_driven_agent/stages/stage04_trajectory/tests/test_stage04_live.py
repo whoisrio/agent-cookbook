@@ -116,9 +116,9 @@ def test_turn_lands_on_disk_and_projects_legally(
     for i, role in enumerate(roles):
         if role == "tool":
             assert roles[i - 1] == "assistant"
-    # 生命周期事实在轨迹里：start 与 close
+    # 生命周期不落账：轨迹里第一条 entry 是 attach 留痕的 prompt_change
     types = [e.type for e in entries]
-    assert types[0] == "session_started"
+    assert types[0] == "prompt_change"
 
     projection = build_context(h.traj)
     assert projection.messages[0]["role"] == "system"

@@ -194,7 +194,7 @@ def test_turn_writes_valid_sequence_into_trajectory(
     assert h.traj_roles() == ["user", "assistant", "tool", "assistant"]
     assert inventory_spy == [{"category": "保温杯", "stock": 42}]
     types = [e.type for e in h.traj.entries()]
-    assert types[0] == "session_started"
+    assert types[0] == "prompt_change"  # 生命周期不落账：attach 发现 prompt 不一致留痕
     # 合成的注脚只属于合成消息：正常消息不带 synthetic
     assert not any(e.payload.get("synthetic") for e in h.traj.entries())
 

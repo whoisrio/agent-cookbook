@@ -205,10 +205,11 @@
     怎么判、怎么修——恢复不是附加题，是"以 log 为基准"的另一半。
 - 落地机制（用的是 3b 造好的零件：落盘、位点、seq）：
   1. **会话身份与生命周期**：session_id 由 `SessionStore` 分配（不是调用方随口
-     给）；`start` / `resume` / `close` 三入口，判据是"store 里有没有这个 sid"；
-     `session_started` / `session_resumed` / `session_end` 都要进 log——否则一个
-     log 文件里两段进程的历史首尾相接，回放时看不出中间断过（和 Stage 2
-     "排队的消息连 log 里都没痕迹"是同一类坑）；同 session 单写者。
+     给）；`start` / `resume` 两入口，判据是"store 里有没有这个 sid"；
+     生命周期不落账（pi 同款）——header 即开始、追加即活着，一个 log 文件里
+     两段进程的历史怎么断的，残尾判定与占位 entry 自己会说话（和 Stage 2
+     "排队的消息连 log 里都没痕迹"是同一类坑的对症答案）；fork 的血缘记在
+     header 的 `parent_session`；同 session 单写者。
   2. **投影形式化**：三层模型——事实层（append-only log）/ 视图层（messages）/
      投影函数 `f(log, policy)`。Stage 1 起那句"history 是 log 的投影"在这里才
      完整。两条纪律（对照 pi / hermes 的实现讲，见 books/pi、books/hermes）：

@@ -57,7 +57,6 @@ from .session.trajectory import (
     BRANCH_SUMMARY,
     COMPACTION,
     MESSAGE,
-    METADATA_TYPES,
     MODEL_CHANGE,
     PROMPT_CHANGE,
     Trajectory,
@@ -183,7 +182,9 @@ def build_context(traj: Trajectory) -> Projection:
             )
         elif e.type == COMPACTION:
             stats["skipped"] += 1  # 没有切割点的 compaction：跳过
-        elif e.type in METADATA_TYPES:
+        else:
+            # 未知类型兜底跳过：不进上下文（新类型进来先坏投影再坏账目，宁炸勿静默
+            # 的反面——这里静默但计数，观测得到）
             stats["skipped"] += 1
 
     if prompt is None:
@@ -354,7 +355,7 @@ class Agent:
     def _prefix_view(traj: Trajectory, keep_from_id: str) -> list[dict[str, Any]]:
         """被压段的视图消息（demo / 观测用）——实现在 compaction.segment_view：
         刀口之前的 entries 按同一份分派规则渲染（message 1:1、branch_summary 变
-        <summary>、状态节点不产生消息、元数据与更早的 compaction 跳过）。
+        <summary>、状态节点与未知类型不产生消息、更早的 compaction 跳过）。
         """
         return segment_view(traj, keep_from_id)
 

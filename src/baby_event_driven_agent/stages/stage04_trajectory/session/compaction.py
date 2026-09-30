@@ -331,7 +331,7 @@ def segment_view(traj: Trajectory, cut_id: str) -> list[dict[str, Any]]:
     """被压段的视图消息：路径上 cut 之前、最后一刀 compaction 之后的可见内容。
 
     message 1:1（system 是参数不是事实，跳过）、branch_summary 变 <summary>、
-    状态节点不产生消息、元数据跳过；**compaction 节点跳过**——它的内容已经
+    状态节点不产生消息、未知类型兜底跳过；**compaction 节点跳过**——它的内容已经
     以 previous 的身份进摘要输入（滚动折叠：旧摘要被吞，原文永不重读）。
     不做 sanitize：摘要输入渲染成文本，不进 chat 消息序列。
     """

@@ -12,11 +12,14 @@
   **会话**的账。可 rewind、可 fork。怎么从树 build 上下文不是这里的事——
   那是 agent 的活（agent.py 的 build_context），本模块只提供 path()。
 
-10 种 entry，按"对 LLM 调用的影响"分三组（分类轴就是消费方式）：
+5 种 entry，按"对 LLM 调用的影响"分两组（分类轴就是消费方式）：
 
 - 进上下文：message / branch_summary / compaction
 - 改状态：model_change / prompt_change（覆盖式提取，回退天然正确）
-- 纯元数据：session_started / session_resumed / session_end / label / custom
+
+没有第三组。session 的开始/恢复/结束不落 entry（pi 同款）——header 即开始，
+追加即活着，文件本身就是生命周期的账；fork 的血缘记在 header 的
+parent_session 里。每个 entry 类型要么进上下文要么改状态，没有第三种消费方式。
 
 prompt_change 是本项目对 pi 的偏离（pi 的 system prompt 在 harness，变了
 不落盘）：prompt 变更要审计，就得是事实。初始值在 header，变更以本类型
@@ -44,7 +47,7 @@ prompt_change 是本项目对 pi 的偏离（pi 的 system prompt 在 harness，
      但它代表的是最前面那段被压掉的历史——树上位置和视图位置相反，
      `insert(0)` 修正这一点，最终顺序是 [summary, 保留段...]；
   3. **keep_from_id 必须在当前路径上**，不在（比如被 rewind 掉）则压缩
-     节点按元数据跳过；且切割点要选在**序列合法的边界**（step 起点 /
+     节点当没发生过（投影跳过）；且切割点要选在**序列合法的边界**（step 起点 /
      turn 起点）——选在序列中间，保留段以孤儿 tool 结果开头，会被
      sanitize 丢弃；
   4. **多次压缩：投影认最后一切（05 滚动折叠）**。新摘要吞掉旧摘要：
@@ -63,7 +66,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# ---- entry 类型：按"对 LLM 调用的影响"分三组 ----
+# ---- entry 类型：按"对 LLM 调用的影响"分两组 ----
 
 # 第一组：进上下文（最终变成 messages 里的一项）
 MESSAGE = "message"  # user / assistant / tool；一条 assistant 是一个节点
@@ -73,15 +76,6 @@ COMPACTION = "compaction"  # 压缩摘要 + 切割点（投影语义见模块 do
 # 第二组：改状态（不产生消息，覆盖式提取）
 MODEL_CHANGE = "model_change"
 PROMPT_CHANGE = "prompt_change"  # system prompt 变更（不进消息，进审计）
-
-# 第三组：纯元数据（不进上下文、不改参数，给 UI / 扩展 / 回放的人看）
-SESSION_STARTED = "session_started"
-SESSION_RESUMED = "session_resumed"
-SESSION_END = "session_end"
-LABEL = "label"
-CUSTOM = "custom"
-
-METADATA_TYPES = frozenset({SESSION_STARTED, SESSION_RESUMED, SESSION_END, LABEL, CUSTOM})
 
 
 def _now() -> str:
@@ -245,6 +239,7 @@ class Trajectory:
         cwd: str = "",
         note: str = "",
         system_prompt: str = "",
+        parent_session: str = "",
     ) -> "Trajectory":
         header = {
             "type": "session",
@@ -257,6 +252,9 @@ class Trajectory:
             # 但盘上得查得到"这个会话当时用的是哪个 prompt"，否则重放核对不了。
             "system_prompt": system_prompt,
         }
+        if parent_session:
+            # fork 血缘记在 header（pi 同款 parent_session）：审计留痕，不是引用
+            header["parent_session"] = parent_session
         log.append(header)
         return cls(log, header, [])
 
@@ -368,26 +366,24 @@ class Trajectory:
         """session 切换：把当前路径克隆进一份新文件（id 与 parentId 原样保留）。
 
         新文件是完整合法的轨迹，可以独立继续生长；本文件原封不动。两条轨迹
-        就此分道扬镳，各自的 leaf 各自走。
+        就此分道扬镳，各自的 leaf 各自走。血缘记在新 header 的 parent_session。
         """
-        new = Trajectory.create(new_log, sid=sid, cwd=cwd, note=note or f"forked from {self.sid}")
+        new = Trajectory.create(
+            new_log,
+            sid=sid,
+            cwd=cwd,
+            note=note or f"forked from {self.sid}",
+            parent_session=self.sid,
+        )
         for entry in self.path():
             new.log.append(entry.to_dict())
             new._index(entry)
-        new.append(
-            SESSION_RESUMED,
-            {"forked_from": self.sid, "note": note or f"forked from {self.sid}"},
-        )
         return new
 
     # ------------------------------------------------------------ 投影
 
     def last_message(self) -> dict[str, Any] | None:
-        """当前路径上最后一条真实消息（跳过尾部的元数据节点，如 session_resumed）。
-
-        agent 判断"history 尾巴是什么"用：resume / fork 之后 leaf 可能是元数据，
-        但对投影和消息序列而言，元数据是透明的。
-        """
+        """当前路径上最后一条 message entry 的消息。agent 判断"history 尾巴是什么"用。"""
         for e in reversed(self.path()):
             if e.type == MESSAGE:
                 return dict(e.payload.get("message", {}))

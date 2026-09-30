@@ -150,7 +150,7 @@ def test_maybe_compact_nothing_to_compress(workdir: Path) -> None:
 def test_maybe_compact_segment_includes_branch_summary(workdir: Path) -> None:
     """摘要输入 = 刀口前视图：branch_summary 的 <summary> 也在——摘要吞摘要。"""
     traj = _hand_traj(workdir, "e.jsonl")
-    u1 = traj.path()[1]  # 第一条 user（0 是 session_started）
+    u1 = traj.path()[0]  # 第一条 user
     traj.branch_with_summary(u1.id, "试过 X，结论 Y")
     _user_entry(traj, "重来的第一轮")
     traj.append(MESSAGE, message_payload({"role": "assistant", "content": "答"}))
@@ -380,7 +380,7 @@ def test_manual_compaction_end_to_end(workdir: Path, data_copies: None) -> None:
 
 def test_resume_after_compaction_restores_compacted_view(workdir: Path) -> None:
     """resume × 压缩：恢复出来的是压缩视图（不是全量原文），悬挂调用补占位，
-    原文件 append-only（resume 前字节是 resume 后的前缀）。"""
+    原文件 append-only（正常 resume 一个 entry 都不追加）。"""
     store = SessionStore(workdir / "sessions")
     traj = store.start(cwd=str(workdir), system_prompt="SYS")
     summarizer = ScriptedSummarizer(["【已完成】早期的事都办完了。【待办】围巾待核对。"])
@@ -412,7 +412,7 @@ def test_resume_after_compaction_restores_compacted_view(workdir: Path) -> None:
     )
     bytes_before = traj.log.raw_bytes()
 
-    resumed = store.resume(traj.sid, note="crash 恢复演练")
+    resumed = store.resume(traj.sid)
     proj = build_context(resumed)
     # 压缩视图：system + <摘要> + 保留窗（不是全量原文——第一轮不在）
     assert proj.messages[1]["content"].startswith("<summary>")
@@ -421,5 +421,5 @@ def test_resume_after_compaction_restores_compacted_view(workdir: Path) -> None:
     assert any(
         m.get("role") == "tool" and m.get("content") == UNKNOWN_TOOL_RESULT for m in proj.messages
     )
-    # append-only：resume 前字节是 resume 后的前缀（只追加了 session_resumed）
-    assert resumed.log.raw_bytes().startswith(bytes_before)
+    # append-only：正常 resume 一个 entry 都不追加，文件字节不变
+    assert resumed.log.raw_bytes() == bytes_before

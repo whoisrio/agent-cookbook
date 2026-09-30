@@ -346,13 +346,13 @@ def test_resume_after_real_compaction_restores_view(
     bytes_before = h.traj.log.raw_bytes()
 
     store2 = SessionStore(workdir / "sessions")
-    resumed = store2.resume(h.sid, note="压缩后重启恢复演练")
+    resumed = store2.resume(h.sid)
     after = build_context(resumed)
     assert [m["content"] for m in after.messages if m.get("content")] == [
         m["content"] for m in before.messages if m.get("content")
     ]
-    # append-only：只追加了 session_resumed，原文一个字节没动
-    assert resumed.log.raw_bytes().startswith(bytes_before)
+    # append-only：正常 resume 一个 entry 都不追加，原文一个字节没动
+    assert resumed.log.raw_bytes() == bytes_before
 
 
 def test_rewind_before_compaction_restores_original(

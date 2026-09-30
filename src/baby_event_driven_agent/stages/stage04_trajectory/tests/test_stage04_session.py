@@ -1,9 +1,9 @@
 """Stage 5a 会话层用例：全部离线。
 
 覆盖：
-- sid 由 store 分配；start 落 header + session_started（+ 初始 model_change）
-- resume 重建树、从 leaf 继续（不重复事实）；torn_tail 留痕
-- close 落 session_end；生命周期事件都能从轨迹里读出来
+- sid 由 store 分配；start 落 header（+ 初始 model_change）；生命周期不落账
+- resume 重建树、从 leaf 继续（不重复事实）；正常 resume 字节不变；残尾补占位
+- fork 的血缘记在 header 的 parent_session 里
 - 悬挂审批闭合：孤立的 approval_required 补 abandoned 裁决，闭合过的不碰（幂等）
 """
 
@@ -20,7 +20,6 @@ from baby_event_driven_agent.stages.stage04_trajectory.transport.events import E
 from baby_event_driven_agent.stages.stage04_trajectory.transport.persistence import EventLog
 from baby_event_driven_agent.stages.stage04_trajectory.session.store import (
     SessionStore,
-    session_facts,
     sweep_hanging_approvals,
 )
 from baby_event_driven_agent.stages.stage04_trajectory.session.trajectory import (
@@ -43,15 +42,15 @@ def test_sid_is_allocated_by_store(workdir: Path) -> None:
     traj = store.start(cwd="/tmp", model="fake-model")
     assert traj.sid and len(traj.sid) == 32
     assert store.path_of(traj.sid).exists()
-    facts = session_facts(traj)
-    assert [f["type"] for f in facts] == ["session_started", "model_change"]
-    assert facts[1]["payload"]["model_id"] == "fake-model"
+    types = [e.type for e in traj.entries()]
+    assert types == ["model_change"]  # 生命周期不落账：header 即开始
+    assert traj.entries()[0].payload["model_id"] == "fake-model"
 
 
 def test_start_without_model_has_no_model_change(workdir: Path) -> None:
     store = SessionStore(workdir / "sessions")
     traj = store.start()
-    assert [f["type"] for f in session_facts(traj)] == ["session_started"]
+    assert traj.entries() == []  # 没给 model：header 之外一条 entry 都没有
 
 
 def test_header_records_system_prompt_verbatim(workdir: Path) -> None:
@@ -80,15 +79,18 @@ def test_projection_defaults_to_header_prompt(workdir: Path) -> None:
 
 
 def test_resume_rebuilds_tree_and_continues(workdir: Path) -> None:
-    """resume：树从文件重建，接着能追加（resumed 事件本身也在轨迹里留痕）。"""
+    """resume：树从文件重建，接着能追加；正常 resume 一个 entry 都不追加（字节不变）。"""
     store = SessionStore(workdir / "sessions")
     traj = store.start(model="m")
     u = traj.append(MESSAGE, message_payload({"role": "user", "content": "第一句"}))
     traj.append(MESSAGE, message_payload({"role": "assistant", "content": "第一答"}))
+    bytes_before = traj.log.raw_bytes()
 
     resumed = store.resume(traj.sid)  # 模拟重启：全新的 Trajectory 实例
     assert resumed.get(u.id).payload["message"]["content"] == "第一句"
     assert resumed.last_message_role() == "assistant"  # leaf 之前的消息链完整
+    # 生命周期不落账：正常 resume 不追加任何东西，文件字节不变
+    assert resumed.log.raw_bytes() == bytes_before
     resumed.append(MESSAGE, message_payload({"role": "user", "content": "第二句"}))
 
     again = store.resume(traj.sid)
@@ -97,21 +99,24 @@ def test_resume_rebuilds_tree_and_continues(workdir: Path) -> None:
         "第一答",
         "第二句",
     ]
-    facts = [f["type"] for f in session_facts(again)]
-    assert facts == ["session_started", "model_change", "session_resumed", "session_resumed"]
 
 
 def test_resume_marks_torn_tail(workdir: Path) -> None:
-    """残尾在 resume 时被判定：裁掉残尾字节，resumed 事件带 torn_tail=true 留痕。"""
+    """残尾在 resume 时被判定：裁掉残尾字节，补一条 synthetic 占位 entry 留痕。"""
     store = SessionStore(workdir / "sessions")
     traj = store.start()
     traj.append(MESSAGE, message_payload({"role": "user", "content": "u1"}))
     path = store.path_of(traj.sid)
-    path.write_bytes(path.read_bytes()[:-11])
+    bytes_before = path.read_bytes()
+    path.write_bytes(bytes_before[:-11])
     resumed = store.resume(traj.sid)
-    # 实例上的 torn 标志在第一次追加（session_resumed）时消费掉：残尾已裁
+    # 实例上的 torn 标志在第一次追加（占位 entry）时消费掉：残尾已裁
     assert resumed.torn is False
-    assert session_facts(resumed)[-1]["payload"]["torn_tail"] is True
+    # 留痕 = synthetic assistant 占位（note 自述残尾），不是生命周期 entry
+    leaf = resumed.leaf
+    assert leaf is not None and leaf.type == MESSAGE
+    assert leaf.payload["synthetic"] is True
+    assert leaf.payload["message"]["content"].startswith("[UNKNOWN:")
     from baby_event_driven_agent.stages.stage04_trajectory.session.trajectory import TrajectoryLog
 
     assert TrajectoryLog(path).read()[2] is False  # 文件回到完好状态
@@ -123,15 +128,6 @@ def test_resume_unknown_sid_raises(workdir: Path) -> None:
         store.resume("no-such-session")
 
 
-def test_close_appends_session_end(workdir: Path) -> None:
-    store = SessionStore(workdir / "sessions")
-    traj = store.start()
-    store.close(traj, reason="demo 结束")
-    facts = session_facts(traj)
-    assert facts[-1]["type"] == "session_end"
-    assert facts[-1]["payload"]["reason"] == "demo 结束"
-
-
 def test_fork_registers_new_session_in_store(workdir: Path) -> None:
     store = SessionStore(workdir / "sessions")
     traj = store.start()
@@ -139,7 +135,9 @@ def test_fork_registers_new_session_in_store(workdir: Path) -> None:
     forked = store.fork(traj, note="分叉演练")
     assert traj.sid != forked.sid
     assert store.list_sessions() == sorted([traj.sid, forked.sid])
-    assert session_facts(forked)[-1]["payload"]["forked_from"] == traj.sid
+    # 血缘记在新 header 的 parent_session 里（审计留痕，不是引用）
+    assert forked.header["parent_session"] == traj.sid
+    assert traj.header.get("parent_session") is None  # 旧会话 header 原封不动
     # 旧会话原封不动：fork 之后原 leaf 仍是自己的
     assert traj.leaf.type == MESSAGE
 
