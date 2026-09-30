@@ -16,7 +16,7 @@
 
 maybe_compact 是两条规则汇合的唯一入口：水位门控（手动调用跳过）→
 cut_before_step → serialize_segment（被压段序列化成单条 user 消息）→
-摘要 → 复检收缩（摘要+保留窗+headroom 须落回触发线以内，否则收缩保留窗，
+摘要 → 复检收缩（摘要+保留窗须落回触发线以内，否则收缩保留窗，
 收到 1 个 step 仍超线就放弃——压了也压不回线上，不硬压）→ append compaction。
 空摘要视为失败（raise，调用方 fail-open 留痕：append 空摘要等于把被压段
 从视图里抹掉）。
@@ -40,9 +40,8 @@ class CompactionPolicy:
 
     - ratio（本书默认）：触发线 = 复检线 = window_tokens × watermark；
     - reserve（pi 同款）：触发线 = window_tokens − reserve_tokens；
-    - 两种模式共用：headroom_tokens（下一次调用的新增输入 + 回复 + 一次工具
-      往返）、keep_steps（保留窗 step 数上界）、keep_tokens（保留窗 token
-      预算，与 keep_steps 双约束取更紧）。
+    - 两种模式共用：keep_steps（保留窗 step 数上界）、keep_tokens（保留窗
+      token 预算，与 keep_steps 双约束取更紧）。
     - window_tokens = 0：计量不可用，水位不触发（手动压缩不受影响）。
     """
 
@@ -55,7 +54,6 @@ class CompactionPolicy:
     reserve_tokens: int | None = None  # 触发 = W − reserve；压后预算同这条线
     keep_tokens: int | None = None  # 保留窗 token 预算
     # 两种模式共用：
-    headroom_tokens: int = 0  # 下一次调用的新增输入 + 回复 + 一次工具往返
     keep_steps: int = 3  # 保留窗 step 数上界
 
 
@@ -425,11 +423,8 @@ async def maybe_compact(
             raise ValueError("摘要器返回空摘要（推理模型思考 token 吃掉输出时会发生）")
         if reason != "watermark" or trigger is None:
             break
-        # 复检：摘要 + 保留窗 + headroom 须落回触发线以内，否则收缩保留窗重压
-        if (
-            _estimate_text(summary) + _tokens_after(entries, cut_id) + policy.headroom_tokens
-            <= trigger
-        ):
+        # 复检：摘要 + 保留窗须落回触发线以内，否则收缩保留窗重压
+        if _estimate_text(summary) + _tokens_after(entries, cut_id) <= trigger:
             break
         if keep <= 1:
             return None  # 收缩到底仍超线：压不动（返回 None，不做半截压缩）

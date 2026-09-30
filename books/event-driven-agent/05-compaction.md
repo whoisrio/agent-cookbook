@@ -1,7 +1,8 @@
 # Stage 5：上下文压缩——有损变换的纪律
 
-> 配套代码（设计稿，代码尚未落地）：计划新增
-> `src/baby_event_driven_agent/stages/stage05_compaction/`
+> 配套代码已落地：实现与 04 共用一份（`stage04_trajectory/` 的
+> `session/compaction.py`、`agent.py`、`llm.py`），用例归位
+> `src/baby_event_driven_agent/stages/stage05_compaction/tests/`。
 
 ## 为什么要做压缩
 
@@ -17,13 +18,13 @@
 
 核心规则如下: 
 
-**规则一：触发——按 token 检测，按 step 下刀。**
-每次 LLM 调用前计量投影出来的 messages，越过压缩水位线就触发。但压缩刀口不是切在 token 超过水位线的那条消息，而是落在倒数第 N 个 step 的起点，保留最近 N 个 step 原文不动，保证 tool 配对完整，刀口之前的整体送去摘要。
+**规则一：触发——按 token 检测，按 step 切。**
+每次 LLM 调用前计量投影出来的 messages，越过压缩水位线就触发。但压缩切点不是切在 token 超过水位线的那条消息，而是落在倒数第 N 个 step 的起点，保留最近 N 个 step 原文不动，保证 tool 配对完整，切点之前的整体送去摘要。
 
 >一次用户消息到LLM给出最终答复叫做一个turn，turn里每一次LLM要求调用工具+工具结果返回，是一次step
 
 **规则二：折叠——旧摘要被新摘要吞掉，原文永不重读。**
-多次压缩时，新摘要的输入 = 上一刀摘要 + 两刀之间的增量 step。摘要模型永远只看到"上一刀摘要 + 新增内容"，从第一次压缩之后就不再重读任何原始全文。递归折叠，原文不回放。
+多次压缩时，新摘要的输入 = 上一次压缩的摘要 + 两次压缩之间的增量 step。摘要模型永远只看到"上一次压缩的摘要 + 新增内容"，从第一次压缩之后就不再重读任何原始全文。递归折叠，原文不回放。
 
 记住这两条，后面的内容就是它们的展开。
 
@@ -37,28 +38,25 @@
 
 两种方案各有问题，实际方案是把它们组合起来。
 
-### 实际方案：按 token 检测，按 step 下刀（两步走）
+### 实际方案：按 token 检测，按 step 切（两步走）
 
 主流 agent 的做法，都是综合了上述两种方式。
 
 - **第一步——检测（token 计量）**：每次 LLM 调用前计量投影出来的 messages，越过水位线就触发。计量以 API 返回的真实 usage（`prompt_tokens`）为准，落代码校准；调用之间的新增量用字符估算，不引 tokenizer 依赖。
-- **第二步——下刀（找 step 边界）**：触发后不是切在 token 位置，而是找到倒数第 N 个 step 的第一条消息，刀口落在这里。这样保证 tool 配对完整，不用再修序列。保留最近 N 个 step（比如 3 步）原文。
+- **第二步——定切点（找 step 边界）**：触发后不是切在 token 位置，而是找到倒数第 N 个 step 的第一条消息，切点落在这里。这样保证 tool 配对完整，不用再修序列。保留最近 N 个 step（比如 3 步）原文。
 
 
 ### 水位和窗口
 "什么时候触发"有两种设法。
 
-- **按预留token数**：pi / Codex CLI 的写法。pi：触发条件 `contextTokens > W − reserveTokens`（pi 默认预留 16k，即 headroom）；保留窗直接按 token 预算（pi `keepRecentTokens` 默认 20k）。直观可控，但换模型要重调数值。
+- **按预留token数**，设置reserveTokens作为上下文窗口空闲阈值，当 usedTokens > contextwindow - reserveTokens时，即触发压缩
+>pi / Codex CLI 采取的就是这种策略。pi：触发条件 `contextTokens > W − reserveTokens`（pi 的reserveToknes默认设置为 16k）
 
   ```text
   输入 token 用量轴：
 
    0 ├────────────────────────────────────┼───────────────┤ W
                   usedTokens                reserveTokens
-                                            
-
-  复检：tokens(摘要) + tokens(保留窗) + headroom ≤ W − reserveTokens
-  headroom：下一次调用的新增输入（用户消息或 tool 结果）+ 回复的 max_tokens + 一次工具往返
   ```
 
   - **按比例**：以 W 为分母设一条线，换模型、换窗口配置不用动。Gemini CLI 的 `chatCompression.contextPercentageThreshold`（0~1，超过窗口该比例就压）是同款思路；Claude Code 触发线也是比例（有效窗口的 ~85%~92%），但预留是绝对数（20k），算混搭：
@@ -70,8 +68,8 @@
                                                 H·W
                                             用量到这就触发
 
-    复检：tokens(摘要) + tokens(保留窗) + headroom ≤ H·W
-    headroom：下一次调用的新增输入（用户消息或 tool 结果）+ 回复的 max_tokens + 一次工具往返
+    复检：tokens(摘要) + tokens(保留窗) ≤ H·W
+    不达标就收缩保留窗再摘要
     ```
 
 
@@ -81,12 +79,14 @@
       s1      ...   s6          s7       s8       s9            s10（还没发）
  u1   a1 tr   ...   a6    u2    a7 tr    a8 tr    a9    │  u3   a10 tr…
 └───────── 送去做摘要 ─────────┘└───────── 原样保留 ──────────┘
-                                ↑ 刀口 keep_from = s7 的第一条消息
+                                ↑ 切点 keep_from = s7 的第一条消息
                                   （step 边界，不必是 turn 起点）
 
-摘要调用输入：摘要 prompt + 上一刀的摘要（若有）+ 刀口之前的全部消息（u1、s1..s6、u2，含图中省略的 step）
+摘要调用输入：摘要 prompt + 上一次压缩的摘要（若有）+ 切点之前的全部消息（u1、s1..s6、u2，含图中省略的 step）
 压缩后视图：  [system][<摘要>][s7][s8][s9][u3]  ← 下一次调用从这里接着发
 ```
+>pi 在触发压缩时则是保留keepRecentTokens数量的tokens不压缩，根据keepRecentTokens来检查可以留下最近多少个step不进压缩窗口
+>咱们的baby agent直接取最近n轮
 
 
 ### 触发位置：
@@ -95,7 +95,7 @@
 
 ### 多次压缩：滚动折叠
 
-第二次压缩时，视图已经是 [摘要 A] + [后续steps] ，新摘要的输入 = 上一刀的摘要 + 两刀之间的增量 step，不重读所有轨迹：
+第二次压缩时，视图已经是 [摘要 A] + [后续steps] ，新摘要的输入 = 上一次压缩的摘要 + 两次压缩之间的增量 step，不重读所有轨迹：
 
 ```text
 原始轨迹：s1 s2 s3 s4 s5 s6 s7 s8 s9 s10
@@ -103,12 +103,12 @@
   视图 A：[<摘要 A>, s7, s8, s9, s10]
   轨迹：  s1..s10, compA(keep_from=s7)
 
-继续跑到 s14，再次触发，新刀口 keep_from=s12：
+继续跑到 s14，再次触发，新切点 keep_from=s12：
   摘要 B 的输入 = 摘要 A 文本 + s7..s11
-                 （当前视图里、新刀口之前的全部内容）
+                 （当前视图里、新切点之前的全部内容）
   视图 B：[<摘要 B>, s12, s13, s14]
   轨迹：  s1..s10, compA, s11..s14, compB(keep_from=s12)
-          投影只认最后一刀 compB：它之前的全部 entry（含 compA
+          投影只认最后一次压缩 compB：它之前的全部 entry（含 compA
           节点）跳过，摘要 B 插视图最前
 ```
 
@@ -134,7 +134,8 @@
 - **长程/生产会话**：用小一号但窗口足够的模型（如对话用大模型，压缩用同系列小模型）。成本能差一个数量级。
 - **极端场景**：被压段本身很大，主模型窗口装不下 → 降级到窗口最大的可用模型，或走分块 map-reduce，不过压缩质量就最差。
 
-配置上在 `CompactionPolicy` 补两个字段：
+配置上可以在 `CompactionPolicy` 补两个字段。这是选型讨论，**本书未实现**——当前
+`LiveSummarizer` 固定复用对话模型，降级策略留作展望：
 
 ```python
 summarizer_model: str | None = None  # None = 复用对话模型
@@ -144,13 +145,11 @@ fallback_model: str | None = None   # 主选装不下时降级
 ### 压缩调用的 messages 组装策略
 
 压缩 LLM 的输入不是直接把对话视图切片扔过去，把待压缩的messages作为压缩模型的user message的content输入
-
-本章做的就是这个：被压段序列化成**一段文本**，放进单条 user 消息的 content。
 >如果不拼接成单条user message的content，直接用 压缩system prompt + 原始对话按 step 逐条发送给LLM压缩，LLM很有可能会把压缩的意图理解成对话的意图。
 
 **1.压缩 System prompt**
 
-摘要 LLM 用专门的压缩指令示例：
+摘要 LLM 用专门的压缩指令示例，需要给出明确的压缩规则：
 
 ```python
 COMPRESSION_SYSTEM = """你是一个上下文压缩器。任务是将提供的对话历史压缩为结构化摘要。
@@ -168,7 +167,7 @@ COMPRESSION_SYSTEM = """你是一个上下文压缩器。任务是将提供的�
 
 **2. 指令位置：system 定角色，user 文本末尾定任务**
 
-system 放压缩专用指令，如下是压缩时user message的结构，待压缩的对话放在 <conversation> 中间，如果已经压过一刀，将上一刀的摘要放到<previous-summary>中间。
+system 放压缩专用指令，如下是压缩时user message的结构，待压缩的对话放在 <conversation> 中间，如果已经压缩过，将上一次压缩的摘要放到<previous-summary>中间。
 
 ```python
 COMPRESSION_USER = """
@@ -232,32 +231,33 @@ assistant: 如下是xxx类的分析 ...
 - **小模型转写**（tool_result 侧）：WebFetch 类工具不让原文进消息——抓取后先按 prompt 用小模型定向提取，进对话的已经是答案。比 cap 更进一步：原文根本不进来。
 
 
-## 代码改动（设计稿，待实现）
+## 代码改动
 
-新包 `stage05_compaction/` 从 `stage04_trajectory/` 拷贝，`transport/`、`session/` 不动，增量如下。
+实现与 04 共用一份：`transport/`、`session/` 不拆包，本章增量直接落在 `stage04_trajectory/` 的 `session/compaction.py`、`agent.py`、`llm.py` 上；用例归位 `stage05_compaction/tests/`，import 暂指向 `stage04_trajectory`，后续如有 05 专属的结构性增量再原地翻转到本包。
 
-`session/compaction.py` 已有手动档（Summarizer 两档 / maybe_compact，见 04），本章在同一个文件上扩展。刀口粒度从 turn 换成 step，04 的 `cut_before_turn(entries, keep_turns)` 随之改名为 `cut_before_step(entries, keep_steps)`：
+`session/compaction.py` 已有手动档（Summarizer 两档 / maybe_compact，见 04），本章在同一个文件上扩展。切点粒度从 turn 换成 step：新增 `cut_before_step(entries, keep_steps, keep_tokens)`，04 的 `cut_before_turn(entries, keep_turns)` 保留——路径上没有任何 step（纯聊天）时由 `cut_before_step` 退回 turn 刀口：
 
 ```python
 @dataclass(frozen=True)
 class CompactionPolicy:
     version: str = "2026-09-25.v1"
     mode: str = "ratio"           # "ratio" 比例式（本书默认）| "reserve" 预留式（pi 同款）
-    window_tokens: int = 0        # 模型窗口 W
+    window_tokens: int = 0        # 模型窗口 W；0 = 计量不可用，水位不触发（手动压缩不受影响）
     # ratio 模式读取：
     watermark: float = 0.7        # 触发线 = 复检线 = H·W
     # reserve 模式读取：
     reserve_tokens: int | None = None  # 触发 = W − reserve；压后预算同这条线，超了就再压
-    keep_tokens: int | None = None     # 保留窗 token 预算
     # 两种模式共用：
-    headroom_tokens: int = 0      # 下一次调用的新增输入 + 回复 + 一次工具往返
-    keep_steps: int = 3           # 保留窗 step 数上界（护栏，与 keep_tokens 取更紧）
-    summarizer_model: str | None = None   # None = 复用对话模型
-    fallback_model: str | None = None     # 主选装不下时降级
+    keep_tokens: int | None = None     # 保留窗 token 预算
+    keep_steps: int = 3                # 保留窗 step 数上界（护栏，与 keep_tokens 取更紧）
 
-def estimate_tokens(messages: list[dict]) -> int: ...       # 真实 usage 锚定 + 增量字符估算
+def estimate_tokens(messages: list[dict]) -> int: ...       # 字符估算（CJK 按字计、其余 4 字符/token）
+class TokenMeter: ...
+    # 真实 usage 锚定（anchor 落在发起调用时的轨迹 leaf）+ 之后的轨迹增量估算；
+    # 锚点被 rewind 掉（不在当前路径上）就回退全量估算
+
 def cut_before_step(entries, keep_steps: int, keep_tokens: int | None = None) -> str: ...
-    # 刀口 = 从尾部往前收 step，step 数或 token 预算任一用尽即停（双约束取更紧）
+    # 切点 = 从尾部往前收 step，step 数或 token 预算任一用尽即停（双约束取更紧）
     # 在飞的 step 还没落盘，天然不在被压段
 
 class Summarizer(Protocol):
@@ -265,74 +265,54 @@ class Summarizer(Protocol):
     # ScriptedSummarizer（离线确定性）/ LiveSummarizer（裸 chat、不带工具、max_tokens 封顶）
 
 def serialize_segment(segment, previous_summary, policy) -> dict:
-    # 序列化管线：剥离 system / 剥离工具定义 / 逐条按视图渲染成文本
-    #           （tool_calls 带参数、tool 结果分页/cap 后原样）→ <conversation> 包裹
-    #           → <previous-summary> 前置 → 压缩指令收尾；返回单条 user 消息
-    #           （LiveSummarizer 的渲染逻辑上提为这条公共管线）
+    # 序列化管线：逐条按视图渲染成文本（tool_calls 带参数、结果原样、system 不进）
+    #           → <conversation> 包裹 → <previous-summary> 前置（若有）→ 压缩指令收尾
+    #           返回单条 user 消息；LiveSummarizer 与离线测试共用这条管线
 
 async def maybe_compact(traj, policy, summarizer, *, reason="watermark") -> Entry | None:
     # 投影 → 计量 → 未越水位返回 None（手动调用跳过水位）→ cut_before_step
-    # → 序列化摘要输入 → 摘要 → append compaction
+    # → 序列化摘要输入 → 摘要 → 复检（摘要+保留窗 ≤ 触发线，否则收缩保留窗重压，
+    #   收到 1 个 step 仍超线返回 None，不硬压）→ append compaction
     # 空摘要视为失败：append 空摘要等于把被压段从视图里抹掉
-    # 失败 fail-open：记 context_compact_failed，不 append、不抛出
+    # 失败 fail-open：记 context_compact_failed，不 append、不挡 turn
 ```
 
-`agent.py` 的检测挂在 `_run_steps` 循环顶部（step 边界）：`查 interrupt → 计量（锚点 + 轨迹增量）→ 越线则 maybe_compact → drain steering → build_context → 发请求`——计量依据全在轨迹层，不需要投影，压完直接 build 一次即得新视图，不做"build → 压 → 重新 build"的无用功；压缩分支从认第一条改成认最后一切；`MAX_STEPS` 提为可配置。
+`agent.py` 的检测挂在 `_run_steps` 循环顶部（step 边界）：`查 interrupt → 计量（锚点 + 轨迹增量）→ 越线则 maybe_compact → drain steering → build_context → 发请求`——计量依据全在轨迹层，不需要投影，压完直接 build 一次即得新视图，不做"build → 压 → 重新 build"的无用功；同一 leaf 上只尝试一次（复检不过的会话每个边界都越线，没有新 entry 就不重复白打摘要调用）；压缩分支从认第一条改成认最后一次压缩；`MAX_STEPS` 提为可配置。
 
-工具层：`tools.py` 加分页参数和 4 个新工具（须满足"结论前置"约束）；执行层加 cap 包装和 `BlobStore`（`blobs/<sha256>`，写一次、不可变）；payload 加 blob 元数据注脚；投影和 sanitize 不解引用。`llm.py` 开 `include_usage` 解析尾部 usage。事件 `context_compacted` / `context_compact_failed` 经 `bus.record` 落盘。
+工具层不动：3c 的六件套原样沿用。分页契约、批次句柄、cap + blob（含 `BlobStore` 与工具的"结论前置"约束）**本书未实现**，留作展望。`llm.py` 开 `include_usage` 解析尾部 usage，作为计量的真实锚点。事件 `context_compacted` / `context_compact_failed` 经总线落盘。
 
-## demo（脚本设计，实测输出待回填）
+## demo（`stage05_compaction/main.py`，入口 `stage05-demo`，实测输出待回填）
 
-沿用 main.py 的分段惯例，五段全部打真实模型（读仓库根 .env 的 OpenAI 兼容端点，本地 ollama 也行），不用剧本替身——压缩的行为断言（摘要保真、副作用不重做）只有真模型才算数；剧本替身只保留给离线单元测试。demo policy 阈值调小（水位一两千 token、cap 几百字符、保留 3 个 step），不用造几十万 token 的会话。
+沿用 main.py 的分段惯例，五段全部打真实模型（读仓库根 .env 的 OpenAI 兼容端点，本地 ollama 也行），不用剧本替身——压缩的行为断言（摘要保真、副作用不重做）只有真模型才算数；剧本替身只保留给离线单元测试。demo policy 阈值调小（水位一两千 token、保留 1~2 个 step），不用造几十万 token 的会话。
 
-先行落地三段（`stage05_compaction/main.py`，入口 `stage05-demo`，真模型）：压缩前后对照、摘要失败 fail-open、副作用不重做——对应下面第 4 条的 fail-open 半边与第 5 条；其余段落依赖 05 增量（水位计量、分页与批次句柄、cap+blob、二次折叠），落地后回填。
-
-1. **触发策略对照**：同样 N 个 step，一个会话含大结果、一个闲聊——纯按步数前者超限、后者误压，组合策略下两者都正确。
-2. **补货任务单**：`list_tasks → get_task 分页 → query_inventory(max_stock) 翻页 → search_rules → 水位到自动压缩 → batch_update_inventory（一次审批）→ 压完继续未处理条目 → 汇报`。断言：已更新条目不被第二次写、截断清单经分页取回、压后投影合法且 token 下降。
-3. **cap + blob**：cap 调到比一页小，看头部进消息、全文落 blob、resume 后仍不解引用。
-4. **二次折叠 + 失败 fail-open**：两刀后认最后一切、旧摘要被吞；摘要器外面包一层一次性失败注入（空摘要同样算失败），看留痕、不 append、下一边界重试成功。
-5. **压缩前后对照**：同一任务端到端，打印压前压后投影、compaction entry、事件和 usage 校准值。
+1. **压缩前后对照**（01-compact-before-after）：三轮查库存 → compact_request → 下一轮边界压缩。看四样：compaction entry（摘要全文 + 切点）、context_compacted 事件报账、压前压后投影对比、原文一个字节没删。
+2. **摘要失败 fail-open**（02-compact-fail-open）：摘要器第一次被注入空返回（推理模型思考 token 吃掉输出时的真实姿态）——留痕、不 append、不挡 turn，重发请求下一边界重试成功。
+3. **副作用不重做**（03-side-effect-not-repeated）：写操作被压掉之后，模型凭摘要知道"做过就是做过"——全程恰好一次真实写，落库值正确（设值语义）。
+4. **触发策略对照**（04-watermark-trigger）：同样几轮，工具会话 token 越水位自动压缩、闲聊会话全程不压——纯按步数后者误压、纯按 token 前者切不准，组合策略下两者都正确（demo 1）。
+5. **二次折叠**（05-fold-twice）：两刀之后投影认最后一切、旧摘要被吞；摘要 B 的输入带着摘要 A（previous 传递），原始全文一次都不重读（demo 4）。
 
 
-## 验证（计划，代码落地后回填）
+## 验证（离线已跑，实测输出待回填）
 
+### 离线测试（`stage04_trajectory/tests/test_stage05_mechanism.py`，18 条，全绿）
 
-### 工具集扩充
+- 计量与触发：`estimate_tokens` 字符估算（不引 tokenizer）、`TokenMeter` 锚点 + 轨迹增量（锚点被 rewind 掉回退全量估算）、ratio / reserve 两种触发线、window=0 不触发；
+- 切点：落在倒数第 N 个 step 的第一条消息、tool 配对完整、step 数或 keep_tokens 预算任一用尽即停、纯聊天退回 turn 刀口；
+- 折叠与不变式：认最后一次压缩、旧摘要被吞（previous 传递 + 原文不重读）、rewind 过切点语义不变；
+- 复检：摘要+保留窗 ≤ 触发线不达标时收缩保留窗重压、收到 1 个 step 仍超线返回 None（不硬压）、手动通道跳过复检；
+- **messages 组装**：摘要输入是单条 user 消息（序列化文本）、不含对话 system prompt、不含工具定义、压缩 system prompt 与文档逐字一致；
+- agent 集成：水位自动压缩挂 step 边界、计量不越线不压、usage 锚定在最终答复步、max_steps 可配置。
 
-现有四件套撑不出长会话，也没有大结果。5b 在业务世界内加工具，不引入文件系统语义（read_file 是 coding agent 的形态，不贴合运营 agent）：
+分页 / 批次句柄 / cap+blob 相关的离线测试随功能 descope，一并留作展望（见"代码改动"）。
 
-| 形态 | 工具 | 剩余部分怎么取 |
-| --- | --- | --- |
-| 列表分页 | `query_inventory(category?, max_stock?, offset, limit)`、`search_rules(query, offset, limit)` | 同参数翻页，返回 `total/has_more` |
-| 单条详情 | `get_inventory_detail(category)` | 列表只给摘要行，完整规格按 key 取 |
-| 工单域 | `list_tasks(status?)`、`get_task(task_id, offset, limit)` | 工单条目分页，多步任务的驱动器 |
-| 批次句柄 | `batch_update_inventory(items[])`（每批条数有上限，一次审批，返回 `result_id`）、`get_batch_result(result_id, offset, limit)` | 写操作不可重放，尾部按句柄查，不能让模型再调一次拿结果 |
-
-即 4 个现有工具（查询类加分页）加 4 个新工具。
-
-
-离线测试（条数待回填），分组：
-
-- 计量与触发：usage 锚定加增量估算、水位触发、手动/自动同通道；
-- 刀口：落在倒数第 N 个 step 的第一条消息、在飞的 step 总不在被压段、tool 配对完整、复检判据（摘要+保留窗+headroom ≤ 触发线）不达标时收缩保留窗；
-- **messages 组装**：摘要输入是单条 user 消息（序列化文本）、不含对话 system prompt、不含工具定义、tool 调用与结果按视图渲染、压缩指令收尾、blob 不解引用；
-- tool 信息：摘要输入含被压 step 的 tool 页、压后被压 step 不进视图、保留窗配对完整、**tool_result 分层视图矩阵逐项验证**；
-- **工具规范**：分页工具结论前置（cap 后头部含整体状态/失败原因/后续指引）、违反约束的工具被拒绝接入；
-- 工具层：分页返回 total/has_more、cap 后头部加标记进轨迹且 blob hash 可核对、投影（含 resume）不解引用、batch 超条数被契约拒绝、get_batch_result 按句柄分页；
-- 折叠与不变式：认最后一切、旧摘要被吞且原文不重读、两次投影逐字节一致、rewind 过两刀（回归 5a）、policy_version/hash 落 entry；
-- 失败处理：摘要失败 fail-open 加 failed 事件、压缩被 interrupt 不留半截 entry；
-- 回归：stage04_trajectory 全部既有用例在新包通过。
-
-真模型（先行落地 5 条，`stage05_compaction/tests/test_stage05_compaction.py`；目录按章归位，
-实现与 04 共用一份，用例的 import 指向 stage04_trajectory，增量落地后原地翻转到本包）：
+### 真模型（`stage05_compaction/tests/test_stage05_compaction.py`，5 条）
 
 - 手动压缩端到端（真模型摘要）：entry 落盘、事件报账、新视图 = [system, <摘要>, 保留窗] 且序列合法；
 - 口述事实凭摘要可续：原文不在投影、摘要保住关键信息、回答带得出来；摘要失败（空摘要）fail-open 留痕、下一边界重试成功；
 - 副作用不重做：写操作被压掉之后全程恰好一次真实写（设值语义落库正确）；
 - resume：压缩视图从盘上还原与关会话前一致（append-only）；
-- rewind 回归：branch 回刀口，原文逐字回来、文件一个字节不动。
+- rewind 回归：branch 回切点，原文逐字回来、文件一个字节不动。
 
-05 独有增量（水位自动触发、cap+blob、滚动折叠）落地后把对应用例补进同一文件。
 demo 五段实测输出回填各小节。
 
 ## 下一章预告
