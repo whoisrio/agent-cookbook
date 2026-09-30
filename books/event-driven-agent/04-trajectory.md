@@ -144,7 +144,8 @@ rewind回到过去时，希望一并把当前session已经做的尝试进行summ
 当前路径（leaf = 6）：1 → 2 → 3 → S → 6
 投影：[system, 1, 2, 3, <summary>4、5 里试过 X，结论是 Y</summary>, 6…]
 ```
-这个summary是rewind操作的一种可选项，比如pi agent通过`tree`切换对话分支时，就提供了这样的能力。
+这个summary是rewind操作时的一种可选项，比如pi agent通过`tree`切换对话分支时，就提供了这样的能力。
+注意，这里的summary，是对rewind后放弃掉的messages的摘要，不是对路径上靠前位置的messages的摘要，所以，这里的summary在投影到messages时，不会移动放到 system prompt后面。
 
 下面看看fork，
 **fork**（`SessionStore.fork`）把当前路径克隆进一份新会话文件（id 与
