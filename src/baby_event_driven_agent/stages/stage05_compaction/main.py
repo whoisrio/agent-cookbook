@@ -391,7 +391,7 @@ async def case_watermark_trigger(workdir: Path) -> None:
         return
     # 真实 usage 为锚（含 system prompt 的基线 ~800 token）：阈值要落在基线
     # 之上、数轮工具往返能到的地方——纯闲聊到不了，工具会话几轮就越线
-    policy = CompactionPolicy(mode="ratio", window_tokens=2200, watermark=0.7, keep_steps=2)
+    policy = CompactionPolicy(mode="ratio", window_tokens=2000, watermark=0.7, keep_steps=2)
     trigger = trigger_tokens(policy)
 
     # —— 会话 A：多品类查询（每轮并行多个工具往返，token 涨得快）——
@@ -405,6 +405,8 @@ async def case_watermark_trigger(workdir: Path) -> None:
             "帆布包和围巾呢",
             "保温壶和不锈钢碗呢",
             "再把陶瓷餐具查一下",
+            "电水壶和保鲜盒呢",
+            "干货区的米面粮油也查一下",
         ),
         1,
     ):

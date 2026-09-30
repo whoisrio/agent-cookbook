@@ -1,4 +1,4 @@
-# Stage 5b：真知识库——把"假检索"换成真的（05b-real-agent.md，设计稿，代码未落地）
+# Stage 5b：真知识库——把"假检索"换成真的（05b-real-agent.md，设计已落地，代码见 src/baby_event_driven_agent/stages/stage05b_real_agent/）
 
 （定位同 3c：场景升级章，不是机制章。05 与 06 之间的能力台阶——进入 rubric
 之前，agent 得先是一个接近真实的运营助手：规则检索接真知识库，知识库构建

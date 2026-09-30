@@ -20,6 +20,7 @@ dependencies = [
     "langchain-community>=0.3.0",
     "langchain-experimental>=0.4.0",
     "textual>=0.80.0",
+    "prompt_toolkit>=3.0",
     "typesafe-sdk>=0.7.0",
 ]
 
@@ -40,6 +41,8 @@ stage04-demo = "baby_event_driven_agent.stages.stage04_trajectory.main:cli"
 stage04-test = "baby_event_driven_agent.stages.stage04_trajectory.testing:main"
 stage05-demo = "baby_event_driven_agent.stages.stage05_compaction.main:cli"
 stage05-test = "baby_event_driven_agent.stages.stage05_compaction.testing:main"
+stage05b-demo = "baby_event_driven_agent.stages.stage05b_real_agent.main:cli"
+stage05b-test = "baby_event_driven_agent.stages.stage05b_real_agent.testing:main"
 
 # 用 asciinema 把某个 stage 的 demo case 逐个录成 .cast（见 recorder.py）。
 cookbook-rec = "baby_event_driven_agent.recorder:cli"
