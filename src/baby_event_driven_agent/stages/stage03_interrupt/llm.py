@@ -9,6 +9,7 @@ RealLLM：OpenAI 兼容的流式客户端，配置读仓库根 .env，环境变�
 - {"type": "tool_call_delta", "index": int, 工具调用增量：首块带 id / name，
    "id": str | None, "name": str | None,     arguments 常分多块到达，必须累积
    "args_delta": str}
+- {"type": "finish", "reason": str | None}  流结束，透传 OpenAI 的 finish_reason
 流结束即本轮请求结束。
 """
 
@@ -247,10 +248,14 @@ class RealLLM:
             tools=TOOL_SCHEMAS,
             stream=True,
         )
+        finish_reason: str | None = None
         async for chunk in stream:
             if not chunk.choices:
                 continue
-            delta = chunk.choices[0].delta
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+            delta = choice.delta
             # 思考内容单独成一路，不跳过：云上 qwen3 系列走 reasoning_content，
             # 本地 ollama 走 reasoning，归一化成 reasoning_delta 发给 UI，
             # 不和可见文本混流。
@@ -269,3 +274,6 @@ class RealLLM:
                     "name": fn.name if fn else None,
                     "args_delta": (fn.arguments if fn else "") or "",
                 }
+        # 流结束透传 finish_reason（stop / tool_calls / length / content_filter），
+        # agent 拿它当账本里的 stop_reason。
+        yield {"type": "finish", "reason": finish_reason}

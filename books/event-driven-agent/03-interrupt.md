@@ -24,8 +24,9 @@ stage02 里，用户消息进收件箱，排队，在 step 边界被消费，语
 
 无论agent在哪种执行状态下被打断，一个必须遵从的原则，就是与LLM交互的messages，assistant的消息和tool的消息必须成对的，
 agent执行时被打断，意味着没法完整的收到LLM的回复或者工具执行的结果，就需要agent在处理打断信号时补齐应该有的消息，以保持messages的配对格式，因此，整体策略是，
-- 只要进入了agent的循环，没有收到LLM的完整消息前，丢弃不完整的消息，而后补充上assistant消息，标识该轮对话已经被打断；
+- 只要进入了agent的循环，没有收到LLM的完整消息前，丢弃不完整的消息，而后补充上assistant消息，标识该轮对话已经被打断；message中断的原因stop_reason要记录上`interrupted`；
 - LLM处于工具调用执行过程中，没有完成的工具调用，主动补齐 tool_result ，补充的内容则是标识该工具被打断；
+
 
 咱们将如上场景分类看一下，
 
@@ -50,6 +51,12 @@ agent执行时被打断，意味着没法完整的收到LLM的回复或者工具
   {"role": "assistant", "content": "[response interrupted]"},
   {"role": "user", "content": "先别查了，改成订会议室"}
 ]
+```
+
+占位 assistant 消息落进账本时，stop_reason 由 agent 自行补在 payload 上（不进 message）：
+
+```json
+{"type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[response interrupted]"}, "synthetic": true, "stop_reason": "interrupted"}}
 ```
 
 #### tool 执行中（边界命中）：在跑的跑完，没开始的补占位
@@ -215,6 +222,22 @@ finally:
         self._inflight[sid] = None
 ```
 
+第三，stop reason 进账本。正常路径下 stop_reason 直接取自 LLM 返回的 finish_reason（`stop` / `tool_calls`/`error`）；主动时没有 LLM 的输出，payload 里没有这条信息，由 agent 自行补上 `"interrupted"`。它挂在 log 记录的 payload 上，不进 message
+
+```python
+# 正常路径：finish_reason 原样透传
+stop_reason = partial.get("finish_reason") or (
+    "tool_calls" if msg.get("tool_calls") else "stop"
+)
+event = Event("agent_reply", sid, {"message": msg, "stop_reason": stop_reason})
+
+# 打断收尾：合成占位自行补
+event = Event(
+    "agent_reply", sid,
+    {"message": message, "synthetic": True, "stop_reason": "interrupted"},
+)
+```
+
 
 ## 跑一下（真实 LLM 实测输出）
 
@@ -226,14 +249,15 @@ finally:
 05 是在04的基础上追加新的用户消息处理；
 06 则是LLM完成工具调用，在输出最终答复时被中断的演示；
 
+
 ### 01 已发 LLM、未回复
 如下case中，用户刚要求agent介绍自己，agent就收到中断信号，因此，此时agent没有任何输出
 ![01-sent-stop](../../src/baby_event_driven_agent/rec/stage03/docs/01-sent-stop.gif)
 
 对应的session log如下，
 ```json
-{"ts": 0.23, "type": "user_input", "payload": {"text": "你好，用一句话介绍你自己"}, "note": "turn start"}
-{"ts": 0.39, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[response interrupted]"}, "synthetic": true}, "note": "marker"}
+{"ts": 0.23, "type": "user_input", "payload": {"message": {"role": "user", "content": "你好，用一句话介绍你自己"}}, "note": "turn start"}
+{"ts": 0.39, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[response interrupted]"}, "synthetic": true, "stop_reason": "interrupted"}, "note": "marker"}
 ```
 
 ### 02 打断时附了一条新消息
@@ -242,12 +266,12 @@ finally:
 
 对应的session log如下，
 ```json
-{"ts": 0.23, "type": "user_input", "payload": {"text": "你好，用一句话介绍你自己"}, "note": "turn start"}
-{"ts": 0.39, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[response interrupted]"}, "synthetic": true}, "note": "interrupted"}
-{"ts": 0.39, "type": "user_input", "payload": {"text": "别自我介绍了，改成说说报销规定", "synthetic": true}, "note": "redirect"}
-{"ts": 4.81, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules…]}}, "note": "tool_call"}
+{"ts": 0.23, "type": "user_input", "payload": {"message": {"role": "user", "content": "你好，用一句话介绍你自己"}}, "note": "turn start"}
+{"ts": 0.39, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[response interrupted]"}, "synthetic": true, "stop_reason": "interrupted"}, "note": "interrupted"}
+{"ts": 0.39, "type": "user_input", "payload": {"message": {"role": "user", "content": "别自我介绍了，改成说说报销规定"}, "synthetic": true}, "note": "redirect"}
+{"ts": 4.81, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules…]}, "stop_reason": "tool_calls"}, "note": "tool_call"}
 {"ts": 4.81, "type": "tool_result", "payload": {"…", "result": "报销：报销流程：发起申请 -> 财务审核 -> 打款。详见财务制度。", "skipped": false}, "note": "tool result"}
-{"ts": 7.43, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "报销流程是：发起申请 -> 财务审核 -> 打款，详细规定请查看财务制度。"}}, "note": "final"}
+{"ts": 7.43, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "报销流程是：发起申请 -> 财务审核 -> 打款，详细规定请查看财务制度。"}, "stop_reason": "stop"}, "note": "final"}
 ```
 
 ### 03 回答只说了一半
@@ -256,8 +280,8 @@ finally:
 
 对应的session log如下，
 ```json
-{"ts": 0.33, "type": "user_input", "payload": {"text": "用三句话说说，事件驱动架构相比轮询好在哪儿"}, "note": "turn start"}
-{"ts": 6.33, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[response interrupted]"}, "synthetic": true}, "note": "marker"}
+{"ts": 0.33, "type": "user_input", "payload": {"message": {"role": "user", "content": "用三句话说说，事件驱动架构相比轮询好在哪儿"}}, "note": "turn start"}
+{"ts": 6.33, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[response interrupted]"}, "synthetic": true, "stop_reason": "interrupted"}, "note": "marker"}
 ```
 
 ### 04 工具执行中被中断
@@ -267,11 +291,11 @@ finally:
 
 对应的session log如下，
 ```json
-{"ts": 0.33, "type": "user_input", "payload": {"text": "报销和 VPN 分别有什么规定，都要查"}, "note": "turn start"}
-{"ts": 5.11, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules × 2…]}}, "note": "tool_call"}
+{"ts": 0.33, "type": "user_input", "payload": {"message": {"role": "user", "content": "报销和 VPN 分别有什么规定，都要查"}}, "note": "turn start"}
+{"ts": 5.11, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules × 2…]}, "stop_reason": "tool_calls"}, "note": "tool_call"}
 {"ts": 5.11, "type": "tool_result", "payload": {"…", "result": "报销：报销流程：发起申请 -> 财务审核 -> 打款。详见财务制度。", "skipped": false}, "note": "tool result"}
 {"ts": 5.11, "type": "tool_result", "payload": {"…", "result": "[被用户中断，未执行]", "skipped": true}, "note": "tool skipped"}
-{"ts": 5.11, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[本轮已被用户中断，不再基于上面的工具结果作答]"}, "synthetic": true}, "note": "marker"}
+{"ts": 5.11, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[本轮已被用户中断，不再基于上面的工具结果作答]"}, "synthetic": true, "stop_reason": "interrupted"}, "note": "marker"}
 ```
 
 ### 05 工具执行中被中断，并附了一条新消息
@@ -281,14 +305,14 @@ finally:
 
 对应的session log如下，
 ```json
-{"ts": 0.22, "type": "user_input", "payload": {"text": "报销和 VPN 分别有什么规定，都要查"}, "note": "turn start"}
-{"ts": 4.36, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules × 2…]}}, "note": "tool_call"}
+{"ts": 0.22, "type": "user_input", "payload": {"message": {"role": "user", "content": "报销和 VPN 分别有什么规定，都要查"}}, "note": "turn start"}
+{"ts": 4.36, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules × 2…]}, "stop_reason": "tool_calls"}, "note": "tool_call"}
 {"ts": 4.36, "type": "tool_result", "payload": {"…", "result": "报销：报销流程：发起申请 -> 财务审核 -> 打款。详见财务制度。", "skipped": false}, "note": "tool result"}
 {"ts": 4.36, "type": "tool_result", "payload": {"…", "result": "[被用户中断，未执行]", "skipped": true}, "note": "tool skipped"}
-{"ts": 4.36, "type": "user_input", "payload": {"text": "先别查了，改成订会议室", "synthetic": true}, "note": "redirect"}
-{"ts": 5.79, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules("会议室")…]}}, "note": "tool_call"}
+{"ts": 4.36, "type": "user_input", "payload": {"message": {"role": "user", "content": "先别查了，改成订会议室"}, "synthetic": true}, "note": "redirect"}
+{"ts": 5.79, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules("会议室")…]}, "stop_reason": "tool_calls"}, "note": "tool_call"}
 {"ts": 5.79, "type": "tool_result", "payload": {"…", "result": "会议室预订：需提前一天通过OA系统申请，填写事由和时间，经直属上级审批通过后即可生效。…", "skipped": false}, "note": "tool result"}
-{"ts": 12.81, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "根据查询结果：…"}}, "note": "final"}
+{"ts": 12.81, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "根据查询结果：…"}, "stop_reason": "stop"}, "note": "final"}
 ```
 
 ### 06 工具刚好跑完时被中断
@@ -298,10 +322,10 @@ finally:
 
 对应的session log如下，
 ```json
-{"ts": 0.35, "type": "user_input", "payload": {"text": "报销有什么规定"}, "note": "turn start"}
-{"ts": 3.67, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules…]}}, "note": "tool_call"}
+{"ts": 0.35, "type": "user_input", "payload": {"message": {"role": "user", "content": "报销有什么规定"}}, "note": "turn start"}
+{"ts": 3.67, "type": "agent_reply", "payload": {"message": {"role": "assistant", …, "tool_calls": [search_rules…]}, "stop_reason": "tool_calls"}, "note": "tool_call"}
 {"ts": 3.67, "type": "tool_result", "payload": {"…", "result": "报销：报销流程：发起申请 -> 财务审核 -> 打款。详见财务制度。", "skipped": false}, "note": "tool result"}
-{"ts": 3.67, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[本轮已被用户打断，不再基于上面的工具结果作答]"}, "synthetic": true}, "note": "marker"}
+{"ts": 3.67, "type": "agent_reply", "payload": {"message": {"role": "assistant", "content": "[本轮已被用户打断，不再基于上面的工具结果作答]"}, "synthetic": true, "stop_reason": "interrupted"}, "note": "marker"}
 ```
 
 

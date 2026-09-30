@@ -190,6 +190,10 @@ def test_stream_stop_closes_with_assistant(workdir: Path) -> None:
     assert tail(hist) == {"role": "assistant", "content": INTERRUPTED}
     # 中断之后 history 仍然是合法序列：没有半截 assistant
     assert hist[-2]["role"] == "user"
+    # 账本里 stop_reason 可查：正常回复取 LLM 的 finish_reason，合成占位自行补
+    replies = [r for r in records(log_path) if r["type"] == "agent_reply"]
+    assert replies and all("stop_reason" in r["payload"] for r in replies)
+    assert replies[-1]["payload"]["stop_reason"] == "interrupted"
 
 
 # ------------------------------------------------------------------ ⑤（stop，慢工具）

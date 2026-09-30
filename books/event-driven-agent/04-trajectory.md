@@ -52,7 +52,6 @@ entry的type可选的类型大致如下，要根据type来决定是否在投影�
 | 进上下文 | message / branch_summary / compaction                            | 模型（经投影）           |
 | 改状态  | model_change / thinking_level                                    | 投影函数（不产生消息，覆盖式提取） |
 
-没有第三组：每个 entry 类型要么进上下文、要么改状态，没有第三种消费方式。session 的开始/恢复/结束不落 entry——header 即开始，追加即活着，文件本身就是生命周期的账（pi 同款）。
 
 
 ### messages--trajectory的投影
@@ -78,7 +77,7 @@ trajectory 定下来之后，来看看如何通过轨迹来生成messages。
 
 ```text
 压缩发生时：  e1 e2 | e3 e4 e5 [compA(keep_from=e3)]
-              摘要   原样保留    ↑ 追加在末尾（刀口在 e2|e3 之间）
+              摘要   原样保留    ↑ 追加在末尾（切点在 e2|e3 之间）
 
 之后继续对话：e1 e2 | e3 e4 e5 compA e6 e7 ...
                                     ↑ 新对话接在 compA 之后
@@ -366,7 +365,7 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 
 ### demo 3 · 触发压缩之后的操作（03-compact）
 
-先说这个 case 里 agent 在干什么：**用户连问三轮（保温杯 → 玻璃杯 → 汇总），agent 每轮都发起工具调用、一轮轮把上下文堆长；用户喊压一下，agent 在下一个 step 边界把刀口之前的历史压成一份摘要**——追加一个 compaction entry（摘要 + 刀口 keep_from_id），原文一个字节不删；之后的"继续"，模型看到的就是 [system, <摘要>, 保留窗] 的短视图。压缩了哪些，三样东西摆在一起看：compaction entry 原文、被压进摘要的消息清单、压缩后的投影。
+先说这个 case 里 agent 在干什么：**用户连问三轮（保温杯 → 玻璃杯 → 汇总），agent 每轮都发起工具调用、一轮轮把上下文堆长；用户喊压一下，agent 在下一个 step 边界把切点之前的历史压成一份摘要**——追加一个 compaction entry（摘要 + 切点 keep_from_id），原文一个字节不删；之后的"继续"，模型看到的就是 [system, <摘要>, 保留窗] 的短视图。压缩了哪些，三样东西摆在一起看：compaction entry 原文、被压进摘要的消息清单、压缩后的投影。
 
 ```text
 [用户] 保温杯还有库存吗 / 玻璃杯呢 / 帮我汇总一下

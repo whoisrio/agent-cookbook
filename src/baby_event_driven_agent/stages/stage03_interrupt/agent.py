@@ -177,8 +177,14 @@ class Agent:
         while not inbox.empty():
             ev = inbox.get_nowait()
             texts.append(ev.payload["text"])
-            history.append({"role": "user", "content": ev.payload["text"]})
-            self.log.append(ev, note="steering")
+            # 进账本转成 message 形式（与 agent_reply 的 payload 对齐）；
+            # 总线事件保持 {"text"} 的命令形状，只改账面。
+            message = {"role": "user", "content": ev.payload["text"]}
+            history.append(message)
+            self.log.append(
+                Event("user_input", sid, {"message": message}, ts=ev.ts),
+                note="steering",
+            )
         if texts:
             await self.bus.emit(Event("steering_consumed", sid, {"texts": texts}))
         return len(texts)
@@ -226,6 +232,10 @@ class Agent:
                 if chunk.get("name"):
                     tc["name"] = chunk["name"]
                 tc["args"] += chunk.get("args_delta", "")
+            elif chunk["type"] == "finish":
+                # 流结束的收尾块：OpenAI 的 finish_reason，原样透传给账本当
+                # stop_reason——正常路径"这轮为什么结束"直接取自 LLM。
+                partial["finish_reason"] = chunk["reason"]
         if tool_calls:
             return {
                 "role": "assistant",
@@ -261,7 +271,13 @@ class Agent:
         # assistant 消息一成形就先发总线、先进 log——必须在工具执行之前：
         # 否则轨迹里会先出现 tool_result、后出现发起它的 tool_call，
         # 回放读起来就是"结果比调用先发生"。工具结果仍在下面即时进 log。
-        event = Event("agent_reply", sid, {"message": msg})
+        # stop_reason 进 payload（不进 message：message 要进 history 发给模型，
+        # 账面标注不能混进上下文）：正常路径取 LLM 的 finish_reason，协议没给
+        # 就按消息形状兜底。
+        stop_reason = partial.get("finish_reason") or (
+            "tool_calls" if msg.get("tool_calls") else "stop"
+        )
+        event = Event("agent_reply", sid, {"message": msg, "stop_reason": stop_reason})
         await self.bus.emit(event)
         self.log.append(event, note="tool_call" if msg.get("tool_calls") else "final")
         tool_results: list[dict[str, Any]] = []
@@ -310,8 +326,13 @@ class Agent:
         history = self.history.setdefault(sid, [])
         if not history:
             history.append({"role": "system", "content": SYSTEM_PROMPT})
-        history.append({"role": "user", "content": event.payload["text"]})
-        self.log.append(event, note="turn start")
+        # 进账本转成 message 形式（与 agent_reply 对齐），ts 保留入站时刻
+        message = {"role": "user", "content": event.payload["text"]}
+        history.append(message)
+        self.log.append(
+            Event("user_input", sid, {"message": message}, ts=event.ts),
+            note="turn start",
+        )
         self._turn_active[sid] = True
         try:
             await self._run_steps(sid, history)
@@ -458,12 +479,17 @@ class Agent:
         合成消息（中断标记、assistant 占位、纠正 user、半成品）也必须进 log，
         否则"history 是 log 的投影"就在这里断了。类型沿用投影认得的那三种
         （agent_reply / tool_result / user_input），靠 payload 里的 synthetic
-        和 note 标明它不是真发生过的对话。
+        和 note 标明它不是真发生过的对话。assistant 占位没有 LLM 的输出可依，
+        stop_reason 由 agent 自行补 "interrupted"，同样只挂 payload 不进 message。
         """
         history.append(message)
         role = message.get("role")
         if role == "assistant":
-            event = Event("agent_reply", sid, {"message": message, "synthetic": True})
+            event = Event(
+                "agent_reply",
+                sid,
+                {"message": message, "synthetic": True, "stop_reason": "interrupted"},
+            )
         elif role == "tool":
             event = Event(
                 "tool_result",
@@ -480,7 +506,7 @@ class Agent:
             event = Event(
                 "user_input",
                 sid,
-                {"text": message.get("content", ""), "synthetic": True},
+                {"message": message, "synthetic": True},
             )
         self.log.append(event, note=note)
 

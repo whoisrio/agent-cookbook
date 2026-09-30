@@ -47,7 +47,8 @@ class Event:
 class SessionLog:
     """append-only 的会话账，只投影消息：user_input / agent_reply / tool_result
     （含 synthetic 合成消息）。打断、取消、turn 结束这些生命周期事件只走总线
-    给 UI，不进账——账本里是模型读到的东西，回放与恢复从它重建。
+    给 UI，不进账——账本里是模型读到的东西（外加 agent_reply 上的 stop_reason
+    账面标注），回放与恢复从它重建。
 
     Stage 5 靠它回放重建状态，Stage 6 靠它做可重复的 eval。
     """
