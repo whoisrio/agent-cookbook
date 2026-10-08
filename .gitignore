@@ -31,4 +31,5 @@ uv.lock
 .vscode/
 node_modules/
 .codebuddy/
+.obsidian/workspace.json
 
