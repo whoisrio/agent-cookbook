@@ -12,8 +12,8 @@
 
 ## 核心设计摘要
 
-压缩的范围，先划清楚总边界：动的只是视图，事实层的轨迹 append-only、一个字节不删，被压掉的原文永远躺在轨迹里。
-进摘要的只有压缩点前的全部消息，历史的 user message、assistant 消息（含 tool_calls）、tool 结果整段序列化。
+压缩不删除任何trajectory记录，改动的只是从trajectory到messages的内容，
+压缩点前的全部消息，包括历史的 user message、assistant 消息（含 tool_calls）、tool的执行结果，被压缩后的摘要替代。
 不进行压缩的内容：system prompt 不随历史折叠(AGENTS.md,SOULD.md，MCP，TOOLS，SKILLS等等在system prompt区域的都不会压缩)；当前对话最近 N 个 step 原样保留；
 
 核心规则如下: 
