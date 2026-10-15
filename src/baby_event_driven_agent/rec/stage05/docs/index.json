@@ -33,9 +33,9 @@
     {
       "case": "03-side-effect-not-repeated",
       "title": "副作用不重做：写被压掉之后恰好一次真实写",
-      "exit": 1,
+      "exit": 0,
       "timeout": false,
-      "secs": 196.2,
+      "secs": 100.7,
       "cast": "src/baby_event_driven_agent/rec/stage05/docs/03-side-effect-not-repeated.cast",
       "sessions": "src/baby_event_driven_agent/sessions/stage05",
       "stderr": "",
@@ -59,12 +59,12 @@
     {
       "case": "05-fold-twice",
       "title": "二次折叠：新摘要吞旧摘要，投影认最后一切",
-      "exit": null,
-      "timeout": true,
-      "secs": 300.0,
+      "exit": 0,
+      "timeout": false,
+      "secs": 716.9,
       "cast": "src/baby_event_driven_agent/rec/stage05/docs/05-fold-twice.cast",
       "sessions": "src/baby_event_driven_agent/sessions/stage05",
-      "stderr": "超时 300s，已中止",
+      "stderr": "",
       "gif": "src/baby_event_driven_agent/rec/stage05/docs/05-fold-twice.gif",
       "mp4": "src/baby_event_driven_agent/rec/stage05/docs/05-fold-twice.mp4",
       "render_error": ""

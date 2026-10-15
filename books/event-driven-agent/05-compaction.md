@@ -274,10 +274,19 @@ demo policy 阈值调小（水位一两千 token、保留 1~2 个 step），不�
 下面按"压缩前后对照 → 失败兜底 → 副作用不重做 → 触发策略 → 二次折叠"的顺序，把压缩的每条纪律过一遍。
 entry id 每次运行随机生成，模型输出每次也会不同，下面的引用是一次真实运行；真模型有波动，个别段要靠重跑取到干净的现场。
 
+每个 demo 都用 asciinema 录了终端实录（`rec/stage05/docs/`，`.cast` 渲染成 gif，`index.json` 里记着每个 case 的说明），case 名是 `两位编号-语义名`，能单独复跑：
+
+```
+stage05-demo 01-compact-before-after   # → rec/stage05/docs/01-compact-before-after.gif
+stage05-demo --list                    # 五个 case 及说明
+```
+
 ### demo 1 · 压缩前后对照（01-compact-before-after）
 
 先说这个 case 里 agent 在干什么：**用户连问三轮库存（保温杯 → 玻璃杯 → 马克杯），agent 每轮发起工具调用、把上下文堆到 13 条消息；用户喊压一下，下一个 step 边界把切点之前的历史压成一份摘要**——追加一条 compaction entry（摘要全文 + 切点 keep_from_id），原文一个字节不删。
 压缩了哪些，四样东西摆在一起看：compaction entry、context_compacted 事件报账、压前压后投影对比、轨迹全树。
+
+![01-compact-before-after：压缩前后对照，投影换视图](../../src/baby_event_driven_agent/rec/stage05/docs/01-compact-before-after.gif)
 
 ```text
 [用户] 保温杯还有库存吗 / 玻璃杯呢 / 马克杯还有吗
@@ -304,6 +313,8 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 
 先说这个 case 里 agent 在干什么：**摘要器第一次被注入空返回（推理模型思考 token 吃掉输出时的真实姿态），第二次放行真模型**——空摘要比长摘要危害大：append 空摘要等于把被压段从视图里抹掉，所以按失败处理：context_compact_failed 留痕、不 append、不挡 turn；重发请求，下一边界重试成功。
 
+![02-compact-fail-open：空摘要 fail-open，下一边界重试成功](../../src/baby_event_driven_agent/rec/stage05/docs/02-compact-fail-open.gif)
+
 ```text
 [用户] 保温杯还有库存吗 / 好的
 [实测] 压缩前投影：7 条消息（system×1、user×2、assistant×3、tool×1）
@@ -320,6 +331,8 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 ### demo 3 · 副作用不重做（03-side-effect-not-repeated）
 
 先说这个 case 里 agent 在干什么：**用户先把保温杯库存改成 10 件（免审批量），再闲聊两轮把这个写操作推进被压段；压缩之后让模型汇报"今天改了哪些库存、还需要再改吗"**——模型凭摘要里的"已完成"段知道"做过就是做过"，全程恰好一次真实 update_inventory，落库值正确（设值语义）。
+
+![03-side-effect-not-repeated：写被压掉之后恰好一次真实写](../../src/baby_event_driven_agent/rec/stage05/docs/03-side-effect-not-repeated.gif)
 
 ```text
 [用户] 把保温杯的库存改成 10 件 / 玻璃杯还有多少 / 好的，先这样
@@ -338,6 +351,8 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 
 先说这个 case 里 agent 在干什么：**两个会话跑同一套组合策略（ratio 水位 + step 刀口，window=2000、水位 0.7，触发线 1400 token）**——会话 A 连查七轮品类，每轮工具往返把 token 一路顶上去，第 6 轮越线自动压缩；会话 B 纯闲聊聊了三轮，估算始终不到触发线的六成，全程不压。
 触发看 token（真实 usage 锚点 + 轨迹增量估算），下刀看 step（保留窗 tool 配对完整）——纯按步数会把闲聊也误压，纯按 token 会切在消息中间。
+
+![04-watermark-trigger：token 越水位才压，闲聊会话全程不压](../../src/baby_event_driven_agent/rec/stage05/docs/04-watermark-trigger.gif)
 
 ```text
 会话 A：工具往返的查询会话（触发线 1400 token）
@@ -370,6 +385,8 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 
 先说这个 case 里 agent 在干什么：**同一个会话里连压两刀**——第一刀把保温杯、玻璃杯两轮压成摘要 A；再聊马克杯、雨伞两轮后压第二刀，摘要 B 的输入 = 摘要 A + 增量 step（previous 传递），投影认最后一切，视图里只剩摘要 B，原始全文一次都不重读。
 折叠有没有真发生，看摘要 B 的内容就知道：保温杯 3 件、玻璃杯 17 件这两条事实只存在于摘要 A 里（原文已不在第二刀的被压段），它们出现在摘要 B 中，说明旧摘要被并入了新摘要。
+
+![05-fold-twice：二次折叠，新摘要吞旧摘要](../../src/baby_event_driven_agent/rec/stage05/docs/05-fold-twice.gif)
 
 ```text
 [用户] 保温杯还有库存吗 / 玻璃杯呢

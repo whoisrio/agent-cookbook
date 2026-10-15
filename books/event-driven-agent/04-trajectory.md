@@ -306,9 +306,18 @@ if prompt is None:
 六个 demo 全部打真实模型（读仓库根 `.env` 的 OpenAI 兼容端点，本地 ollama 也行；没配 key 的段整段跳过）。
 entry id 每次运行随机生成，模型输出每次也会不同，下面的引用是一次真实运行。
 
+每个 demo 都用 asciinema 录了终端实录（`rec/stage04/docs/`，`.cast` 渲染成 gif，`index.json` 里记着每个 case 的说明），case 名是 `两位编号-语义名`，能单独复跑：
+
+```
+stage04-demo 03-compact         # → rec/stage04/docs/03-compact.gif
+stage04-demo --list             # 六个 case 及说明
+```
+
 ### demo 1 · 写轨迹：写好的 entry 长什么样（01-trajectory-shape）
 
 先说这个 case 里 agent 在干什么：**用户问保温杯库存 → LLM 发起工具调用 query_inventory → agent 执行工具 → LLM 拿到结果回复**。四步对话各记一条 message entry，加上开头记录的 model_change（模型选择），正好 5 条 entry。
+
+![01-trajectory-shape：写好的 entry 长什么样](../../src/baby_event_driven_agent/rec/stage04/docs/01-trajectory-shape.gif)
 
 ```text
 [用户] 保温杯还有库存吗
@@ -336,6 +345,8 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 ### demo 2 · 从正常轨迹恢复（02-resume-normal）
 
 先说这个 case 里 agent 在干什么：**和 demo 1 一样跑一轮"问库存 → 工具 → 回复"，写下轨迹后关掉会话；进程重启后，新 agent 拿着 sid resume 这张轨迹；用户接着问"刚才查的是哪个品类？"，agent 凭恢复的历史答出保温杯**。轨迹的变化：resume 一个 entry 都不追加——5 条 entry 原样重建，文件字节不变。
+
+![02-resume-normal：resume 重建投影，历史原样回来](../../src/baby_event_driven_agent/rec/stage04/docs/02-resume-normal.gif)
 
 ```text
 [用户] 保温杯还有库存吗
@@ -366,6 +377,8 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 ### demo 3 · 触发压缩之后的操作（03-compact）
 
 先说这个 case 里 agent 在干什么：**用户连问三轮（保温杯 → 玻璃杯 → 汇总），agent 每轮都发起工具调用、一轮轮把上下文堆长；用户喊压一下，agent 在下一个 step 边界把切点之前的历史压成一份摘要**——追加一个 compaction entry（摘要 + 切点 keep_from_id），原文一个字节不删；之后的"继续"，模型看到的就是 [system, <摘要>, 保留窗] 的短视图。压缩了哪些，三样东西摆在一起看：compaction entry 原文、被压进摘要的消息清单、压缩后的投影。
+
+![03-compact：边界压缩，投影换成 [system, <摘要>, 保留窗]](../../src/baby_event_driven_agent/rec/stage04/docs/03-compact.gif)
 
 ```text
 [用户] 保温杯还有库存吗 / 玻璃杯呢 / 帮我汇总一下
@@ -401,6 +414,8 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 用户希望"换个思路重来"，agent 把指针 rewind 回第一条 user message；
 再 branch 回压缩节点，又能回到压缩刚做完那一刻。同一个文件，两个落点两种视图。
 
+![04-rewind-after-compact：压缩之后再 rewind，两个落点两种视图](../../src/baby_event_driven_agent/rec/stage04/docs/04-rewind-after-compact.gif)
+
 ```text
 [用户] 开始处理 T-101，先定个方案 / 继续 / 继续
 [实测] 压缩完成：compaction entry 8eff9816（keep_from=bcf051a4）；投影 6 条 = [system, <摘要>, 保留窗…]
@@ -422,6 +437,8 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 
 先说这个 case 里 agent 在干什么：**agent 跑完一轮"问库存 → 工具 → 回复"后，把当前路径克隆进一份新会话文件；之后旧会话续一句、新会话也续一句，两条轨迹各自生长，互不可见**——fork 出来的新文件 id 与 parentId 原样保留，是完整合法的轨迹，旧文件原封不动。
 
+![05-fork：fork 出新会话文件，两条轨迹分道扬镳](../../src/baby_event_driven_agent/rec/stage04/docs/05-fork.gif)
+
 ```text
 [系统] store 里的会话：['47dbec70…', 'ecc7c658…']
 [实测] 原会话 47dbec70…：6 条 entry，最后一条 user = 旧会话的下一句
@@ -436,6 +453,8 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
 先说这个 case 里 agent 在干什么：**demo 主动构造两份不完整的轨迹，各自先摆"坏轨迹"原文、再摆"修好之后"的样子**——
 1. 轨迹1最后一条entry因为agent运行时异常导致没有被完整记录，resume这个session时，删除掉不完整的信息，并直接补一条 assistant 占位 entry 进轨迹（synthetic + note 自述残尾，标记区分主动补充）；
 2. 轨迹里躺着一条"assistant 要了工具结果但结果永远没来"的悬挂调用（崩在工具执行前），投影补一条自描述占位，模型知道缺了什么，原文件字节不变。两个现场全部以"轨迹是唯一真相"为基准。
+
+![06-resume-broken：残尾裁掉补占位、悬挂调用投影补位](../../src/baby_event_driven_agent/rec/stage04/docs/06-resume-broken.gif)
 
 ```text
 # 轨迹1

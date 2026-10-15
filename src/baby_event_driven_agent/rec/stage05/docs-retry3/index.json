@@ -1,0 +1,21 @@
+{
+  "stage": "05",
+  "run_id": "docs-retry3",
+  "window_size": "120x40",
+  "idle_time_limit": 1.0,
+  "cases": [
+    {
+      "case": "05-fold-twice",
+      "title": "二次折叠：新摘要吞旧摘要，投影认最后一切",
+      "exit": 0,
+      "timeout": false,
+      "secs": 716.9,
+      "cast": "src/baby_event_driven_agent/rec/stage05/docs-retry3/05-fold-twice.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage05",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage05/docs-retry3/05-fold-twice.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage05/docs-retry3/05-fold-twice.mp4",
+      "render_error": ""
+    }
+  ]
+}
