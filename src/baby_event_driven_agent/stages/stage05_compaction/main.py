@@ -141,7 +141,7 @@ class Harness:
         self.store = SessionStore(workdir / "sessions")
         self.system_prompt = "你是一个通过工具干活的通用 agent。"
         self.llm = llm or RealLLM()
-        self.timeout = 180.0  # 真模型段放宽等待
+        self.timeout = 600.0  # 真模型段放宽等待（压缩轮有摘要 + 答复两次调用）
         self.policy = policy or CompactionPolicy(keep_steps=1)
         self.agent = Agent(
             self.bus,

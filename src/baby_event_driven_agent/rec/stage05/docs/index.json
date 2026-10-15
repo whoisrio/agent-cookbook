@@ -1,0 +1,73 @@
+{
+  "stage": "05",
+  "run_id": "docs",
+  "window_size": "120x40",
+  "idle_time_limit": 1.0,
+  "cases": [
+    {
+      "case": "01-compact-before-after",
+      "title": "压缩前后对照：entry + 摘要全文 + 投影换视图",
+      "exit": 0,
+      "timeout": false,
+      "secs": 114.1,
+      "cast": "src/baby_event_driven_agent/rec/stage05/docs/01-compact-before-after.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage05",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage05/docs/01-compact-before-after.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage05/docs/01-compact-before-after.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "02-compact-fail-open",
+      "title": "摘要失败 fail-open：留痕、不 append、重试成功",
+      "exit": 0,
+      "timeout": false,
+      "secs": 115.1,
+      "cast": "src/baby_event_driven_agent/rec/stage05/docs/02-compact-fail-open.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage05",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage05/docs/02-compact-fail-open.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage05/docs/02-compact-fail-open.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "03-side-effect-not-repeated",
+      "title": "副作用不重做：写被压掉之后恰好一次真实写",
+      "exit": 1,
+      "timeout": false,
+      "secs": 196.2,
+      "cast": "src/baby_event_driven_agent/rec/stage05/docs/03-side-effect-not-repeated.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage05",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage05/docs/03-side-effect-not-repeated.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage05/docs/03-side-effect-not-repeated.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "04-watermark-trigger",
+      "title": "触发策略对照：token 计量决定压不压，闲聊不误压",
+      "exit": 0,
+      "timeout": false,
+      "secs": 180.8,
+      "cast": "src/baby_event_driven_agent/rec/stage05/docs/04-watermark-trigger.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage05",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage05/docs/04-watermark-trigger.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage05/docs/04-watermark-trigger.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "05-fold-twice",
+      "title": "二次折叠：新摘要吞旧摘要，投影认最后一切",
+      "exit": null,
+      "timeout": true,
+      "secs": 300.0,
+      "cast": "src/baby_event_driven_agent/rec/stage05/docs/05-fold-twice.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage05",
+      "stderr": "超时 300s，已中止",
+      "gif": "src/baby_event_driven_agent/rec/stage05/docs/05-fold-twice.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage05/docs/05-fold-twice.mp4",
+      "render_error": ""
+    }
+  ]
+}

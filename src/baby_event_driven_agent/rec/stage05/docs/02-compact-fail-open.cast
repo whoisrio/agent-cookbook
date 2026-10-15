@@ -1,0 +1,10 @@
+{"version":3,"term":{"cols":120,"rows":40},"timestamp":1792030158,"idle_time_limit":1.0,"command":"/opt/miniconda3/bin/python -m baby_event_driven_agent.stages.stage05_compaction.main 02-compact-fail-open --sessions-dir /Users/rio/repos/myprjs/agent-cookbook/src/baby_event_driven_agent/sessions/stage05","title":"stage05/02-compact-fail-open · 摘要失败 fail-open：留痕、不 append、重试成功","env":{"SHELL":"/bin/zsh"}}
+[0.518, "o", "\u001b[1mStage 05 压缩策略演示 —— 与 05 章 demo 对应（真模型）\u001b[0m\r\n\u001b[90m  （只跑：02-compact-fail-open）\u001b[0m\r\n"]
+[0.000, "o", "\r\n\u001b[1m── 02-compact-fail-open · 摘要失败 fail-open：留痕、不 append、下一边界重试 ──\u001b[0m\r\n\u001b[90m       说明 │ 摘要器第一次被注入空返回（推理模型思考 token 吃掉输出时的真实姿态）。空摘要比长摘要危害大：append 空摘要等于把被压段从视图里抹掉，所以按失败处理——context_compact_failed 留痕、不 append、不挡 turn，重发请求下一边界重试成功。\u001b[0m\r\n"]
+[0.030, "o", "\r\n\u001b[1m\u001b[33m[用户] \u001b[0m\u001b[33m保温杯还有库存吗\u001b[0m\r\n"]
+[5.250, "o", "\r\n\u001b[1m\u001b[33m[用户] \u001b[0m\u001b[33m好的\u001b[0m\r\n"]
+[1.471, "o", "\r\n\u001b[1m\u001b[94m[压缩前投影] \u001b[0m\u001b[94m7 条消息（system×1、user×2、assistant×3、tool×1）\u001b[0m\r\n\r\n\u001b[1m\u001b[33m[用户] \u001b[0m\u001b[33m继续（第一次压缩：摘要器返回空）\u001b[0m\r\n"]
+[5.928, "o", "\r\n\u001b[1m\u001b[91m[失败留痕] \u001b[0m\u001b[91mcontext_compact_failed × 1；错误：摘要器返回空摘要（推理模型思考 token 吃掉输出时会发生）\u001b[0m\r\n"]
+[0.001, "o", "\r\n\u001b[1m\u001b[94m[失败后] \u001b[0m\u001b[94mcompaction entry：无（不 append）；投影 9 条消息（system×1、user×3、assistant×4、tool×1）\u001b[0m\r\n\r\n\u001b[1m\u001b[33m[用户] \u001b[0m\u001b[33m继续（重发：下一边界重试）\u001b[0m\r\n"]
+[101.779, "o", "\r\n\u001b[1m\u001b[32m[重试成功] \u001b[0m\u001b[32mentry fe515384；context_compacted × 1\u001b[0m\r\n\u001b[90m       说明 │ 失败与成功都留痕在 EventLog；turn 都没有被挡住——压缩救不了自己，但也不拖垮会话。\u001b[0m\r\n\r\n\u001b[1m── 收尾 ──\u001b[0m\r\n\r\n\u001b[1m\u001b[38;5;208m[系统] \u001b[0m\u001b[38;5;208mdemo 结束\u001b[0m\r\n\u001b[90m  session log: /Users/rio/repos/myprjs/agent-cookbook/src/baby_event_driven_agent/sessions/stage05\u001b[0m\r\n\u001b[90m       说明 │ “其他影响上下文的一些策略”一章的配套段落（分页与批次句柄、cap + blob）不在本书 demo 范围内，不实现。\u001b[0m\r\n"]
+[0.115, "x", "0"]

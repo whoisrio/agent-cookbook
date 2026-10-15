@@ -1,0 +1,86 @@
+{
+  "stage": "04",
+  "run_id": "docs",
+  "window_size": "120x40",
+  "idle_time_limit": 1.0,
+  "cases": [
+    {
+      "case": "01-trajectory-shape",
+      "title": "demo 1：写轨迹——写好的 entry 长什么样",
+      "exit": 0,
+      "timeout": false,
+      "secs": 10.1,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/01-trajectory-shape.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/01-trajectory-shape.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/01-trajectory-shape.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "02-resume-normal",
+      "title": "demo 2：从正常轨迹恢复——resume + attach + 投影重建",
+      "exit": 0,
+      "timeout": false,
+      "secs": 8.8,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/02-resume-normal.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/02-resume-normal.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/02-resume-normal.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "03-compact",
+      "title": "demo 3：触发压缩——compaction entry + 投影换视图",
+      "exit": 0,
+      "timeout": false,
+      "secs": 154.4,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/03-compact.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/03-compact.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/03-compact.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "04-rewind-after-compact",
+      "title": "demo 4：压缩之后 rewind，然后继续对话",
+      "exit": 0,
+      "timeout": false,
+      "secs": 591.1,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/04-rewind-after-compact.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/04-rewind-after-compact.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/04-rewind-after-compact.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "05-fork",
+      "title": "demo 5：session 切换——fork",
+      "exit": 0,
+      "timeout": false,
+      "secs": 8.2,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/05-fork.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/05-fork.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/05-fork.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "06-resume-broken",
+      "title": "demo 6：从有问题的轨迹 resume——残尾、悬挂调用",
+      "exit": 0,
+      "timeout": false,
+      "secs": 6.9,
+      "cast": "src/baby_event_driven_agent/rec/stage04/docs/06-resume-broken.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage04",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage04/docs/06-resume-broken.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage04/docs/06-resume-broken.mp4",
+      "render_error": ""
+    }
+  ]
+}

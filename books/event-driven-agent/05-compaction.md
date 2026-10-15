@@ -6,15 +6,15 @@
 
 ## 为什么要做压缩
 
-即便现在的模型已经支持百万级上下文（GPT-astra 已经支持 1.1M），长程任务下照样不够用：agent 连着干几个小时、工具结果一轮轮堆上去，百万 token 也有见底的时候。
+即便现在的模型已经支持百万级上下文（GPT-astra 已经支持 1.1M），长程任务下照样不够用。
 
 经过上一章的处理，咱们的 agent 已经有了完整的 trajectory，这一章我们基于 trajectory 轨迹来处理上下文压缩；这一章，我们就来严肃处理上下文的压缩。
 
 ## 核心设计摘要
 
-压缩不删除任何trajectory记录，改动的只是从trajectory到messages的内容，
+压缩不删除任何trajectory记录，改动的只是从trajectory投影到messages的内容，
 压缩点前的全部消息，包括历史的 user message、assistant 消息（含 tool_calls）、tool的执行结果，被压缩后的摘要替代。
-不进行压缩的内容：system prompt 不随历史折叠(AGENTS.md,SOULD.md，MCP，TOOLS，SKILLS等等在system prompt区域的都不会压缩)；当前对话最近 N 个 step 原样保留；
+system prompt区域的内容不随历史折叠(AGENTS.md,SOULD.md，MCP，TOOLS，SKILLS等等在system prompt区域的都不会压缩)；当前对话最近 N 个 step 原样保留；
 
 核心规则如下: 
 
@@ -26,13 +26,12 @@
 **规则二：折叠——旧摘要被新摘要吞掉，原文永不重读。**
 多次压缩时，新摘要的输入 = 上一次压缩的摘要 + 两次压缩之间的增量 step。摘要模型永远只看到"上一次压缩的摘要 + 新增内容"，从第一次压缩之后就不再重读任何原始全文。递归折叠，原文不回放。
 
-记住这两条，后面的内容就是它们的展开。
 
-## 压缩机制：两种天然的想法
+## 压缩阈值
 
-最容易想到的压缩方式有两种。
+下面看看如何计算压缩阈值和找压缩切点，有如下两种方案，
 
-一种是按 token 消耗：算上下文占了多少 token，超过窗口的某个比例就压，和窗口限制直接对齐。但是，agent 与 llm 交互，是要严格遵循消息格式的，只判断 token 消耗，有可能压缩时会意外截断消息，导致消息角色不匹配。
+第一种是按 token 消耗：算上下文占了多少 token，超过窗口的某个比例就压，和窗口限制直接对齐。但是，agent 与 llm 交互，是要严格遵循消息格式的，只判断 token 消耗，有可能压缩时会意外截断消息，导致消息角色不匹配。
 
 另一种则是按步数：数 step 数，超过 N 个 step 就压，token 都不用算。这种方式，虽然确保了消息格式的正确性（step 是消息序列天然合法的最小单位），但是每一次与 LLM 交互的 tool_result 长度都可能是不一样的，有可能某次查询工具的结果返回了超多数据，而后 n 步的工具调用返回的结果却很少，这种机制，不容易找到正确的压缩时机。
 
@@ -42,7 +41,7 @@
 
 主流 agent 的做法，都是综合了上述两种方式。
 
-- **第一步——检测（token 计量）**：每次 LLM 调用前计量投影出来的 messages，越过水位线就触发。计量以 API 返回的真实 usage（`prompt_tokens`）为准，落代码校准；调用之间的新增量用字符估算，不引 tokenizer 依赖。
+- **第一步——检测（token 计量）**：每次 LLM 调用前计量投影出来的 messages，越过水位线就触发。计量以 API 返回的真实 usage（`prompt_tokens`）为准，落代码校准。
 - **第二步——定切点（找 step 边界）**：触发后不是切在 token 位置，而是找到倒数第 N 个 step 的第一条消息，切点落在这里。这样保证 tool 配对完整，不用再修序列。保留最近 N 个 step（比如 3 步）原文。
 
 
@@ -59,18 +58,7 @@
                   usedTokens                reserveTokens
   ```
 
-  - **按比例**：以 W 为分母设一条线，换模型、换窗口配置不用动。Gemini CLI 的 `chatCompression.contextPercentageThreshold`（0~1，超过窗口该比例就压）是同款思路；Claude Code 触发线也是比例（有效窗口的 ~85%~92%），但预留是绝对数（20k），算混搭：
-
-    ```text
-    输入 token 用量轴：
-
-     0 ├────────────────────────────────────────────┼─────┤ W
-                                                H·W
-                                            用量到这就触发
-
-    复检：tokens(摘要) + tokens(保留窗) ≤ H·W
-    不达标就收缩保留窗再摘要
-    ```
+  也有按比例设线的：以 W 为分母，超过窗口的某个比例就压，换模型、换窗口配置不用动。Gemini CLI 的 `chatCompression.contextPercentageThreshold`（0~1）是同款思路；Claude Code 触发线也是比例（有效窗口的 ~85%~92%），但预留是绝对数（20k），算混搭。
 
 
 触发压缩时，保留最近N个step的消息不压缩，如下（N=3，正要发 turn3 的第 s10 步，s10 还没开始）：
@@ -88,10 +76,6 @@
 >pi 在触发压缩时则是保留keepRecentTokens数量的tokens不压缩，根据keepRecentTokens来检查可以留下最近多少个step不进压缩窗口
 >咱们的baby agent直接取最近n轮
 
-
-### 触发位置：
-
-上下文是否超出阈值，检测在 step 边界：上一个 step 完整结算之后、下一次调用之前。此刻下一次调用要发的全部内容都已 append 进轨迹，所有messages的token消耗都可以从轨迹中拿到。
 
 ### 多次压缩：滚动折叠
 
@@ -188,7 +172,11 @@ COMPRESSION_USER = """
 除了通过LLM对messages做整体摘要外，还有一些控制message长度的处理方式，避免单条message占用过多的context；比如，
 
 ### 输入摘要
-针对用户的超长输入先做摘要，或者将超长输入保存为文档，再让LLM阅读，这样在user message就不需要直接写入超长输入的所有内容；
+针对用户的超长输入（贴进对话的大段文本、日志、代码、图片等等），user message 里不必原样全收，
+
+- **先摘要**:进消息前按用途定向提取，user message 里只留摘要。有损，适合叙述性内容；
+- **落盘成文件**:原文写成文件，消息里只留路径引用，LLM 需要时自行 read。无损，适合代码这类要求精确保留的内容。
+- **图片压缩**:粘贴/附加的图片以 base64 进消息，占 token 大头且无法文本摘要，处理方式是进消息前缩放/压缩。
 
 ### 超大的tool_result 的处理机制
 超大tool_result的处理，
@@ -210,7 +198,7 @@ assistant: 如下是xxx类的分析 ...
 
 针对这类场景，我们看看claude是如何处理的，
 #### 冷热分层：Claude Code 的 tool_result 清除（机制介绍，本书不实现）
-
+ 
 长度限制和分页都发生在结果**进入消息之前**。Claude Code 在此之上还有一组会话中途的清除机制（microcompact），按 prompt cache 的冷热分两条路：
 
 **冷路（缓存已死）：Time-Based MicroCompact。** 距上次 API 调用超过 60 分钟（≥ prompt cache 最长 TTL 1h），缓存前缀反正注定全量重写，此时直接把旧的 tool_result（保留最近 5 个）替换成 `[Old tool result content cleared]`——无 LLM 参与、轨迹不变、只瘦视图。触发条件本身就是保护条件：等缓存死透再改历史，不烧任何活缓存。
@@ -223,10 +211,8 @@ assistant: 如下是xxx类的分析 ...
 如上两种机制，对于已经挂掉的缓存，通用的agent都可以支持，而对于prompt cache仍然处于生效阶段的这类动态替换，则需要服务端的配合；
 现在各家provider也提供了cache_control的功能来主动管理缓存，不过主动设置的缓存的价格是缓存未命中价格的1.2倍，且有数量限制，所以如上的热路策略，并不是通用方案。
 
-### 其他直接控制点（输入 / 输出 / tool_result）
+### 其他直接控制点（输出 / tool_result）
 
-- **粘贴落盘**（输入侧）：用户贴进对话的大段文本/代码 → 写成文件，消息里只留引用——blob 不只是 tool_result 的归宿，输入侧同样适用；
-- **图片降采样**（输入侧）：粘贴的图片进消息前缩放/压缩，多模态内容占 token 大头且无法文本摘要；
 - **thinking 块清除**（输出侧）：reasoning 块是输出侧的 token 大头，Claude Code 在距上次调用超过缓存 TTL 后清除历史 thinking，同样的"等缓存死透再动手"逻辑；
 - **小模型转写**（tool_result 侧）：WebFetch 类工具不让原文进消息——抓取后先按 prompt 用小模型定向提取，进对话的已经是答案。比 cap 更进一步：原文根本不进来。
 
@@ -405,30 +391,6 @@ entry id 每次运行随机生成，模型输出每次也会不同，下面的�
        说明 │ 全树 29 条 entry、两刀 compaction 都在轨迹里：branch 回第一刀还能回到
              摘要 A 的视图；投影只认当前路径上最后一刀。
 ```
-
-
-## 验证（离线已跑，真模型已跑）
-
-### 离线测试（`stage04_trajectory/tests/test_stage05_mechanism.py`，18 条，全绿）
-
-- 计量与触发：`estimate_tokens` 字符估算（不引 tokenizer）、`TokenMeter` 锚点 + 轨迹增量（锚点被 rewind 掉回退全量估算）、ratio / reserve 两种触发线、window=0 不触发；
-- 切点：落在倒数第 N 个 step 的第一条消息、tool 配对完整、step 数或 keep_tokens 预算任一用尽即停、纯聊天退回 turn 刀口；
-- 折叠与不变式：认最后一次压缩、旧摘要被吞（previous 传递 + 原文不重读）、rewind 过切点语义不变；
-- 复检：摘要+保留窗 ≤ 触发线不达标时收缩保留窗重压、收到 1 个 step 仍超线返回 None（不硬压）、手动通道跳过复检；
-- **messages 组装**：摘要输入是单条 user 消息（序列化文本）、不含对话 system prompt、不含工具定义、压缩 system prompt 与文档逐字一致；
-- agent 集成：水位自动压缩挂 step 边界、计量不越线不压、usage 锚定在最终答复步、max_steps 可配置。
-
-分页 / 批次句柄 / cap+blob 相关的离线测试随功能 descope，一并留作展望（见"代码改动"）。
-
-### 真模型（`stage05_compaction/tests/test_stage05_compaction.py`，5 条）
-
-- 手动压缩端到端（真模型摘要）：entry 落盘、事件报账、新视图 = [system, <摘要>, 保留窗] 且序列合法；
-- 口述事实凭摘要可续：原文不在投影、摘要保住关键信息、回答带得出来；摘要失败（空摘要）fail-open 留痕、下一边界重试成功；
-- 副作用不重做：写操作被压掉之后全程恰好一次真实写（设值语义落库正确）；
-- resume：压缩视图从盘上还原与关会话前一致（append-only）；
-- rewind 回归：branch 回切点，原文逐字回来、文件一个字节不动。
-
-demo 五段的实测输出已回填各小节（见"demo"）。
 
 ## 下一章预告
 

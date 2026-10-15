@@ -1,0 +1,34 @@
+{
+  "stage": "05",
+  "run_id": "docs-retry",
+  "window_size": "120x40",
+  "idle_time_limit": 1.0,
+  "cases": [
+    {
+      "case": "03-side-effect-not-repeated",
+      "title": "副作用不重做：写被压掉之后恰好一次真实写",
+      "exit": 0,
+      "timeout": false,
+      "secs": 100.7,
+      "cast": "src/baby_event_driven_agent/rec/stage05/docs-retry/03-side-effect-not-repeated.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage05",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage05/docs-retry/03-side-effect-not-repeated.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage05/docs-retry/03-side-effect-not-repeated.mp4",
+      "render_error": ""
+    },
+    {
+      "case": "05-fold-twice",
+      "title": "二次折叠：新摘要吞旧摘要，投影认最后一切",
+      "exit": 1,
+      "timeout": false,
+      "secs": 191.8,
+      "cast": "src/baby_event_driven_agent/rec/stage05/docs-retry/05-fold-twice.cast",
+      "sessions": "src/baby_event_driven_agent/sessions/stage05",
+      "stderr": "",
+      "gif": "src/baby_event_driven_agent/rec/stage05/docs-retry/05-fold-twice.gif",
+      "mp4": "src/baby_event_driven_agent/rec/stage05/docs-retry/05-fold-twice.mp4",
+      "render_error": ""
+    }
+  ]
+}
