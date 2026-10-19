@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import AsyncIterator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -63,12 +64,19 @@ def _doc_filename(title: str) -> str:
     return name or "untitled"
 
 
+def _today() -> str:
+    """写文档当日（本地日期）：frontmatter 的 updated。"""
+    return datetime.now().strftime("%Y-%m-%d")
+
+
 async def update_rules(args: dict[str, Any]) -> str:
     """按标题重写整篇知识库文档（设值语义）→ 增量更新索引 → 立即可检索。
 
     设值语义与 update_inventory 同一纪律：写的是目标状态不是增量，
     rewind / 重放之后哪怕重做，结果不叠加。content 支持整篇 markdown
     （带 `##` 节标题）；不带标题行的纯文本会自动冠上 `# {title}`。
+    frontmatter 由写路径统一管理：`version` 在旧文档基础上递增、
+    `updated` 刷新为当日——模型给的 frontmatter 不落盘。
     """
     title = str(args.get("title", "")).strip()
     content = str(args.get("content", "")).strip()
@@ -76,15 +84,24 @@ async def update_rules(args: dict[str, Any]) -> str:
         return "需要 title 和 content，未执行"
     filename = f"{_doc_filename(title)}.md"
     raw = content if content.lstrip().startswith("# ") else f"# {title}\n\n{content}"
+    _, raw = kb._frontmatter(raw)
     path = _KNOWLEDGE_DIR / filename
     existed = path.exists()
+    prev_version = 0
+    if existed:
+        prev_meta, _ = kb._frontmatter(path.read_text(encoding="utf-8"))
+        try:
+            prev_version = int(prev_meta.get("version", "0") or "0")
+        except ValueError:
+            prev_version = 0
+    raw = f"---\nupdated: {_today()}\nversion: {prev_version + 1}\n---\n\n{raw.lstrip()}"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(raw.rstrip() + "\n", encoding="utf-8")
 
     index = kb.KnowledgeIndex(_KNOWLEDGE_DIR, _INDEX_PATH, kb.get_embedder())
     await index.ensure()
     await index.update_document(filename, raw)
-    n_chunks = sum(1 for c in index.chunks() if c.source == filename)
+    n_chunks = sum(1 for c in index.chunks() if c.meta.source == filename)
     verb = "已更新" if existed else "已写入"
     return f"{verb}知识库文档《{title}》（{n_chunks} 块），立即可检索"
 

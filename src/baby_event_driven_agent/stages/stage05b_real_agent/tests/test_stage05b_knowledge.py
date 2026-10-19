@@ -69,11 +69,11 @@ def kb_offline(monkeypatch: pytest.MonkeyPatch, workdir: Path) -> Path:
 def test_chunk_document_splits_sections() -> None:
     raw = "# 补货制度\n\n## 报备线\n\n超 50 件要先报备店长审批。\n\n## 审批链\n\n店长审批后执行。\n"
     chunks = kb.chunk_document("补货制度.md", raw)
-    assert [c.section for c in chunks] == ["报备线", "审批链"]
+    assert [c.meta.section for c in chunks] == ["报备线", "审批链"]
     assert chunks[0].text == "补货制度 §报备线：超 50 件要先报备店长审批。"
     assert chunks[0].body == "超 50 件要先报备店长审批。"
-    assert chunks[0].doc == "补货制度" and chunks[0].source == "补货制度.md"
-    assert len({c.id for c in chunks}) == 2  # 内容派生 id，块块不同
+    assert chunks[0].meta.doc == "补货制度" and chunks[0].meta.source == "补货制度.md"
+    assert len({c.meta.id for c in chunks}) == 2  # 内容派生 id，块块不同
 
 
 def test_long_section_splits_by_paragraph() -> None:
@@ -85,7 +85,7 @@ def test_long_section_splits_by_paragraph() -> None:
     # 首块带前缀、只装第一段；续块只含段落，前缀不重复占位
     assert chunks[0].text.startswith("制度 §长节：")
     assert chunks[0].text.endswith(para_a) and chunks[0].body == para_a
-    assert chunks[1].text == para_b and chunks[1].section == "长节"
+    assert chunks[1].text == para_b and chunks[1].meta.section == "长节"
 
 
 def test_whitespace_neutral_bigrams() -> None:
@@ -97,7 +97,8 @@ def test_whitespace_neutral_bigrams() -> None:
 # ---------------------------------------------------------------- 确定性
 
 
-def test_build_deterministic(tmp_path: Path) -> None:
+def test_build_deterministic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kb, "_now", lambda: "2026-10-19T00:00:00Z")  # 冻结墙钟
     docs = tmp_path / "docs"
     docs.mkdir()
     (docs / "a.md").write_text(
@@ -109,7 +110,34 @@ def test_build_deterministic(tmp_path: Path) -> None:
     i2 = kb.KnowledgeIndex(docs, tmp_path / "i2.json", None)
     run(i2.build())
     assert (tmp_path / "i1.json").read_bytes() == (tmp_path / "i2.json").read_bytes()
-    assert [c.id for c in i1.chunks()] == [c.id for c in i2.chunks()]
+    assert [c.meta.id for c in i1.chunks()] == [c.meta.id for c in i2.chunks()]
+
+
+def test_frontmatter_flows_into_chunks() -> None:
+    """源文档 frontmatter 是时间与版本的唯一来源：切块透传进每块。"""
+    raw = (
+        "---\nupdated: 2026-10-19\nversion: 2\n---\n\n"
+        "# 甲\n\n## 一\n\n第一段。\n\n## 二\n\n第二段。\n"
+    )
+    chunks = kb.chunk_document("甲.md", raw)
+    assert all(c.meta.doc_time == "2026-10-19" and c.meta.doc_version == 2 for c in chunks)
+    assert all(c.meta.created_at == "" for c in chunks)  # 入索时间由索引层赋
+    assert chunks[0].meta.doc == "甲"  # frontmatter 不干扰标题切分
+
+
+def test_created_at_inherited_across_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """重建不改块的首次入索时间：同 id 继承，新块才取当前时间。"""
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.md").write_text("# 甲\n\n## 一\n\n第一段。\n", encoding="utf-8")
+    monkeypatch.setattr(kb, "_now", lambda: "T1")
+    index = kb.KnowledgeIndex(docs, tmp_path / "i.json", None)
+    run(index.build())
+    monkeypatch.setattr(kb, "_now", lambda: "T2")
+    run(index.build())
+    assert all(c.meta.created_at == "T1" for c in index.chunks())
 
 
 # ---------------------------------------------------------------- 检索双路
@@ -128,7 +156,7 @@ def test_lexical_search_hits_expected_chunk(kb_offline: Path) -> None:
     result = run(index.search("打车费怎么报销"))
     assert result.mode == "lexical"
     assert result.hits, "应命中报销流程的交通费块"
-    assert result.hits[0].chunk.doc == "报销流程"
+    assert result.hits[0].chunk.meta.doc == "报销流程"
     formatted = kb.format_result(result)
     assert "来源：报销流程" in formatted and "score" in formatted
 
@@ -153,7 +181,7 @@ def test_semantic_path_with_fake_embedder(kb_offline: Path) -> None:
     run(index.build())
     result = run(index.search("报销流程怎么走"))
     assert result.mode == "semantic"
-    assert result.hits[0].chunk.doc == "报销流程"
+    assert result.hits[0].chunk.meta.doc == "报销流程"
 
 
 def test_semantic_path_fuses_lexical_boost(kb_offline: Path) -> None:
@@ -173,8 +201,8 @@ def test_semantic_path_fuses_lexical_boost(kb_offline: Path) -> None:
     run(index.build())
     result = run(index.search("报备线"))
     assert result.mode == "semantic"
-    assert result.hits[0].chunk.doc == "补货制度"
-    assert result.hits[0].chunk.section == "报备线"
+    assert result.hits[0].chunk.meta.doc == "补货制度"
+    assert result.hits[0].chunk.meta.section == "报备线"
 
 
 def test_embed_failure_degrades_to_lexical(kb_offline: Path) -> None:
@@ -216,16 +244,19 @@ def test_update_rules_writeback_and_set_semantics(kb_offline: Path) -> None:
         )
     )
     assert "已更新" in out and "立即可检索" in out
-    # 文档整篇重写（设值语义）
+    # 文档整篇重写（设值语义）；frontmatter 由写路径维护：版本递增、时间刷新
     doc = kb_offline / "盘点差异处理.md"
-    assert doc.exists() and "双签" in doc.read_text(encoding="utf-8")
+    text = doc.read_text(encoding="utf-8")
+    assert doc.exists() and "双签" in text
+    assert "version: 2" in text and "updated:" in text
     # 索引原地更新：该文档的旧块全被替换，新块立即可检索
     index = kb.KnowledgeIndex(
         tools_mod._KNOWLEDGE_DIR, tools_mod._INDEX_PATH, kb.get_embedder()
     )
     assert index.load()
-    own = [c for c in index.chunks() if c.source == "盘点差异处理.md"]
-    assert own and all("双签" in c.body for c in own)
+    own = [c for c in index.chunks() if c.meta.source == "盘点差异处理.md"]
+    assert own and all("双签" in c.body and c.meta.created_at for c in own)
+    assert all(c.meta.doc_version == 2 for c in own)  # frontmatter 透传进块
     result = run(index.search("盘点差异挂起需谁审批签字"))
     assert any("双签" in h.chunk.body for h in result.hits)
 
@@ -235,7 +266,7 @@ def test_update_rules_writeback_and_set_semantics(kb_offline: Path) -> None:
         tools_mod._KNOWLEDGE_DIR, tools_mod._INDEX_PATH, kb.get_embedder()
     )
     assert index2.load()
-    own2 = [c for c in index2.chunks() if c.source == "盘点差异处理.md"]
+    own2 = [c for c in index2.chunks() if c.meta.source == "盘点差异处理.md"]
     assert all("双签" not in c.body for c in own2)
 
 

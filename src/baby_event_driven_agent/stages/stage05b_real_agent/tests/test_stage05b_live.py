@@ -79,7 +79,7 @@ def test_live_paraphrase_hit(workdir: Path, kb_copies: tuple[Path, Path]) -> Non
     if result.mode != "semantic":
         pytest.skip(f"嵌入端点不可用，走了词面路（mode={result.mode}）——语义路用例跳过")
     assert result.hits, "同义改写应命中"
-    assert result.hits[0].chunk.doc == "报销流程"
+    assert result.hits[0].chunk.meta.doc == "报销流程"
     assert "来源：报销流程" in kb.format_result(result)
 
 

@@ -92,16 +92,16 @@ async def case_build_index(workdir: Path) -> None:
         for path in docs:
             chunks = kb.chunk_document(path.name, path.read_text(encoding="utf-8"))
             total += len(chunks)
-            sections = "、".join(dict.fromkeys(c.section for c in chunks))
+            sections = "、".join(dict.fromkeys(c.meta.section for c in chunks))
             print(f"{GREY}  {path.name}：{len(chunks)} 块 ［{sections}］{RESET}")
         line("切块", BLUE, f"共 {total} 块；每块带来源（源文件 / 文档标题 / 节标题）")
 
         first = _fresh_index()
         await first.build()
-        ids_first = [c.id for c in first.chunks()]
+        ids_first = [c.meta.id for c in first.chunks()]
         again = _fresh_index()
         await again.build()
-        ids_second = [c.id for c in again.chunks()]
+        ids_second = [c.meta.id for c in again.chunks()]
         line(
             "确定性",
             GREEN if ids_first == ids_second else RED,
@@ -154,8 +154,8 @@ async def case_search_upgrade(workdir: Path) -> None:
             kb.format_result(result).replace("\n", "\n       │ "),
         )
         assert result.hits, "同义改写应命中报销流程块"
-        assert result.hits[0].chunk.doc == "报销流程", (
-            f"应命中报销流程，实际 {result.hits[0].chunk.doc}"
+        assert result.hits[0].chunk.meta.doc == "报销流程", (
+            f"应命中报销流程，实际 {result.hits[0].chunk.meta.doc}"
         )
         print(f"{GREY}       说明 │ 检索模式 mode={result.mode}，降级不是静默的{RESET}")
 
@@ -166,8 +166,8 @@ async def case_search_upgrade(workdir: Path) -> None:
         line(
             "对照（关键词问法）",
             BLUE,
-            f"旧：{old_kw.splitlines()[0][:60]}… ／ 新命中《{top.chunk.doc} "
-            f"§{top.chunk.section}》——原来能查到的现在一样能查到",
+            f"旧：{old_kw.splitlines()[0][:60]}… ／ 新命中《{top.chunk.meta.doc} "
+            f"§{top.chunk.meta.section}》——原来能查到的现在一样能查到",
         )
         note("工具名和调用方式模型侧完全不变，换的是工具背后的世界。")
     finally:
@@ -275,7 +275,7 @@ async def case_write_back(workdir: Path) -> None:
     index = kb.KnowledgeIndex(kb_dir, index_path, kb.get_embedder())
     index.load()
     after = index.chunks()
-    written = sorted({c.source for c in after if "双签" in c.body})
+    written = sorted({c.meta.source for c in after if "双签" in c.body})
     has_new = bool(written)
     line(
         "索引增量",

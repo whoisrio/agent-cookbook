@@ -7,9 +7,11 @@
 
 切块：按 `##` 标题切节；超过长度上限的节按空行段落续切（首块带
 `文档标题 §节标题：` 前缀，续块只含段落）。每块带来源元数据
-（源文件 / 文档标题 / 节标题）——检索结果能指回出处。块 id 由内容派生
-（sha256），同一批文档两次构建块 id 完全一致——确定性用离线测试钉死，
-这是"检索命中可判定"的前提。
+（源文件 / 文档标题 / 节标题）——检索结果能指回出处。时间与版本来自
+源文档 frontmatter（`updated` / `version`，源声明才可信）；块自身的
+`created_at` 记首次入索时间，重建按块 id 继承、不因重算而丢。块 id 由
+内容派生（sha256），同一批文档两次构建块 id 完全一致——确定性用离线
+测试钉死，这是"检索命中可判定"的前提。
 
 检索双路：
 - 语义路（默认）：块向量 × 查询向量 cosine（含词面小权重加权，hybrid），
@@ -28,7 +30,8 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +43,7 @@ from dotenv import dotenv_values
 MAX_CHUNK_CHARS = 200
 
 DEFAULT_TOP_K = 5
-INDEX_VERSION = 1
+INDEX_VERSION = 4
 
 # 配置读仓库根 .env，环境变量优先——与 stage04 的 RealLLM 同一份纪律
 _REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -50,6 +53,11 @@ _CONFIG = dotenv_values(_REPO_ROOT / ".env")
 def _cfg(key: str) -> str:
     """环境变量优先于 .env 文件——临时换嵌入端点不用改文件。"""
     return os.environ.get(key) or _CONFIG.get(key) or ""
+
+
+def _now() -> str:
+    """块首次入索时间（UTC 秒级）。墙钟会破坏构建确定性，测试里冻结它。"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ---------------------------------------------------------------- 嵌入客户端
@@ -86,15 +94,25 @@ def get_embedder() -> Embedder | None:
 
 
 @dataclass(frozen=True)
-class Chunk:
-    """一个知识块：给模型看的文本 + 指回出处的元数据 + 两路检索用的字段。"""
+class ChunkMeta:
+    """块的元数据：身份与出处 + 时间与版本，独立于块内容存在。"""
 
-    id: str
-    text: str  # 块内文本（首块：文档标题 §节标题：正文；续块：只含段落）
-    body: str  # 正文裸文本（检索结果里返回给模型的部分）
+    id: str  # 内容派生（sha256），同一批文档两次构建完全一致
     source: str  # 源文件名
     doc: str  # 文档标题
     section: str  # 节标题
+    doc_time: str = ""  # 源文档 frontmatter 的 updated（源声明，确定性）
+    doc_version: int = 0  # 源文档 frontmatter 的 version（0 = 未声明）
+    created_at: str = ""  # 块首次入索时间：重建按 id 继承，不因重算而丢
+
+
+@dataclass(frozen=True)
+class Chunk:
+    """一个知识块：meta（身份与出处）+ 内容（文本 / 两路检索用的字段）。"""
+
+    meta: ChunkMeta
+    text: str  # 块内文本（首块：文档标题 §节标题：正文；续块：只含段落）
+    body: str  # 正文裸文本（检索结果里返回给模型的部分）
     bigrams: dict[str, int]  # 词面倒排（字符二元组 → 出现次数）
     vector: tuple[float, ...] | None = None  # 嵌入向量（构建期尽力而为）
 
@@ -113,6 +131,25 @@ def _chunk_id(source: str, doc: str, section: str, seq: int, text: str) -> str:
     """内容派生的块 id：同一批文档两次构建完全一致（确定性测试钉死）。"""
     raw = f"{source}\x00{doc}\x00{section}\x00{seq}\x00{text}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _frontmatter(raw: str) -> tuple[dict[str, str], str]:
+    """`---` 围栏的极简 frontmatter（`key: value` 行）：返回 (元数据, 正文)。
+
+    只认文档开头的围栏，`:` 首次出现即切键值——不是通用 YAML 解析。
+    """
+    lines = raw.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, raw
+    meta: dict[str, str] = {}
+    for i, ln in enumerate(lines[1:], 1):
+        s = ln.strip()
+        if s == "---":
+            return meta, "\n".join(lines[i + 1 :])
+        if ":" in s:
+            key, _, value = s.partition(":")
+            meta[key.strip()] = value.strip()
+    return meta, raw  # 没有闭合围栏：视作没有 frontmatter
 
 
 def _split_sections(raw: str) -> tuple[str, list[tuple[str, str]]]:
@@ -151,8 +188,15 @@ def chunk_document(source: str, raw: str) -> list[Chunk]:
 
     整节不超长 → 一个块（带 `文档标题 §节标题：` 前缀）；超长 → 首块
     带前缀装第一段，其余段落各自成块（续块只含段落，前缀不重复占位）。
-    段落是原子的：单段超长也保持一个块，不截断。
+    段落是原子的：单段超长也保持一个块，不截断。frontmatter 的
+    `updated` / `version` 是源声明的时间与版本，透传进每个块。
     """
+    meta, raw = _frontmatter(raw)
+    try:
+        doc_version = int(meta.get("version", ""))
+    except ValueError:
+        doc_version = 0
+    doc_time = meta.get("updated", "")
     doc_title, sections = _split_sections(raw)
     chunks: list[Chunk] = []
     seq = 0
@@ -173,12 +217,16 @@ def chunk_document(source: str, raw: str) -> list[Chunk]:
         for text, body in pieces:
             chunks.append(
                 Chunk(
-                    id=_chunk_id(source, doc_title, sec_title, seq, text),
+                    meta=ChunkMeta(
+                        id=_chunk_id(source, doc_title, sec_title, seq, text),
+                        source=source,
+                        doc=doc_title,
+                        section=sec_title,
+                        doc_time=doc_time,
+                        doc_version=doc_version,
+                    ),
                     text=text,
                     body=body,
-                    source=source,
-                    doc=doc_title,
-                    section=sec_title,
                     bigrams=_bigrams(text),
                 )
             )
@@ -208,9 +256,12 @@ def format_result(result: SearchResult) -> str:
     mode_label = "语义检索" if result.mode == "semantic" else "词面检索（语义路不可用，兜底）"
     lines = [f"检索模式：{mode_label}"]
     for i, hit in enumerate(result.hits, 1):
+        c = hit.chunk
+        m = c.meta
+        extra = f"，v{m.doc_version}" if m.doc_version else ""
+        extra += f"，{m.doc_time}" if m.doc_time else ""
         lines.append(
-            f"[{i}] (来源：{hit.chunk.doc} §{hit.chunk.section}，score {hit.score:.2f}) "
-            f"{hit.chunk.body}"
+            f"[{i}] (来源：{m.doc} §{m.section}{extra}，score {hit.score:.2f}) {c.body}"
         )
     return "\n".join(lines)
 
@@ -225,30 +276,42 @@ def _cosine(a: list[float] | tuple[float, ...], b: list[float] | tuple[float, ..
 
 
 def _chunk_to_json(c: Chunk) -> dict[str, Any]:
+    """块 → JSON：meta（身份与出处）在外，内容（文本/词面/向量）分层独立。"""
     return {
-        "id": c.id,
+        "meta": asdict(c.meta),
         "text": c.text,
         "body": c.body,
-        "source": c.source,
-        "doc": c.doc,
-        "section": c.section,
         "bigrams": c.bigrams,
         "vector": list(c.vector) if c.vector is not None else None,
     }
 
 
 def _chunk_from_json(d: dict[str, Any]) -> Chunk:
+    m = d["meta"]
     vec = d.get("vector")
     return Chunk(
-        id=str(d["id"]),
+        meta=ChunkMeta(
+            id=str(m["id"]),
+            source=str(m["source"]),
+            doc=str(m["doc"]),
+            section=str(m["section"]),
+            doc_time=str(m.get("doc_time") or ""),
+            doc_version=int(m.get("doc_version") or 0),
+            created_at=str(m.get("created_at") or ""),
+        ),
         text=str(d["text"]),
         body=str(d.get("body") or d["text"]),
-        source=str(d["source"]),
-        doc=str(d["doc"]),
-        section=str(d["section"]),
         bigrams={str(k): int(v) for k, v in d.get("bigrams", {}).items()},
         vector=tuple(vec) if vec else None,
     )
+
+
+@dataclass(frozen=True)
+class IndexMeta:
+    """索引级元数据：格式版本与建索时的嵌入模型，与块数据分层落盘。"""
+
+    version: int = INDEX_VERSION
+    embedding_model: str | None = None
 
 
 class KnowledgeIndex:
@@ -269,11 +332,14 @@ class KnowledgeIndex:
     # ------------------------------------------------------------ 读
 
     def load(self) -> bool:
-        """从盘上读索引；文件不存在或损坏返回 False（调用方决定重建）。"""
+        """从盘上读索引；文件不存在、损坏或版本不符返回 False（调用方决定重建）。"""
         try:
             data = json.loads(self.index_path.read_text(encoding="utf-8"))
+            meta = IndexMeta(**data["meta"])
+            if meta.version != INDEX_VERSION:
+                return False
             self._chunks = [_chunk_from_json(c) for c in data["chunks"]]
-            self._embedding_model = data.get("embedding_model")
+            self._embedding_model = meta.embedding_model
             self._loaded = True
             return True
         except (OSError, KeyError, TypeError, ValueError):
@@ -286,8 +352,9 @@ class KnowledgeIndex:
 
     def _save(self) -> None:
         payload = {
-            "version": INDEX_VERSION,
-            "embedding_model": self._embedding_model,
+            "meta": asdict(
+                IndexMeta(version=INDEX_VERSION, embedding_model=self._embedding_model)
+            ),
             "chunks": [_chunk_to_json(c) for c in self._chunks],
         }
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -306,14 +373,35 @@ class KnowledgeIndex:
             return chunks
         return [replace(c, vector=tuple(v)) for c, v in zip(chunks, vectors)]
 
+    def _prev_created(self) -> dict[str, str]:
+        """盘上旧索引的 块id → created_at：重建时块的首次入索时间不因重算而丢。"""
+        try:
+            data = json.loads(self.index_path.read_text(encoding="utf-8"))
+            return {
+                str(c["meta"]["id"]): str(c["meta"]["created_at"])
+                for c in data["chunks"]
+                if c.get("meta", {}).get("created_at")
+            }
+        except (OSError, KeyError, TypeError, ValueError):
+            return {}
+
     async def build(self) -> None:
         """全量重建：读 docs 目录全部文档 → 切块 → 尽力嵌入 → 落盘。"""
         chunks: list[Chunk] = []
         for path in sorted(self.docs_dir.glob("*.md")):
             chunks.extend(chunk_document(path.name, path.read_text(encoding="utf-8")))
         chunks = await self._try_embed(chunks)
-        self._chunks = chunks
-        self._embedding_model = self._embedder.model if any(c.vector for c in chunks) else None
+        prev = self._prev_created()
+        now = _now()
+        self._chunks = [
+            replace(c, meta=replace(c.meta, created_at=prev.get(c.meta.id) or now))
+            for c in chunks
+        ]
+        self._embedding_model = (
+            self._embedder.model
+            if self._embedder is not None and any(c.vector for c in chunks)
+            else None
+        )
         self._loaded = True
         self._save()
 
@@ -337,9 +425,19 @@ class KnowledgeIndex:
             await self.build()
             return
         new_chunks = await self._try_embed(chunk_document(source, raw))
+        prev = {
+            c.meta.id: c.meta.created_at
+            for c in self._chunks
+            if c.meta.source == source and c.meta.created_at
+        }
+        now = _now()
+        new_chunks = [
+            replace(c, meta=replace(c.meta, created_at=prev.get(c.meta.id) or now))
+            for c in new_chunks
+        ]
         # 增量嵌入失败而旧块有向量：新块暂时走不了语义路——保持词面路可
         # 检索（mode 如实标注），下次全量重建补齐向量。
-        self._chunks = [c for c in self._chunks if c.source != source] + new_chunks
+        self._chunks = [c for c in self._chunks if c.meta.source != source] + new_chunks
         if all(c.vector is None for c in self._chunks):
             self._embedding_model = None
         self._save()
@@ -358,7 +456,9 @@ class KnowledgeIndex:
         if not query or not self._chunks:
             return SearchResult(mode="lexical", hits=[])
         top_k = max(1, min(int(top_k), len(self._chunks)))
-        lex_all = {h.chunk.id: h.score for h in self._lexical(query, len(self._chunks))}
+        lex_all = {
+            h.chunk.meta.id: h.score for h in self._lexical(query, len(self._chunks))
+        }
         lex_max = max(lex_all.values()) if lex_all else 0.0
         if (
             self._embedder is not None
@@ -371,13 +471,13 @@ class KnowledgeIndex:
                     SearchHit(
                         c,
                         0.7 * _cosine(qvec, c.vector)
-                        + 0.3 * (lex_all.get(c.id, 0.0) / lex_max if lex_max > 0 else 0.0),
+                        + 0.3 * (lex_all.get(c.meta.id, 0.0) / lex_max if lex_max > 0 else 0.0),
                     )
                     for c in self._chunks
                     if c.vector is not None
                 ]
                 hits = [h for h in fused if h.score > 0.0]
-                hits.sort(key=lambda h: (-h.score, h.chunk.id))
+                hits.sort(key=lambda h: (-h.score, h.chunk.meta.id))
                 return SearchResult(mode="semantic", hits=hits[:top_k])
             except Exception:  # noqa: BLE001 - 检索期嵌入失败：降级词面路
                 pass
@@ -403,5 +503,5 @@ class KnowledgeIndex:
             num = sum(idf.get(g, unseen) for g in qgrams if g in c.bigrams)
             if num > 0.0:
                 hits.append(SearchHit(c, num / denom))
-        hits.sort(key=lambda h: (-h.score, h.chunk.id))
+        hits.sort(key=lambda h: (-h.score, h.chunk.meta.id))
         return hits[:top_k]
